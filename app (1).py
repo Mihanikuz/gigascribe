@@ -135,7 +135,7 @@ class AudioProcessor:
 
             for device in devices_to_try:
                 try:
-                    self.gigaam_model = gigaam.load_model("v2_ctc", device=device)
+                    self.gigaam_model = gigaam.load_model(os.getenv("GIGASCRIBE_GIGAAM_MODEL", "v2_ctc"), device=device)
                     print(f"Gigaam модель загружена успешно на {device}")
                     break
                 except Exception as e:
@@ -151,7 +151,7 @@ class AudioProcessor:
         if PYANNOTE_AVAILABLE:
             try:
                 self.diarization_pipeline = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization-3.1",
+                    os.getenv("GIGASCRIBE_PYANNOTE_MODEL", "pyannote/speaker-diarization-3.1"),
                     use_auth_token=os.getenv("HF_TOKEN")
                 )
 
@@ -503,7 +503,7 @@ class AudioProcessor:
             return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
     async def process_single_file(self, file_path: str, progress_callback=None,
-                                  original_filename=None) -> TranscriptionResult:
+                                  original_filename=None, artifacts_dir=None) -> TranscriptionResult:
         """Обработка одного файла с улучшенной обработкой ошибок"""
         if original_filename:
             filename = original_filename
@@ -531,6 +531,10 @@ class AudioProcessor:
 
             if not self.convert_to_wav(file_path, wav_path):
                 raise ValueError("Ошибка конвертации файла")
+
+            if artifacts_dir:
+                os.makedirs(artifacts_dir, exist_ok=True)
+                shutil.copy2(wav_path, os.path.join(artifacts_dir, "normalized.wav"))
 
             # Получаем длительность
             duration = self.get_audio_duration(wav_path)
@@ -968,4 +972,4 @@ def create_interface():
 if __name__ == "__main__":
     # Инициализируем приложение
     demo = create_interface()
-    demo.launch(share=True)
+    demo.launch(server_name=os.getenv("GIGASCRIBE_HOST", "127.0.0.1"), server_port=int(os.getenv("GIGASCRIBE_GRADIO_PORT", "7860")), share=False)
