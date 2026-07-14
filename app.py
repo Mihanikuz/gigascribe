@@ -22,7 +22,22 @@ import requests
 MODELS_DIR = Path(os.getenv("GIGASCRIBE_MODELS_DIR", "./models")).resolve()
 os.environ.setdefault("HF_HOME", str(MODELS_DIR / "huggingface"))
 os.environ.setdefault("TORCH_HOME", str(MODELS_DIR / "torch"))
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+PYANNOTE_LOCAL_PATH = Path(os.getenv("GIGASCRIBE_PYANNOTE_MODEL", MODELS_DIR / "pyannote-speaker-diarization-3.1")).resolve()
+GIGAAM_MODEL_NAME = os.getenv("GIGASCRIBE_GIGAAM_MODEL", "v2_ctc")
+GIGAAM_MARKER = MODELS_DIR / "gigaam" / GIGAAM_MODEL_NAME / ".gigaam-ready.json"
+PYANNOTE_MARKER = PYANNOTE_LOCAL_PATH / ".pyannote-ready.json"
+
+
+def _has_gigaam_model() -> bool:
+    return GIGAAM_MARKER.is_file()
+
+
+def _has_pyannote_model() -> bool:
+    return PYANNOTE_MARKER.is_file() and (PYANNOTE_LOCAL_PATH / "config.yaml").is_file()
+
 
 # Импортируем библиотеку автозамены
 try:
@@ -75,7 +90,8 @@ MAX_FILE_DURATION = 9000  # 2 часа в секундах
 SUPPORTED_FORMATS = ['.mp3', '.wav', '.mp4', '.avi', '.webm', '.m4a', '.flac', '.ogg']
 
 # GPU конфигурация
-DEVICE = torch.device("cuda" if torch is not None and torch.cuda.is_available() else "cpu") if torch is not None else "cpu"
+DEVICE = torch.device("cuda" if torch is not None and torch.cuda.is_available() else "cpu") if torch is not None else type("CPUDevice", (), {"type": "cpu", "__str__": lambda self: "cpu"})()
+CUDA_OOM = torch.cuda.OutOfMemoryError if torch is not None else RuntimeError
 MAX_BATCH_SIZE = 8  # Начальный размер батча для параллельной обработки
 MIN_BATCH_SIZE = 1  # Минимальный размер батча при нехватке памяти
 
@@ -134,44 +150,45 @@ class AudioProcessor:
         """Инициализация моделей AI с улучшенной обработкой ошибок"""
         if progress_callback:
             progress_callback(0.1,
-                              "Загрузка модели gigaam на GPU..." if self.device.type == 'cuda' else "Загрузка модели gigaam на CPU...")
+                              "Загрузка модели gigaam на GPU..." if getattr(self.device, "type", str(self.device)) == 'cuda' else "Загрузка модели gigaam на CPU...")
 
-        # Загружаем gigaam модель
-        if GIGAAM_AVAILABLE:
-            devices_to_try = [str(self.device)] if self.device.type == 'cuda' else ['cpu']
-            if self.device.type == 'cuda':
-                devices_to_try.append('cpu')  # fallback на CPU
-
-            for device in devices_to_try:
-                try:
-                    self.gigaam_model = gigaam.load_model(os.getenv("GIGASCRIBE_GIGAAM_MODEL", "v2_ctc"), device=device)
-                    print(f"Gigaam модель загружена успешно на {device}")
-                    break
-                except Exception as e:
-                    print(f"Ошибка загрузки gigaam на {device}: {e}")
-                    if device == devices_to_try[-1]:  # последняя попытка
-                        self.gigaam_model = None
+        # Загружаем GigaAM только из уже подготовленного локального кэша.
+        if not GIGAAM_AVAILABLE:
+            raise RuntimeError("gigaam is not installed; transcription cannot run")
+        if not _has_gigaam_model():
+            raise RuntimeError(f"GigaAM model '{GIGAAM_MODEL_NAME}' is not prepared in {MODELS_DIR}. Run scripts/download_models.py first.")
+        devices_to_try = [str(self.device)] if getattr(self.device, "type", str(self.device)) == 'cuda' else ['cpu']
+        if getattr(self.device, "type", str(self.device)) == 'cuda':
+            devices_to_try.append('cpu')
+        last_error = None
+        for device in devices_to_try:
+            try:
+                self.gigaam_model = gigaam.load_model(GIGAAM_MODEL_NAME, device=device)
+                print(f"GigaAM модель загружена успешно на {device} из локального кэша")
+                break
+            except Exception as e:
+                last_error = e
+                print(f"Ошибка загрузки GigaAM на {device}: {e}")
+        if self.gigaam_model is None:
+            raise RuntimeError(f"GigaAM model '{GIGAAM_MODEL_NAME}' is unavailable locally: {last_error}")
 
         if progress_callback:
             progress_callback(0.3,
-                              "Загрузка модели для разделения спикеров на GPU..." if self.device.type == 'cuda' else "Загрузка модели для разделения спикеров на CPU...")
+                              "Загрузка модели для разделения спикеров на GPU..." if getattr(self.device, "type", str(self.device)) == 'cuda' else "Загрузка модели для разделения спикеров на CPU...")
 
-        # Загружаем pyannote для speaker diarization
-        if PYANNOTE_AVAILABLE:
+        # Загружаем pyannote только из локального snapshot; отсутствие не критично.
+        if PYANNOTE_AVAILABLE and _has_pyannote_model():
             try:
-                self.diarization_pipeline = Pipeline.from_pretrained(
-                    os.getenv("GIGASCRIBE_PYANNOTE_MODEL", "pyannote/speaker-diarization-3.1"),
-                    use_auth_token=os.getenv("HF_TOKEN")
-                )
-
-                # Переносим модель на GPU если доступен
-                if self.device.type == 'cuda':
+                self.diarization_pipeline = Pipeline.from_pretrained(str(PYANNOTE_LOCAL_PATH))
+                if getattr(self.device, "type", str(self.device)) == 'cuda':
                     self.diarization_pipeline = self.diarization_pipeline.to(self.device)
-
-                print(f"Pyannote модель загружена успешно на {self.device}")
+                print(f"Pyannote модель загружена успешно на {self.device} из {PYANNOTE_LOCAL_PATH}")
             except Exception as e:
-                print(f"Ошибка загрузки pyannote: {e}")
+                print(f"Предупреждение: pyannote недоступен локально, режим без разделения спикеров: {e}")
                 self.diarization_pipeline = None
+        else:
+            print(f"Предупреждение: локальная pyannote модель не найдена в {PYANNOTE_LOCAL_PATH}; используется один спикер")
+            self.diarization_pipeline = None
 
         if progress_callback:
             progress_callback(0.5, "Модели загружены!")
@@ -321,7 +338,7 @@ class AudioProcessor:
                 'speakers': list(set(seg['speaker'] for seg in segments))
             }
 
-        except torch.cuda.OutOfMemoryError:
+        except CUDA_OOM:
             print("GPU память закончилась при diarization")
             self.memory_manager.handle_memory_error()
             self.memory_manager.clear_cache()
@@ -336,7 +353,7 @@ class AudioProcessor:
         """Синхронная обертка для diarization"""
         try:
             return self.diarization_pipeline(audio_path)
-        except torch.cuda.OutOfMemoryError:
+        except CUDA_OOM:
             raise
         except Exception as e:
             print(f"Ошибка в _run_diarization_sync: {e}")
@@ -344,8 +361,10 @@ class AudioProcessor:
 
     async def transcribe_audio_batch(self, audio_paths: List[str]) -> List[str]:
         """Батчевая транскрипция аудио с адаптивным размером батча"""
-        if not self.gigaam_model or not audio_paths:
-            return [f"[Ошибка: модель недоступна]" for _ in audio_paths]
+        if not audio_paths:
+            return []
+        if not self.gigaam_model:
+            raise RuntimeError("GigaAM model is not loaded")
 
         results = []
         current_batch_size = self.memory_manager.get_current_batch_size()
@@ -395,7 +414,7 @@ class AudioProcessor:
                             valid_batch
                         )
                         batch_results.extend([r.strip() if r else "" for r in batch_results_inner])
-                    except (AttributeError, torch.cuda.OutOfMemoryError):
+                    except (AttributeError, CUDA_OOM):
                         # Fallback на одиночную обработку
                         for audio_path in valid_batch:
                             try:
@@ -423,7 +442,7 @@ class AudioProcessor:
                                 logger.error(f"Ошибка транскрипции файла {audio_path}: {e2}")
                                 batch_results.append(f"[Ошибка транскрипции: {type(e2).__name__}]")
 
-            except torch.cuda.OutOfMemoryError:
+            except CUDA_OOM:
                 print(f"GPU память закончилась при обработке батча размером {len(batch)}")
                 self.memory_manager.handle_memory_error()
                 self.memory_manager.clear_cache()
@@ -487,7 +506,7 @@ class AudioProcessor:
                         logger.error(f"Ошибка транскрипции файла {path}: {e}")
                         results.append(f"[Ошибка транскрипции: {type(e).__name__}]")
                 return results
-        except torch.cuda.OutOfMemoryError:
+        except CUDA_OOM:
             raise
         except Exception as e:
             print(f"Ошибка в _transcribe_batch_sync: {e}")
@@ -496,10 +515,10 @@ class AudioProcessor:
     async def transcribe_audio(self, audio_path: str) -> str:
         """Транскрипция одного аудио файла"""
         if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
-            return "[Ошибка: файл не найден или пуст]"
+            raise FileNotFoundError("Файл не найден или пуст")
 
         results = await self.transcribe_audio_batch([audio_path])
-        return results[0] if results else f"[Ошибка транскрипции: {os.path.basename(audio_path)}]"
+        return results[0] if results else ""
 
     def format_time(self, seconds: float) -> str:
         """Форматирование времени в MM:SS или HH:MM:SS"""
@@ -552,7 +571,7 @@ class AudioProcessor:
 
             if progress_callback:
                 progress_callback(0.4,
-                                  f"Обработка {filename}: разделение по спикерам на GPU..." if self.device.type == 'cuda' else f"Обработка {filename}: разделение по спикерам...")
+                                  f"Обработка {filename}: разделение по спикерам на GPU..." if getattr(self.device, "type", str(self.device)) == 'cuda' else f"Обработка {filename}: разделение по спикерам...")
 
             # Speaker diarization
             diarization_result = await self.perform_diarization(wav_path)
@@ -560,7 +579,7 @@ class AudioProcessor:
 
             if progress_callback:
                 progress_callback(0.7,
-                                  f"Обработка {filename}: транскрипция на GPU..." if self.device.type == 'cuda' else f"Обработка {filename}: транскрипция...")
+                                  f"Обработка {filename}: транскрипция на GPU..." if getattr(self.device, "type", str(self.device)) == 'cuda' else f"Обработка {filename}: транскрипция...")
 
             segments = []
             full_text_parts = []
@@ -706,9 +725,7 @@ async def process_files(files, progress=gr.Progress()):
     # Инициализируем модели если нужно
     if processor.gigaam_model is None:
         progress(0.05, f"Инициализация моделей на {processor.device}...")
-        await processor.initialize_models(
-            lambda p, msg: progress(p * 0.1, msg)
-        )
+        await processor.initialize_models(lambda p, msg: progress(p * 0.1, msg))
 
     results = []
     output_files = []
