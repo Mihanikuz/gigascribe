@@ -35,6 +35,11 @@ if spec is None or spec.loader is None:
 giga_app = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(giga_app)
 
+MODELS_DIR = Path(os.getenv("GIGASCRIBE_MODELS_DIR", "./models")).resolve()
+os.environ.setdefault("HF_HOME", str(MODELS_DIR / "huggingface"))
+os.environ.setdefault("TORCH_HOME", str(MODELS_DIR / "torch"))
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
 BASE_DIR = Path(os.getenv("GIGASCRIBE_DATA_DIR", "./data")).resolve()
 UPLOAD_DIR = BASE_DIR / "uploads"
 RESULT_DIR = BASE_DIR / "results"

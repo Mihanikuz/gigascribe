@@ -1,0 +1,25 @@
+services:
+  gigascribe:
+    build: .
+    image: gigascribe:local
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      GIGASCRIBE_DATA_DIR: /opt/gigascribe/data
+      GIGASCRIBE_MODELS_DIR: /opt/gigascribe/models
+      HF_HOME: /opt/gigascribe/models/huggingface
+      TORCH_HOME: /opt/gigascribe/models/torch
+    volumes:
+      - ./data:/opt/gigascribe/data
+      - ./models:/opt/gigascribe/models
+    restart: unless-stopped
+    # Для GPU раскомментируйте блок ниже и установите NVIDIA Container Toolkit.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
