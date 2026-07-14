@@ -19,6 +19,11 @@ from urllib.parse import urlparse
 
 import requests
 
+MODELS_DIR = Path(os.getenv("GIGASCRIBE_MODELS_DIR", "./models")).resolve()
+os.environ.setdefault("HF_HOME", str(MODELS_DIR / "huggingface"))
+os.environ.setdefault("TORCH_HOME", str(MODELS_DIR / "torch"))
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
 # Импортируем библиотеку автозамены
 try:
     from autoreplacer import AutoReplacer, autoreplacer
@@ -52,10 +57,14 @@ except ImportError:
     GIGAAM_AVAILABLE = False
 
 try:
-    from pyannote.audio import Pipeline
     import torch
+except ImportError:
+    torch = None
 
-    PYANNOTE_AVAILABLE = True
+try:
+    from pyannote.audio import Pipeline
+
+    PYANNOTE_AVAILABLE = torch is not None
 except ImportError:
     print("Warning: pyannote.audio not available")
     PYANNOTE_AVAILABLE = False
@@ -66,7 +75,7 @@ MAX_FILE_DURATION = 9000  # 2 часа в секундах
 SUPPORTED_FORMATS = ['.mp3', '.wav', '.mp4', '.avi', '.webm', '.m4a', '.flac', '.ogg']
 
 # GPU конфигурация
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda" if torch is not None and torch.cuda.is_available() else "cpu") if torch is not None else "cpu"
 MAX_BATCH_SIZE = 8  # Начальный размер батча для параллельной обработки
 MIN_BATCH_SIZE = 1  # Минимальный размер батча при нехватке памяти
 
@@ -99,7 +108,7 @@ class GPUMemoryManager:
 
     def clear_cache(self):
         """Очистка кэша GPU"""
-        if torch.cuda.is_available():
+        if torch is not None and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def reset_batch_size(self):
@@ -117,7 +126,7 @@ class AudioProcessor:
         self.device = DEVICE
 
         print(f"Инициализация AudioProcessor на устройстве: {self.device}")
-        if torch.cuda.is_available():
+        if torch is not None and torch.cuda.is_available():
             print(f"GPU: {torch.cuda.get_device_name()}")
             print(f"GPU память: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} GB")
 
