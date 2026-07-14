@@ -1,0 +1,30 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest fastapi uvicorn python-multipart passlib[bcrypt] itsdangerous requests gradio==5.38.2
+      - name: Compile
+        run: python -m compileall app.py server.py model_store.py scripts tests
+      - name: Pytest
+        run: pytest -q
+      - name: Docker compose config
+        run: docker compose config
+      - name: Build Docker image
+        run: docker compose build
+      - name: Container import smoke
+        run: docker compose run --rm --entrypoint python gigascribe -c "import gradio, requests, torch, torchaudio; import app; import server"
+      - name: Volume permission smoke
+        run: |
+          mkdir -p data models
+          docker compose run --rm --entrypoint sh gigascribe -c 'touch /opt/gigascribe/data/users.json /opt/gigascribe/models/.write-test'

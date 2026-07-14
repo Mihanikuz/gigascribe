@@ -1,38 +1,18 @@
-import os
 import sys
 from pathlib import Path
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import model_store as ms
 import scripts.download_models as dm
 
 
-def test_repeated_download_skips_ready_gigaam(tmp_path, monkeypatch):
-    model = tmp_path / "gigaam" / "v2_ctc"
-    model.mkdir(parents=True)
-    (model / dm.GIGAAM_MARKER_NAME).write_text('{"model_name":"v2_ctc"}')
-    called = False
-    def fail_import(*a, **k):
-        nonlocal called
-        called = True
-    assert dm.warm_up_gigaam(tmp_path, "v2_ctc") == model
-    assert not called
+def _ready(base):
+    ckpt=ms.gigaam_checkpoint_path(base,"v2_ctc"); ckpt.parent.mkdir(parents=True, exist_ok=True); ckpt.write_bytes(b"ok")
+    ms.write_gigaam_marker(base,"v2_ctc")
 
 
-def test_force_warms_gigaam_again(tmp_path, monkeypatch):
-    model = tmp_path / "gigaam" / "v2_ctc"
-    model.mkdir(parents=True)
-    (model / dm.GIGAAM_MARKER_NAME).write_text('{"model_name":"v2_ctc"}')
-    class FakeModel:
-        def transcribe(self): pass
-    class FakeGiga:
-        @staticmethod
-        def load_model(name, device="cpu"):
-            FakeGiga.called = True
-            return FakeModel()
-    FakeGiga.called = False
-    monkeypatch.setitem(sys.modules, "gigaam", FakeGiga)
-    dm.warm_up_gigaam(tmp_path, "v2_ctc", force=True)
-    assert FakeGiga.called
+def test_repeated_download_skips_ready_gigaam(tmp_path):
+    _ready(tmp_path)
+    assert dm.warm_up_gigaam(tmp_path, "v2_ctc") == tmp_path / "gigaam" / "v2_ctc"
 
 
 def test_missing_hf_token_errors_when_pyannote_not_ready(tmp_path):

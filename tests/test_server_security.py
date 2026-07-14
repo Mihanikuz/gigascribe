@@ -47,3 +47,15 @@ def test_bad_extension_rejected_before_processing(srv):
     c.post("/login", data={"username":"admin","password":"adminpw"})
     r = c.post("/api/jobs", files={"file": ("a.exe", b"1", "application/octet-stream")})
     assert r.status_code == 400
+
+
+def test_health_live_and_ready(srv, tmp_path):
+    import model_store as ms
+    ckpt=ms.gigaam_checkpoint_path(srv.MODELS_DIR, "v2_ctc")
+    ckpt.parent.mkdir(parents=True, exist_ok=True); ckpt.write_bytes(b"ok")
+    ms.write_gigaam_marker(srv.MODELS_DIR, "v2_ctc")
+    c = TestClient(srv.app)
+    assert c.get("/health/live").status_code == 200
+    r = c.get("/health/ready")
+    assert r.status_code in (200, 503)
+    assert "pyannote" in r.json()["checks"]

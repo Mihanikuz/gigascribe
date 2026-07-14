@@ -17,6 +17,7 @@ import os
 import secrets
 import hashlib
 import shutil
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -24,7 +25,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from passlib.context import CryptContext
 from starlette.middleware.sessions import SessionMiddleware
@@ -38,7 +39,6 @@ spec.loader.exec_module(giga_app)
 
 MODELS_DIR = Path(os.getenv("GIGASCRIBE_MODELS_DIR", "./models")).resolve()
 os.environ.setdefault("HF_HOME", str(MODELS_DIR / "huggingface"))
-os.environ.setdefault("TORCH_HOME", str(MODELS_DIR / "torch"))
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -148,6 +148,36 @@ def validate_upload_name(filename: str) -> str:
     if Path(safe).suffix.lower() not in giga_app.SUPPORTED_FORMATS:
         raise HTTPException(status_code=400, detail="Unsupported file extension")
     return safe
+
+
+@app.get("/health/live")
+def health_live():
+    return {"status": "live"}
+
+
+def _writable_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".write-test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+@app.get("/health/ready")
+def health_ready():
+    checks = {
+        "data_writable": _writable_dir(BASE_DIR),
+        "models_writable": _writable_dir(MODELS_DIR),
+        "ffmpeg": shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None,
+        "gigaam": giga_app._has_gigaam_model(),
+        "pyannote": giga_app._has_pyannote_model(),
+    }
+    required = checks["data_writable"] and checks["models_writable"] and checks["ffmpeg"] and checks["gigaam"]
+    payload = {"status": "ready" if required else "not_ready", "checks": checks}
+    return JSONResponse(payload, status_code=200 if required else 503)
 
 
 @app.get("/", response_class=HTMLResponse)

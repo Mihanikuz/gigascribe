@@ -19,24 +19,24 @@ from urllib.parse import urlparse
 
 import requests
 
+from model_store import assert_gigaam_ready, gigaam_cache_dir, is_gigaam_ready, is_pyannote_ready, pyannote_target
+
 MODELS_DIR = Path(os.getenv("GIGASCRIBE_MODELS_DIR", "./models")).resolve()
 os.environ.setdefault("HF_HOME", str(MODELS_DIR / "huggingface"))
-os.environ.setdefault("TORCH_HOME", str(MODELS_DIR / "torch"))
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-PYANNOTE_LOCAL_PATH = Path(os.getenv("GIGASCRIBE_PYANNOTE_MODEL", MODELS_DIR / "pyannote-speaker-diarization-3.1")).resolve()
+PYANNOTE_LOCAL_PATH = Path(os.getenv("GIGASCRIBE_PYANNOTE_MODEL", pyannote_target(MODELS_DIR))).resolve()
 GIGAAM_MODEL_NAME = os.getenv("GIGASCRIBE_GIGAAM_MODEL", "v2_ctc")
-GIGAAM_MARKER = MODELS_DIR / "gigaam" / GIGAAM_MODEL_NAME / ".gigaam-ready.json"
-PYANNOTE_MARKER = PYANNOTE_LOCAL_PATH / ".pyannote-ready.json"
+GIGAAM_CACHE_DIR = gigaam_cache_dir(MODELS_DIR)
 
 
 def _has_gigaam_model() -> bool:
-    return GIGAAM_MARKER.is_file()
+    return is_gigaam_ready(MODELS_DIR, GIGAAM_MODEL_NAME)
 
 
 def _has_pyannote_model() -> bool:
-    return PYANNOTE_MARKER.is_file() and (PYANNOTE_LOCAL_PATH / "config.yaml").is_file()
+    return is_pyannote_ready(MODELS_DIR)
 
 
 # Импортируем библиотеку автозамены
@@ -155,15 +155,14 @@ class AudioProcessor:
         # Загружаем GigaAM только из уже подготовленного локального кэша.
         if not GIGAAM_AVAILABLE:
             raise RuntimeError("gigaam is not installed; transcription cannot run")
-        if not _has_gigaam_model():
-            raise RuntimeError(f"GigaAM model '{GIGAAM_MODEL_NAME}' is not prepared in {MODELS_DIR}. Run scripts/download_models.py first.")
+        assert_gigaam_ready(MODELS_DIR, GIGAAM_MODEL_NAME)
         devices_to_try = [str(self.device)] if getattr(self.device, "type", str(self.device)) == 'cuda' else ['cpu']
         if getattr(self.device, "type", str(self.device)) == 'cuda':
             devices_to_try.append('cpu')
         last_error = None
         for device in devices_to_try:
             try:
-                self.gigaam_model = gigaam.load_model(GIGAAM_MODEL_NAME, device=device)
+                self.gigaam_model = gigaam.load_model(GIGAAM_MODEL_NAME, device=device, download_root=str(GIGAAM_CACHE_DIR))
                 print(f"GigaAM модель загружена успешно на {device} из локального кэша")
                 break
             except Exception as e:
