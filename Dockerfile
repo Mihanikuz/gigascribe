@@ -14,7 +14,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg build-essential git \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt "requirements (4).txt" ./
+COPY requirements.txt "requirements-gigaam.txt" ./
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
