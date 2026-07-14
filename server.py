@@ -15,6 +15,7 @@ import importlib.util
 import json
 import os
 import secrets
+import hashlib
 import shutil
 import time
 import uuid
@@ -38,6 +39,7 @@ spec.loader.exec_module(giga_app)
 MODELS_DIR = Path(os.getenv("GIGASCRIBE_MODELS_DIR", "./models")).resolve()
 os.environ.setdefault("HF_HOME", str(MODELS_DIR / "huggingface"))
 os.environ.setdefault("TORCH_HOME", str(MODELS_DIR / "torch"))
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 BASE_DIR = Path(os.getenv("GIGASCRIBE_DATA_DIR", "./data")).resolve()
@@ -45,6 +47,7 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 RESULT_DIR = BASE_DIR / "results"
 USER_DB = Path(os.getenv("GIGASCRIBE_USERS_FILE", BASE_DIR / "users.json"))
 SECRET_KEY = os.getenv("GIGASCRIBE_SECRET_KEY", secrets.token_urlsafe(32))
+MAX_UPLOAD_BYTES = int(os.getenv("GIGASCRIBE_MAX_UPLOAD_BYTES", str(1024 * 1024 * 1024)))
 for directory in (UPLOAD_DIR, RESULT_DIR, USER_DB.parent):
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -119,8 +122,32 @@ def current_user(request: Request) -> str:
 
 
 def safe_name(name: str) -> str:
-    cleaned = "".join(ch for ch in name if ch.isalnum() or ch in "._- ()").strip()
+    cleaned = "".join(ch for ch in Path(name).name if ch.isalnum() or ch in "._- ()").strip()
     return cleaned or "audio"
+
+
+def safe_user_id(username: str) -> str:
+    digest = hashlib.sha256(username.encode("utf-8")).hexdigest()[:24]
+    return f"user-{digest}"
+
+
+def ensure_inside_base(path: Path) -> Path:
+    resolved = path.resolve()
+    if not resolved.is_relative_to(BASE_DIR):
+        raise HTTPException(status_code=400, detail="Invalid storage path")
+    return resolved
+
+
+def is_admin(username: str) -> bool:
+    users = _load_users()
+    return bool(username == "admin" and users.get(username) and not users[username].get("disabled"))
+
+
+def validate_upload_name(filename: str) -> str:
+    safe = safe_name(filename or "audio")
+    if Path(safe).suffix.lower() not in giga_app.SUPPORTED_FORMATS:
+        raise HTTPException(status_code=400, detail="Unsupported file extension")
+    return safe
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -151,14 +178,29 @@ def logout(request: Request):
 
 @app.post("/api/jobs")
 async def create_job(file: UploadFile = File(...), username: str = Depends(current_user)):
+    filename = validate_upload_name(file.filename or "audio")
     job_id = uuid.uuid4().hex
-    user_upload_dir = UPLOAD_DIR / username / job_id
-    user_result_dir = RESULT_DIR / username / job_id
+    user_dir = safe_user_id(username)
+    user_upload_dir = ensure_inside_base(UPLOAD_DIR / user_dir / job_id)
+    user_result_dir = ensure_inside_base(RESULT_DIR / user_dir / job_id)
     user_upload_dir.mkdir(parents=True, exist_ok=True)
     user_result_dir.mkdir(parents=True, exist_ok=True)
-    original_path = user_upload_dir / safe_name(file.filename or "audio")
-    with original_path.open("wb") as fh:
-        shutil.copyfileobj(file.file, fh)
+    original_path = ensure_inside_base(user_upload_dir / filename)
+    written = 0
+    try:
+        with original_path.open("wb") as fh:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="Uploaded file is too large")
+                fh.write(chunk)
+    except Exception:
+        if original_path.exists():
+            original_path.unlink()
+        raise
     job = JobState(id=job_id, username=username, filename=original_path.name, original_path=original_path, log_path=user_result_dir / "job.log")
     async with jobs_lock:
         jobs[job_id] = job
@@ -231,10 +273,12 @@ def download(job_id: str, kind: str, username: str = Depends(current_user)):
 
 @app.post("/admin/users")
 def create_local_user(credentials: HTTPBasicCredentials = Depends(security), username: str = Form(...), password: str = Form(...)):
-    if not _verify_local(credentials.username, credentials.password):
-        raise HTTPException(401)
+    if not _verify_local(credentials.username, credentials.password) or not is_admin(credentials.username):
+        raise HTTPException(403)
+    if not username or len(username) > 128:
+        raise HTTPException(400, detail="Invalid username")
     users = _load_users()
-    users[username] = {"password_hash": pwd_context.hash(password), "disabled": False}
+    users[username] = {"password_hash": pwd_context.hash(password), "disabled": False, "storage_id": safe_user_id(username)}
     USER_DB.write_text(json.dumps(users, indent=2, ensure_ascii=False), encoding="utf-8")
     return {"ok": True}
 

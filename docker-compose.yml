@@ -11,15 +11,20 @@ services:
       GIGASCRIBE_MODELS_DIR: /opt/gigascribe/models
       HF_HOME: /opt/gigascribe/models/huggingface
       TORCH_HOME: /opt/gigascribe/models/torch
+      HF_HUB_OFFLINE: "1"
     volumes:
       - ./data:/opt/gigascribe/data
       - ./models:/opt/gigascribe/models
     restart: unless-stopped
-    # Для GPU раскомментируйте блок ниже и установите NVIDIA Container Toolkit.
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/login"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    # CPU работает по умолчанию.
+    # Для NVIDIA GPU установите NVIDIA Container Toolkit и раскомментируйте блок ниже.
+    # gpus: all
+    # environment:
+    #   NVIDIA_VISIBLE_DEVICES: all
+    #   NVIDIA_DRIVER_CAPABILITIES: compute,utility
