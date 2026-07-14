@@ -28,7 +28,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from passlib.context import CryptContext
 from starlette.middleware.sessions import SessionMiddleware
 
-APP_MODULE_PATH = Path(__file__).with_name("app (1).py")
+APP_MODULE_PATH = Path(__file__).with_name("app.py")
 spec = importlib.util.spec_from_file_location("gigascribe_gradio_app", APP_MODULE_PATH)
 if spec is None or spec.loader is None:
     raise RuntimeError(f"Cannot load {APP_MODULE_PATH}")
