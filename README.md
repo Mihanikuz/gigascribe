@@ -1,120 +1,125 @@
 # GigaScribe
 
-GigaScribe — локальный сервис транскрибации: FFmpeg нормализует аудио, pyannote при наличии делает diarization, GigaAM выполняет распознавание, затем применяется autoreplacer.
+Локальный сервис транскрибации для Ubuntu/Docker Compose с режимами CPU и NVIDIA GPU.
 
-## Первая установка
+## Поддерживаемые модели
 
-```bash
-cp .env.example .env
-mkdir -p data models
-docker compose build
-docker compose run --rm gigascribe python scripts/download_models.py --models-dir /opt/gigascribe/models
-docker compose up -d
-```
+ASR: `GigaAM v2_ctc`, `GigaAM v3_ctc`. Диаризация: `pyannote speaker-diarization-3.1`, `pyannote speaker-diarization-community-1`, `Без диаризации`. Выбор сохраняется в `models/settings.json`; новые задания получают снимок настроек, уже запущенные задания не переключаются молча.
 
-`HF_TOKEN` нужен только для первой загрузки pyannote. Перед запуском команды скачивания примите условия `pyannote/speaker-diarization-3.1` и вложенной gated-модели `pyannote/segmentation-3.0` на Hugging Face и внесите токен в `.env`. Если полный локальный кэш уже создан, повторный запуск без `--force` не требует токен.
-
-## Где хранятся модели
-
-В Docker Compose подключен постоянный host volume:
-
-```yaml
-./models:/opt/gigascribe/models
-```
-
-Явные локальные пути:
-
-- pyannote snapshot: `/opt/gigascribe/models/pyannote-speaker-diarization-3.1`;
-- Hugging Face cache для вложенных моделей pyannote: `/opt/gigascribe/models/huggingface`;
-- GigaAM cache: `/opt/gigascribe/models/gigaam-cache`;
-- checkpoint GigaAM `v2_ctc`: `/opt/gigascribe/models/gigaam-cache/v2_ctc.ckpt`;
-- marker GigaAM: `/opt/gigascribe/models/gigaam/v2_ctc/.gigaam-ready.json`.
-
-Модели не входят в Docker-образ. `docker compose down/up`, пересборка образа и удаление контейнера не удаляют `./models`. Для полного удаления моделей удалите каталог вручную:
+## Быстрый старт CPU
 
 ```bash
-rm -rf ./models
+cp .env.example .env  # если шаблон отсутствует, создайте .env вручную
+printf 'GIGASCRIBE_SECRET_KEY=%s\nGIGASCRIBE_ADMIN_PASSWORD=%s\nHOST_UID=%s\nHOST_GID=%s\n' "$(openssl rand -hex 32)" "change-this-password" "$(id -u)" "$(id -g)" > .env
+scripts/preflight.sh cpu
+docker compose up -d --build
 ```
 
-## Проверка загрузки
+CPU-образ использует `requirements-cpu.txt` и не скачивает CUDA wheels.
+
+## Быстрый старт NVIDIA GPU / RTX 50xx
+
+1. Проверьте GPU: `nvidia-smi`.
+2. Установите драйвер NVIDIA и NVIDIA Container Toolkit.
+3. Настройте runtime:
 
 ```bash
-docker compose run --rm gigascribe test -f /opt/gigascribe/models/pyannote-speaker-diarization-3.1/.pyannote-ready.json
-docker compose run --rm gigascribe test -s /opt/gigascribe/models/gigaam-cache/v2_ctc.ckpt
-docker compose run --rm gigascribe test -f /opt/gigascribe/models/gigaam/v2_ctc/.gigaam-ready.json
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
 ```
 
-## Обычный запуск без интернета
-
-Runtime mode использует `HF_HUB_OFFLINE=1`, `HF_HOME=/opt/gigascribe/models/huggingface`, локальные marker-файлы и предварительную проверку checkpoint GigaAM до вызова `gigaam.load_model(..., download_root="/opt/gigascribe/models/gigaam-cache")`. После первой загрузки можно запускать сервис без доступа в интернет:
+4. Проверьте Docker GPU:
 
 ```bash
-docker compose up -d
+docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu22.04 nvidia-smi
 ```
 
-Если GigaAM отсутствует, задание завершается `status="error"`, потому что транскрибация невозможна. Если pyannote отсутствует, сервис выводит предупреждение и работает в документированном fallback-режиме с одним спикером.
-
-## Download mode
-
-Скрипт `scripts/download_models.py` временно переводит Hugging Face Hub в online mode для загрузки, явно передает GigaAM `download_root=/opt/gigascribe/models/gigaam-cache`, создает pyannote pipeline online, затем включает offline mode и повторно создает pipeline без сети. Исправные модели не перекачиваются без `--force`. Marker создается только после проверки реального checkpoint/offline pipeline.
-
-Принудительно обновить обе модели безопасно: GigaAM скачивается во временный каталог, проверяется и только затем атомарно заменяет рабочий checkpoint; старая модель остается на месте при ошибке.
+5. Запустите preflight и сервис:
 
 ```bash
-docker compose run --rm gigascribe python scripts/download_models.py --models-dir /opt/gigascribe/models --force
+scripts/preflight.sh gpu
+docker compose -f compose.yaml -f compose.gpu.yaml up -d --build
 ```
 
-Скачать только pyannote:
+GPU-сборка использует `requirements-cu128.txt` с `torch==2.7.0`, `torchaudio==2.7.0` и индексом `https://download.pytorch.org/whl/cu128`. Для RTX 5060 Ti проверяйте, что `torch.cuda.get_arch_list()` содержит `sm_120`, а реальная CUDA-операция проходит. Версия CUDA в `nvidia-smi` и `torch.version.cuda` может отличаться; это нормально при достаточно новом драйвере.
+
+## Проверка PyTorch внутри контейнера
 
 ```bash
-docker compose run --rm gigascribe python scripts/download_models.py --models-dir /opt/gigascribe/models --skip-gigaam
+docker compose exec gigascribe python - <<'PY'
+import torch, torchaudio
+print(torch.__version__, torchaudio.__version__, torch.version.cuda)
+print(torch.cuda.get_device_name(0))
+print(torch.cuda.get_device_capability(0))
+print(torch.cuda.get_arch_list())
+x = torch.randn((2048, 2048), device='cuda')
+y = x @ x
+torch.cuda.synchronize()
+print('cuda real test ok')
+PY
 ```
 
-Скачать/прогреть только GigaAM:
+Если RTX 5060 Ti обнаружена, но `sm_120` отсутствует, установлена несовместимая сборка PyTorch; используйте CUDA 12.8 wheel.
+
+## Скачивание моделей
 
 ```bash
-docker compose run --rm gigascribe python scripts/download_models.py --models-dir /opt/gigascribe/models --skip-pyannote
+python scripts/download_models.py --models-dir ./models --gigaam-model v2_ctc --skip-pyannote
+python scripts/download_models.py --models-dir ./models --gigaam-model v3_ctc --skip-pyannote
+HF_TOKEN=... python scripts/download_models.py --models-dir ./models --skip-gigaam
+python scripts/download_models.py --models-dir ./models --offline
 ```
 
-## Пользователи
+`gigaam==0.1.0` устанавливается в Docker через `pip install --no-deps`, потому что metadata пакета ограничивает `torch<=2.5.1`. Это временный обход ограничения metadata, а не скрытие конфликта; совместимость должна подтверждаться smoke-тестами импорта, загрузки `v2_ctc`/`v3_ctc`, CPU/CUDA-инференса, длинного аудио и повторной загрузки.
 
-Администратор по умолчанию: `admin`, пароль задается `GIGASCRIBE_ADMIN_PASSWORD` в `.env`. Создавать локальных пользователей может только администратор:
+Для локального pyannote используется путь к `config.yaml`, marker `.pyannote-ready.json` создаётся только после загрузочной проверки. HF token лучше передавать одноразово или через secret; не публикуйте вывод `docker compose config`, он может раскрыть `.env`.
 
-```bash
-curl -u admin:change-me -F username=ivan -F password='strong-password' http://localhost:8000/admin/users
-```
+## API и UI
 
-## GPU NVIDIA
+Доступны `/api/models`, `/api/models/status`, `/api/models/download`, `/api/models/verify`, `/api/models/select`, `DELETE /api/models/{model_id}`, `/api/models/{model_id}/test`, `/api/system`, `/api/system/gpu`, а также `/health/live`, `/health/ready`, `/health/models`, `/health/gpu`.
 
-CPU поддерживается по умолчанию. Для GPU установите NVIDIA Container Toolkit и раскомментируйте пример `gpus: all` в `docker-compose.yml`. Torch/GigaAM автоматически используют CUDA, если она доступна, иначе выполняется CPU fallback.
+## Snap Docker не поддерживается для GPU
 
-## Зависимости
+`preflight.sh gpu` останавливает установку при Snap Docker или `Docker Root Dir: /var/snap/docker/...`. Используйте Docker Engine из apt-репозитория Docker или системный `docker.io` и Docker Compose v2. После миграции проверьте `Docker Root Dir: /var/lib/docker` и сокет `/run/docker.sock`.
 
-Проект использует Python 3.11, поэтому backport-пакеты `asyncio`, `dataclasses`, `pathlib2`, `zipfile36` удалены. Критические ML-зависимости ограничены совместимой группой: `torch`/`torchaudio` одной версии, `pyannote.audio` 3.1.x для модели diarization 3.1, `numpy<2` для совместимости с аудио/ML стеком, `huggingface_hub<0.30` из-за используемого API `snapshot_download(local_dir=...)`. GigaAM вызывается только через официальный `gigaam.load_model(model_name, device=..., download_root=...)`; локальный path API в коде не используется, потому что он не подтвержден как стабильный.
+## Диагностика остановки контейнеров
 
-
-## Права bind mounts
-
-Контейнер не запускает сервер от root. UID/GID пользователя `gigascribe` задаются build args `HOST_UID` и `HOST_GID` (см. `.env.example`). Для Linux-хоста обычно достаточно:
+При `cannot stop container: permission denied` проверьте одновременный Snap/system Docker, `which dockerd`, `which nvidia-container-runtime`, Docker Root Dir, AppArmor, `docker.socket` и старые контейнеры от другого daemon. Не используйте `kill -9` как штатный способ. Проверочный сценарий:
 
 ```bash
-echo "HOST_UID=$(id -u)" >> .env
-echo "HOST_GID=$(id -g)" >> .env
-docker compose build
-```
-
-Так пользователь внутри контейнера совпадает с владельцем `./data` и `./models` на хосте и может создать `data/users.json`, сохранить загруженный файл, результат транскрибации и модели без `chmod 777`.
-
-## Healthcheck
-
-- `GET /health/live` проверяет только живой HTTP-процесс.
-- `GET /health/ready` проверяет запись в `data` и `models`, наличие `ffmpeg/ffprobe` и локального checkpoint GigaAM. Pyannote отражается в JSON, но его отсутствие не делает сервис полностью недоступным, потому что поддерживается fallback одного спикера.
-
-## Полное удаление моделей
-
-```bash
+docker compose stop
+docker compose start
+docker compose restart
 docker compose down
-rm -rf ./models/*
 ```
 
-После этого снова выполните команду первой установки. `docker compose down` и пересборка образа сами по себе содержимое `./models` не удаляют.
+## Права и .env
+
+Контейнер запускается не от root и поддерживает `HOST_UID`/`HOST_GID`. После изменения `.env` пересоздайте контейнер:
+
+```bash
+docker compose up -d --force-recreate
+```
+
+Production нельзя запускать с `GIGASCRIBE_SECRET_KEY=change-me-long-random-string`; сгенерируйте ключ через `openssl rand -hex 32`.
+
+## Тесты
+
+```bash
+python -m pytest
+python -m pytest tests/test_requirements_integrity.py tests/test_password_validation.py
+scripts/preflight.sh cpu
+```
+
+## Migration guide
+
+1. Сделайте backup `data/` и `models/`.
+2. Разделите старый `requirements.txt` на новые файлы или используйте поставляемые файлы.
+3. Создайте `.env` с безопасным `GIGASCRIBE_SECRET_KEY`, `HOST_UID`, `HOST_GID`.
+4. Для GPU удалите Snap Docker и установите Docker/Compose v2 + NVIDIA Container Toolkit.
+5. Перескачайте/проверьте модели через `scripts/download_models.py --offline`; при ошибке выполните загрузку с `--force`.
+6. Запустите CPU или GPU compose-команду и проверьте `/health/ready`.
+
+## Известные ограничения
+
+В этом репозитории нет доступа к реальной RTX 5060 Ti, поэтому фактические замеры VRAM и скорости должны выполняться на целевом хосте через `/api/system/gpu` и job logs. Реальный CUDA-smoke, pyannote gated downloads и инференс зависят от установленного драйвера, HF-доступа и локальных model snapshots.

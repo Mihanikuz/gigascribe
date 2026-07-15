@@ -1,8 +1,8 @@
 .git
-.venv
 __pycache__
+.pytest_cache
 *.pyc
-*.log
-data/*
-models/*
+data/
+models/
 .env
+transcription_app.log
