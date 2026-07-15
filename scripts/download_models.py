@@ -45,9 +45,10 @@ def download_pyannote(models_dir: Path, token: str | None, *, force: bool = Fals
     snapshot_download(repo_id=PYANNOTE_REPO_ID, local_dir=target, local_dir_use_symlinks=False, token=token, force_download=force)
     # Materialize gated nested dependency used by pipeline config.
     snapshot_download(repo_id=PYANNOTE_SEGMENTATION_REPO_ID, token=token, force_download=force)
-    Pipeline.from_pretrained(str(target), use_auth_token=token)
+    config = target / "config.yaml"
+    Pipeline.from_pretrained(str(config), use_auth_token=token)
     os.environ["HF_HUB_OFFLINE"] = "1"
-    Pipeline.from_pretrained(str(target))
+    Pipeline.from_pretrained(str(config))
     write_pyannote_marker(models_dir)
     return target
 
@@ -89,16 +90,24 @@ def warm_up_gigaam(models_dir: Path, model_name: str, *, force: bool = False) ->
 def main() -> int:
     parser = argparse.ArgumentParser(description="Download GigaScribe models to a persistent directory")
     parser.add_argument("--models-dir", default=os.getenv("GIGASCRIBE_MODELS_DIR", "./models"))
-    parser.add_argument("--gigaam-model", default=os.getenv("GIGASCRIBE_GIGAAM_MODEL", "v2_ctc"))
+    parser.add_argument("--gigaam-model", default=os.getenv("GIGASCRIBE_GIGAAM_MODEL", "v2_ctc"), choices=["v2_ctc", "v3_ctc"])
+    parser.add_argument("--offline", action="store_true", help="verify existing markers without network downloads")
     parser.add_argument("--skip-gigaam", action="store_true")
     parser.add_argument("--skip-pyannote", action="store_true")
     parser.add_argument("--force", action="store_true", help="download/warm up models again even if readiness markers exist")
     args = parser.parse_args()
 
     models_dir = Path(args.models_dir).expanduser().resolve()
-    configure_model_dirs(models_dir, offline=False)
+    configure_model_dirs(models_dir, offline=args.offline)
     paths: dict[str, str] = {}
     try:
+        if args.offline:
+            if not args.skip_gigaam and not is_gigaam_ready(models_dir, args.gigaam_model):
+                raise RuntimeError("GigaAM offline verification failed")
+            if not args.skip_pyannote and not is_pyannote_ready(models_dir):
+                raise RuntimeError("Pyannote offline verification failed")
+            print("Offline verification passed")
+            return 0
         if not args.skip_gigaam:
             print(f"Preparing GigaAM model '{args.gigaam_model}' in {models_dir}")
             paths["gigaam"] = str(warm_up_gigaam(models_dir, args.gigaam_model, force=args.force))

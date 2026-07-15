@@ -1,0 +1,10 @@
+services:
+  gigascribe:
+    build:
+      args:
+        TORCH_REQUIREMENTS: requirements-cu128.txt
+    gpus: all
+    environment:
+      GIGASCRIBE_DEVICE: cuda
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility

@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from model_store import assert_gigaam_ready, gigaam_cache_dir, is_gigaam_ready, is_pyannote_ready, pyannote_target
+from model_store import assert_gigaam_ready, gigaam_cache_dir, is_gigaam_ready, is_pyannote_ready, pyannote_target, load_settings, SUPPORTED_GIGAAM_MODELS
 
 MODELS_DIR = Path(os.getenv("GIGASCRIBE_MODELS_DIR", "./models")).resolve()
 os.environ.setdefault("HF_HOME", str(MODELS_DIR / "huggingface"))
@@ -27,7 +27,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 PYANNOTE_LOCAL_PATH = Path(os.getenv("GIGASCRIBE_PYANNOTE_MODEL", pyannote_target(MODELS_DIR))).resolve()
-GIGAAM_MODEL_NAME = os.getenv("GIGASCRIBE_GIGAAM_MODEL", "v2_ctc")
+GIGAAM_MODEL_NAME = SUPPORTED_GIGAAM_MODELS[load_settings(MODELS_DIR)["asr_model"]]["model_name"]
 GIGAAM_CACHE_DIR = gigaam_cache_dir(MODELS_DIR)
 
 
@@ -67,20 +67,20 @@ try:
     import gigaam
 
     GIGAAM_AVAILABLE = True
-except ImportError:
-    print("Warning: gigaam not available, will use fallback")
+except Exception as e:
+    print(f"Warning: gigaam not available, will use fallback: {e}")
     GIGAAM_AVAILABLE = False
 
 try:
     import torch
-except ImportError:
+except Exception:
     torch = None
 
 try:
     from pyannote.audio import Pipeline
 
     PYANNOTE_AVAILABLE = torch is not None
-except ImportError:
+except Exception:
     print("Warning: pyannote.audio not available")
     PYANNOTE_AVAILABLE = False
 
@@ -90,7 +90,7 @@ MAX_FILE_DURATION = 9000  # 2 часа в секундах
 SUPPORTED_FORMATS = ['.mp3', '.wav', '.mp4', '.avi', '.webm', '.m4a', '.flac', '.ogg']
 
 # GPU конфигурация
-DEVICE = torch.device("cuda" if torch is not None and torch.cuda.is_available() else "cpu") if torch is not None else type("CPUDevice", (), {"type": "cpu", "__str__": lambda self: "cpu"})()
+DEVICE = torch.device("cuda" if torch is not None and load_settings(MODELS_DIR).get("device") == "cuda" and torch.cuda.is_available() else "cpu") if torch is not None else type("CPUDevice", (), {"type": "cpu", "__str__": lambda self: "cpu"})()
 CUDA_OOM = torch.cuda.OutOfMemoryError if torch is not None else RuntimeError
 MAX_BATCH_SIZE = 8  # Начальный размер батча для параллельной обработки
 MIN_BATCH_SIZE = 1  # Минимальный размер батча при нехватке памяти
@@ -176,9 +176,9 @@ class AudioProcessor:
                               "Загрузка модели для разделения спикеров на GPU..." if getattr(self.device, "type", str(self.device)) == 'cuda' else "Загрузка модели для разделения спикеров на CPU...")
 
         # Загружаем pyannote только из локального snapshot; отсутствие не критично.
-        if PYANNOTE_AVAILABLE and _has_pyannote_model():
+        if load_settings(MODELS_DIR).get("diarization_model") != "none" and PYANNOTE_AVAILABLE and _has_pyannote_model():
             try:
-                self.diarization_pipeline = Pipeline.from_pretrained(str(PYANNOTE_LOCAL_PATH))
+                self.diarization_pipeline = Pipeline.from_pretrained(str(PYANNOTE_LOCAL_PATH / "config.yaml"))
                 if getattr(self.device, "type", str(self.device)) == 'cuda':
                     self.diarization_pipeline = self.diarization_pipeline.to(self.device)
                 print(f"Pyannote модель загружена успешно на {self.device} из {PYANNOTE_LOCAL_PATH}")
@@ -402,7 +402,7 @@ class AudioProcessor:
                         )
                         batch_results.append(result.strip() if result else "")
                     except Exception as e:
-                        logger.error(f"Ошибка транскрипции файла {valid_batch[0]}: {e}")
+                        logger.exception("Ошибка транскрипции файла %s", valid_batch[0])
                         batch_results.append(f"[Ошибка транскрипции: {type(e).__name__}]")
                 else:
                     # Батчевая обработка если поддерживается
@@ -428,7 +428,7 @@ class AudioProcessor:
                                 batch_results.append(f"[Ошибка транскрипции: {type(e).__name__}]")
                     except Exception as e:
                         # Fallback на одиночную обработку при других ошибках
-                        logger.error(f"Ошибка батчевой транскрипции: {e}")
+                        logger.exception("Ошибка батчевой транскрипции")
                         for audio_path in valid_batch:
                             try:
                                 result = await loop.run_in_executor(
@@ -464,7 +464,7 @@ class AudioProcessor:
 
             except Exception as e:
                 print(f"Ошибка обработки батча: {e}")
-                logger.error(f"Ошибка обработки батча: {e}")
+                logger.exception("Ошибка обработки батча")
                 # Fallback на одиночную обработку
                 for audio_path in batch:
                     try:

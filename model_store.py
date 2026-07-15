@@ -10,7 +10,7 @@ PYANNOTE_SEGMENTATION_REPO_ID = "pyannote/segmentation-3.0"
 PYANNOTE_DIRNAME = "pyannote-speaker-diarization-3.1"
 GIGAAM_MARKER_NAME = ".gigaam-ready.json"
 PYANNOTE_MARKER_NAME = ".pyannote-ready.json"
-GIGAAM_CHECKPOINTS = {"v2_ctc": "v2_ctc.ckpt"}
+GIGAAM_CHECKPOINTS = {"v2_ctc": "v2_ctc.ckpt", "v3_ctc": "v3_ctc.ckpt"}
 
 
 def models_dir() -> Path:
@@ -112,3 +112,45 @@ def write_pyannote_marker(base: Path) -> None:
     if not (target / "config.yaml").is_file():
         raise RuntimeError(f"Pyannote snapshot is incomplete: {target}")
     atomic_write_json(pyannote_marker_path(base), {"repo_id": PYANNOTE_REPO_ID, "path": str(target), "nested_repos": [PYANNOTE_SEGMENTATION_REPO_ID], "offline_verified": True})
+
+SUPPORTED_GIGAAM_MODELS = {
+    "gigaam-v2-ctc": {"kind":"asr","label":"GigaAM v2_ctc","model_name":"v2_ctc","version":"v2_ctc","speed":"быстро","vram":"низкая","hf_token_required":False,"terms_required":False},
+    "gigaam-v3-ctc": {"kind":"asr","label":"GigaAM v3_ctc","model_name":"v3_ctc","version":"v3_ctc","speed":"средне","vram":"средняя","hf_token_required":False,"terms_required":False},
+}
+SUPPORTED_DIARIZATION_MODELS = {
+    "none": {"kind":"diarization","label":"Без диаризации","model_name":"none","version":"none","speed":"максимальная","vram":"0","hf_token_required":False,"terms_required":False},
+    "pyannote-3.1": {"kind":"diarization","label":"pyannote speaker-diarization-3.1","model_name":"speaker-diarization-3.1","repo_id":"pyannote/speaker-diarization-3.1","version":"3.1","speed":"средне","vram":"средняя","hf_token_required":True,"terms_required":True},
+    "pyannote-community-1": {"kind":"diarization","label":"pyannote speaker-diarization-community-1","model_name":"speaker-diarization-community-1","repo_id":"pyannote/speaker-diarization-community-1","version":"community-1","speed":"средне","vram":"средняя","hf_token_required":True,"terms_required":True},
+}
+PROFILES = {
+    "max_speed": {"label":"Максимальная скорость","asr_model":"gigaam-v2-ctc","diarization_model":"none","device":"cuda"},
+    "balanced": {"label":"Сбалансированный","asr_model":"gigaam-v3-ctc","diarization_model":"pyannote-community-1","device":"cuda"},
+    "compatibility": {"label":"Совместимость","asr_model":"gigaam-v2-ctc","diarization_model":"pyannote-3.1","device":"cuda"},
+    "cpu": {"label":"CPU","asr_model":"gigaam-v2-ctc","diarization_model":"none","device":"cpu","warning":"CPU режим медленнее; параллелизм ограничен."},
+}
+
+def settings_path(base: Path | None = None) -> Path:
+    return (base or models_dir()) / "settings.json"
+
+def default_settings() -> dict[str, Any]:
+    return {"asr_model":"gigaam-v2-ctc","diarization_model":"none","device":os.getenv("GIGASCRIBE_DEVICE","cpu")}
+
+def load_settings(base: Path | None = None) -> dict[str, Any]:
+    data = _read_json(settings_path(base)) or {}
+    settings = {**default_settings(), **data}
+    if settings["asr_model"] not in SUPPORTED_GIGAAM_MODELS: settings["asr_model"] = "gigaam-v2-ctc"
+    if settings["diarization_model"] not in SUPPORTED_DIARIZATION_MODELS: settings["diarization_model"] = "none"
+    if settings["device"] not in {"cpu","cuda"}: settings["device"] = "cpu"
+    return settings
+
+def save_settings(settings: dict[str, Any], base: Path | None = None) -> dict[str, Any]:
+    current = load_settings(base); current.update(settings)
+    if current["asr_model"] not in SUPPORTED_GIGAAM_MODELS: raise ValueError("Unsupported ASR model")
+    if current["diarization_model"] not in SUPPORTED_DIARIZATION_MODELS: raise ValueError("Unsupported diarization model")
+    if current["device"] not in {"cpu","cuda"}: raise ValueError("Unsupported device")
+    atomic_write_json(settings_path(base), current)
+    return current
+
+def pyannote_target_for(base: Path, model_id: str) -> Path:
+    if model_id == "pyannote-community-1": return base / "pyannote-speaker-diarization-community-1"
+    return pyannote_target(base)
