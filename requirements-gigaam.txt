@@ -1,3 +1,6 @@
-# gigaam 0.1.0 declares torch<=2.5.1; Docker installs it with --no-deps
-# after torch 2.7.0 and compatibility smoke tests must validate runtime behavior.
-gigaam==0.1.0
+# Runtime dependencies of gigaam==0.1.0 installed before the package itself.
+# Docker installs gigaam with --no-deps because its published metadata pins an
+# obsolete torch<=2.5.1.  Keep torch and torchaudio out of this file.
+hydra-core>=1.3,<1.4
+omegaconf>=2.3,<2.4
+sentencepiece>=0.1.99,<0.3

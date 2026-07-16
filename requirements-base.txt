@@ -1,4 +1,3 @@
--r requirements-gigaam.txt
 gradio==5.38.2
 requests>=2.31.0,<3.0.0
 fastapi>=0.111.0
