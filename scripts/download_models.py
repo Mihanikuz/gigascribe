@@ -93,7 +93,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Download GigaScribe models to a persistent directory")
     parser.add_argument("--models-dir", default=os.getenv("GIGASCRIBE_MODELS_DIR", "./models"))
     parser.add_argument("--gigaam-model", default=os.getenv("GIGASCRIBE_GIGAAM_MODEL", "v2_ctc"), choices=["v2_ctc", "v3_ctc"])
-    parser.add_argument("--offline", action="store_true", help="verify existing markers without network downloads")
+    parser.add_argument("--offline", "--offline-verify", dest="offline", action="store_true", help="verify existing markers without network downloads")
+    parser.add_argument("--pyannote-model", default="pyannote-3.1", choices=["pyannote-3.1", "pyannote-community-1"])
     parser.add_argument("--skip-gigaam", action="store_true")
     parser.add_argument("--skip-pyannote", action="store_true")
     parser.add_argument("--force", action="store_true", help="download/warm up models again even if readiness markers exist")
@@ -106,7 +107,7 @@ def main() -> int:
         if args.offline:
             if not args.skip_gigaam and not is_gigaam_ready(models_dir, args.gigaam_model):
                 raise RuntimeError("GigaAM offline verification failed")
-            if not args.skip_pyannote and not is_pyannote_ready(models_dir):
+            if not args.skip_pyannote and not is_pyannote_ready(models_dir, args.pyannote_model):
                 raise RuntimeError("Pyannote offline verification failed")
             print("Offline verification passed")
             return 0
@@ -115,7 +116,7 @@ def main() -> int:
             paths["gigaam"] = str(warm_up_gigaam(models_dir, args.gigaam_model, force=args.force))
         if not args.skip_pyannote:
             print(f"Preparing pyannote model in {models_dir}")
-            paths["pyannote"] = str(download_pyannote(models_dir, os.getenv("HF_TOKEN") or None, force=args.force))
+            paths["pyannote"] = str(download_pyannote(models_dir, os.getenv("HF_TOKEN") or None, model_id=args.pyannote_model, force=args.force))
         print("Model paths:")
         for name, path in paths.items():
             print(f"  {name}: {path}")

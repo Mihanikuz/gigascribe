@@ -206,36 +206,36 @@ def _model_checks(load: bool = False) -> dict[str, Any]:
     checks = {
         "gigaam_files": is_gigaam_ready(MODELS_DIR, asr_name),
         "gigaam_import": gigaam_import,
-        "gigaam_load": False,
+        "gigaam_load": "not_run",
         "pyannote_files": st["diarization_model"] == "none" or is_pyannote_ready(MODELS_DIR, st["diarization_model"]),
         "pyannote_import": pyannote_import,
-        "pyannote_load": st["diarization_model"] == "none",
+        "pyannote_load": "ok" if st["diarization_model"] == "none" else "not_run",
     }
     # A load test is deliberately opt-in: /health/ready must remain cheap and
     # must not allocate a second model instance during normal request probes.
     # Presence is deliberately not a load result.  Explicit /health/models or
     # model test records a real load attempt; ready stays inexpensive.
-    checks["gigaam_load"] = False
-    checks["pyannote_load"] = st["diarization_model"] == "none"
-    if load and checks["gigaam_load"]:
+    if load:
         try:
             import gigaam
             gigaam.load_model(asr_name, device=st["device"], download_root=str(MODELS_DIR / "gigaam-cache"))
+            checks["gigaam_load"] = "ok"
         except Exception as exc:
-            checks["gigaam_load"] = False
+            checks["gigaam_load"] = "failed"
             checks["gigaam_error"] = str(exc)
-    if load and st["diarization_model"] != "none" and checks["pyannote_load"]:
+    if load and st["diarization_model"] != "none":
         try:
             from pyannote.audio import Pipeline
             from model_store import pyannote_target_for
-            Pipeline.from_pretrained(str(pyannote_target_for(MODELS_DIR, st["diarization_model"])))
+            Pipeline.from_pretrained(str(pyannote_target_for(MODELS_DIR, st["diarization_model"]) / "config.yaml"))
+            checks["pyannote_load"] = "ok"
         except Exception as exc:
-            checks["pyannote_load"] = False
+            checks["pyannote_load"] = "failed"
             checks["pyannote_error"] = str(exc)
     checks["gigaam"] = {
         "import": "ok" if gigaam_import else "failed", "dependencies": "ok" if gigaam_import else "failed",
-        "checkpoint": "exists" if checks["gigaam_files"] else "missing", "load": "ok" if checks["gigaam_load"] else "not_run",
-        "device": "ok" if st["device"] == "cpu" or checks["gigaam_load"] else "failed",
+        "checkpoint": "exists" if checks["gigaam_files"] else "missing", "load": checks["gigaam_load"],
+        "device": "not_run" if st["device"] == "cuda" and not load else ("ok" if st["device"] == "cpu" or checks["gigaam_load"] == "ok" else "failed"),
     }
     return checks
 
@@ -246,7 +246,9 @@ def health_ready():
     settings = load_settings(MODELS_DIR)
     checks = {"data_writable": _writable_dir(BASE_DIR), "models_writable": _writable_dir(MODELS_DIR), "secret_key_configured": SECRET_KEY_CONFIGURED, "ffmpeg": shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None, **_model_checks()}
     checks["gigaam"] = checks["gigaam_files"] and checks["gigaam_import"]
-    checks["pyannote"] = checks["pyannote_files"] and checks["pyannote_import"] and checks["pyannote_load"]
+    # Readiness deliberately does not represent a model load: the explicit models
+    # endpoint is the only endpoint that allocates a test model instance.
+    checks["pyannote"] = checks["pyannote_files"] and checks["pyannote_import"]
     gpu = gpu_info(real_test=settings["device"] == "cuda")
     checks["device_works"] = settings["device"] == "cpu" or bool(gpu.get("real_cuda_test",{}).get("ok"))
     required = all(checks.values())
@@ -325,20 +327,25 @@ def schedule_job(job_id: str) -> None:
 
 
 async def run_job(job_id: str) -> None:
-    job = job_store.get(job_id)
-    if not job or job["status"] != "queued": return
+    job = job_store.claim(job_id)
+    if not job: return
     result_dir = Path(job["log_path"]).parent
     def log(line: str) -> None:
         with Path(job["log_path"]).open("a", encoding="utf-8") as fh: fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
     def progress(value: float, message: str) -> None:
         value = round(max(0.0, min(1.0, value)), 3); job_store.update(job_id, progress=value, message=message); log(f"{value:.0%} {message}")
     try:
-        job_store.update(job_id, status="running", started_at=time.time(), attempts=job["attempts"] + 1)
         snapshot = job["settings_snapshot"]; progress(.01, "Инициализация задания")
         processor = giga_app.AudioProcessor(snapshot=snapshot)
         worker = gpu_worker if snapshot.get("device") == "cuda" else cpu_worker
+        if job_store.get(job_id)["cancel_requested"]:
+            job_store.update(job_id,status="cancelled",finished_at=time.time(),message="Отменено"); return
         async with worker:
+            if job_store.get(job_id)["cancel_requested"]:
+                job_store.update(job_id,status="cancelled",finished_at=time.time(),message="Отменено"); return
             await processor.initialize_models(lambda p,m: progress(p*.1,m))
+            if job_store.get(job_id)["cancel_requested"]:
+                job_store.update(job_id,status="cancelled",finished_at=time.time(),message="Отменено"); return
             work = processor.process_single_file(job["original_path"], progress, original_filename=job["filename"], artifacts_dir=str(result_dir))
             result = await asyncio.wait_for(work, job["timeout_seconds"]) if job["timeout_seconds"] else await work
         if job_store.get(job_id)["cancel_requested"]:
@@ -378,11 +385,18 @@ async def retry_job(job_id: str, username: str = Depends(current_user)):
     job=job_store.get(job_id)
     if not job or job["username"] != username: raise HTTPException(404)
     if job["status"] not in {"failed","cancelled"}: raise HTTPException(409, detail="Only failed or cancelled jobs can be retried")
-    job_store.update(job_id,status="queued",progress=0,message="В очереди",error=None,started_at=None,finished_at=None,cancel_requested=0); schedule_job(job_id)
+    try: job_store.retry(job_id)
+    except ValueError as exc: raise HTTPException(409, detail=str(exc))
+    # Preserve upload but retire result artefacts: stale downloads cannot become
+    # the result of the next attempt.
+    result_dir = Path(job["log_path"]).parent
+    for artifact in result_dir.iterdir() if result_dir.exists() else ():
+        if artifact.is_file(): artifact.unlink(missing_ok=True)
+    schedule_job(job_id)
     return serialize_job(job_store.get(job_id))
 
 def serialize_job(job: dict[str, Any]) -> dict[str, Any]:
-    return {"id":job["id"],"filename":job["filename"],"status":job["status"],"progress":job["progress"],"message":job["message"],"error":job["error"],"settings":job["settings_snapshot"],"actual_device":job["actual_device"],"actual_models":job["actual_models"],"downloads":{k:bool(job[f"{k}_path"]) for k in ("transcript","log","original","wav")}}
+    return {"id":job["id"],"filename":job["filename"],"status":job["status"],"progress":job["progress"],"message":job["message"],"error":job["error"],"settings":job["settings_snapshot"],"requested_models":job["requested_models"],"requested_device":job["requested_device"],"actual_device":job["actual_device"],"actual_models":job["actual_models"],"attempts":job["attempts"],"correlation_id":job["correlation_id"],"downloads":{k:bool(job[f"{k}_path"]) for k in ("transcript","log","original","wav")}}
 
 @app.get("/api/jobs/{job_id}/download/{kind}")
 def download(job_id: str, kind: str, username: str = Depends(current_user)):
@@ -467,13 +481,31 @@ def api_models_test(model_id: str, username: str = Depends(require_admin)):
         if model_id in SUPPORTED_GIGAAM_MODELS:
             meta=SUPPORTED_GIGAAM_MODELS[model_id]
             if not is_gigaam_ready(MODELS_DIR, meta["model_name"]): raise RuntimeError("Model is not installed or integrity verification failed")
-            import gigaam; gigaam.load_model(meta["model_name"], device="cpu", download_root=str(MODELS_DIR / "gigaam-cache"))
+            import gigaam, wave
+            # A generated, valid one-frame WAV proves inference for *this* model
+            # without shipping a binary fixture in the repository.
+            probe = MODELS_DIR / ".model-test.wav"
+            with wave.open(str(probe), "wb") as wav:
+                wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(16000); wav.writeframes(b"\0\0" * 1600)
+            try:
+                model = gigaam.load_model(meta["model_name"], device="cpu", download_root=str(MODELS_DIR / "gigaam-cache"))
+                result = model.transcribe(str(probe))
+                if result is None: raise RuntimeError("Inference returned no result")
+            finally: probe.unlink(missing_ok=True)
         elif model_id in SUPPORTED_DIARIZATION_MODELS and model_id != "none":
             if not is_pyannote_ready(MODELS_DIR, model_id): raise RuntimeError("Model is not installed or integrity verification failed")
-            from pyannote.audio import Pipeline; Pipeline.from_pretrained(str(pyannote_target_for(MODELS_DIR, model_id) / "config.yaml"))
+            from pyannote.audio import Pipeline
+            pipeline = Pipeline.from_pretrained(str(pyannote_target_for(MODELS_DIR, model_id) / "config.yaml"))
+            # Pipeline invocation is intentional; loading alone is not a smoke test.
+            import wave
+            probe = MODELS_DIR / ".model-test.wav"
+            with wave.open(str(probe), "wb") as wav:
+                wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(16000); wav.writeframes(b"\0\0" * 1600)
+            try: pipeline(str(probe))
+            finally: probe.unlink(missing_ok=True)
         elif model_id == "none": return {"ok": True, "model_id": model_id, "load_test": "not_applicable"}
         else: raise HTTPException(404, detail="Unknown model")
-        return {"ok": True, "model_id": model_id, "load_test": "ok", "inference_test": "not_run"}
+        return {"ok": True, "model_id": model_id, "load_test": "ok", "inference_test": "ok"}
     except HTTPException: raise
     except Exception as exc:
         logger.exception("model test failed model_id=%s", model_id)
