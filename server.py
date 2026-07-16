@@ -202,18 +202,43 @@ def _import_ok(name: str) -> bool:
     except Exception: return False
 
 def _model_checks(load: bool = False) -> dict[str, Any]:
+    """Report every prerequisite separately; never hide an import failure as "false"."""
     from model_store import load_settings, SUPPORTED_GIGAAM_MODELS, is_gigaam_ready, is_pyannote_ready
     st = load_settings(MODELS_DIR); asr_name = SUPPORTED_GIGAAM_MODELS[st["asr_model"]]["model_name"]
+    gigaam_import = _import_ok("gigaam")
+    pyannote_import = st["diarization_model"] == "none" or _import_ok("pyannote.audio")
     checks = {
         "gigaam_files": is_gigaam_ready(MODELS_DIR, asr_name),
-        "gigaam_import": _import_ok("gigaam"),
+        "gigaam_import": gigaam_import,
         "gigaam_load": False,
         "pyannote_files": st["diarization_model"] == "none" or is_pyannote_ready(MODELS_DIR),
-        "pyannote_import": st["diarization_model"] == "none" or _import_ok("pyannote.audio"),
+        "pyannote_import": pyannote_import,
         "pyannote_load": st["diarization_model"] == "none",
     }
-    checks["gigaam_load"] = checks["gigaam_files"] and checks["gigaam_import"] if not load else checks["gigaam_files"] and checks["gigaam_import"]
+    # A load test is deliberately opt-in: /health/ready must remain cheap and
+    # must not allocate a second model instance during normal request probes.
+    checks["gigaam_load"] = checks["gigaam_files"] and checks["gigaam_import"]
     checks["pyannote_load"] = checks["pyannote_files"] and checks["pyannote_import"] if st["diarization_model"] != "none" else True
+    if load and checks["gigaam_load"]:
+        try:
+            import gigaam
+            gigaam.load_model(asr_name, device=st["device"], download_root=str(MODELS_DIR / "gigaam-cache"))
+        except Exception as exc:
+            checks["gigaam_load"] = False
+            checks["gigaam_error"] = str(exc)
+    if load and st["diarization_model"] != "none" and checks["pyannote_load"]:
+        try:
+            from pyannote.audio import Pipeline
+            from model_store import pyannote_target_for
+            Pipeline.from_pretrained(str(pyannote_target_for(MODELS_DIR, st["diarization_model"])))
+        except Exception as exc:
+            checks["pyannote_load"] = False
+            checks["pyannote_error"] = str(exc)
+    checks["gigaam"] = {
+        "import": "ok" if gigaam_import else "failed", "dependencies": "ok" if gigaam_import else "failed",
+        "checkpoint": "exists" if checks["gigaam_files"] else "missing", "load": "ok" if checks["gigaam_load"] else "failed",
+        "device": "ok" if st["device"] == "cpu" or checks["gigaam_load"] else "failed",
+    }
     return checks
 
 @app.get("/health/ready")
@@ -230,7 +255,7 @@ def health_ready():
     return JSONResponse({"status":"ready" if required else "not_ready", "checks":checks, "settings":settings}, status_code=200 if required else 503)
 
 @app.get("/health/models")
-def health_models(): return _model_checks()
+def health_models(): return _model_checks(load=True)
 
 @app.get("/health/gpu")
 def health_gpu():
@@ -387,10 +412,11 @@ def api_models_status(username: str = Depends(current_user)):
     from model_store import SUPPORTED_GIGAAM_MODELS, SUPPORTED_DIARIZATION_MODELS, load_settings, gigaam_checkpoint_path, pyannote_target_for, is_gigaam_ready, is_pyannote_ready
     settings = load_settings(MODELS_DIR); out=[]
     for mid, meta in SUPPORTED_GIGAAM_MODELS.items():
-        ckpt = gigaam_checkpoint_path(MODELS_DIR, meta["model_name"]); out.append({**meta,"id":mid,"installed":is_gigaam_ready(MODELS_DIR, meta["model_name"]),"path":str(ckpt),"size":ckpt.stat().st_size if ckpt.exists() else 0,"active":settings["asr_model"]==mid,"integrity":"ok" if ckpt.exists() and ckpt.stat().st_size>0 else "missing","cpu_compatible":True,"gpu_compatible":True,"download_status":"idle","error":None})
+        ckpt = gigaam_checkpoint_path(MODELS_DIR, meta["model_name"]); installed = is_gigaam_ready(MODELS_DIR, meta["model_name"])
+        out.append({**meta,"id":mid,"installed":installed,"path":str(ckpt),"size":ckpt.stat().st_size if ckpt.exists() else 0,"active":settings["asr_model"]==mid,"integrity":"ok" if installed else "missing","loadable": installed and _import_ok("gigaam"),"test_inference":"not_run","cpu_compatible":True,"gpu_compatible":True,"download_status":"idle","error":None})
     for mid, meta in SUPPORTED_DIARIZATION_MODELS.items():
         path = pyannote_target_for(MODELS_DIR, mid); installed = mid == "none" or is_pyannote_ready(MODELS_DIR)
-        out.append({**meta,"id":mid,"installed":installed,"path":str(path),"size":sum(f.stat().st_size for f in path.rglob('*') if f.is_file()) if path.exists() else 0,"active":settings["diarization_model"]==mid,"integrity":"ok" if installed else "missing","cpu_compatible":True,"gpu_compatible":mid != "none","download_status":"idle","error":None})
+        out.append({**meta,"id":mid,"installed":installed,"path":str(path),"size":sum(f.stat().st_size for f in path.rglob('*') if f.is_file()) if path.exists() else 0,"active":settings["diarization_model"]==mid,"integrity":"ok" if installed else "missing","loadable": mid == "none" or (installed and _import_ok("pyannote.audio")),"test_inference":"not_run","cpu_compatible":True,"gpu_compatible":mid != "none","download_status":"idle","error":None})
     return {"models": out}
 
 @app.post("/api/models/select")
@@ -441,6 +467,8 @@ def api_system_gpu(username: str = Depends(current_user)):
     return gpu_info(real_test=True)
 
 LOGIN_HTML = """<!doctype html><meta charset='utf-8'><title>GigaScribe login</title><style>body{font-family:sans-serif;max-width:420px;margin:10vh auto}.err{color:#b00}input,button{width:100%;padding:10px;margin:6px 0}</style><h1>GigaScribe</h1><!--ERROR--><form method='post'><input name='username' placeholder='Пользователь'><input name='password' type='password' placeholder='Пароль'><button>Войти</button></form>"""
-INDEX_HTML = """<!doctype html><meta charset='utf-8'><title>GigaScribe</title><style>body{font-family:sans-serif;max-width:900px;margin:30px auto}.job{border:1px solid #ddd;padding:12px;margin:10px 0}progress{width:100%}</style><h1>Локальная транскрибация</h1><form id='up'><input type='file' name='file' required><button>Запустить</button></form><form method='post' action='/logout'><button>Выйти</button></form><div id='jobs'></div><script>
+INDEX_HTML = """<!doctype html><meta charset='utf-8'><title>GigaScribe</title><style>body{font-family:sans-serif;max-width:900px;margin:30px auto}.job{border:1px solid #ddd;padding:12px;margin:10px 0}progress{width:100%}label,select{margin:4px}</style><h1>Локальная транскрибация</h1><form id='up'><input type='file' name='file' required><button>Запустить</button></form><form id='model-settings'><label>ASR <select id='asr-model'></select></label><label>Диаризация <select id='diarization-model'></select></label><button>Сохранить модели</button><span id='model-message'></span></form><form method='post' action='/logout'><button>Выйти</button></form><div id='jobs'></div><script>
 async function refresh(){let r=await fetch('/api/jobs');let js=await r.json();jobs.innerHTML=js.reverse().map(j=>`<div class='job'><b>${j.filename}</b> — ${j.status}<br><progress value='${j.progress}' max='1'></progress> ${Math.round(j.progress*100)}%<br>${j.message}<br>${['transcript','log','original','wav'].filter(k=>j.downloads[k]).map(k=>`<a href='/api/jobs/${j.id}/download/${k}'>скачать ${k}</a>`).join(' | ')}</div>`).join('')}
-up.onsubmit=async(e)=>{e.preventDefault();let fd=new FormData(up);await fetch('/api/jobs',{method:'POST',body:fd});up.reset();refresh()};setInterval(refresh,1500);refresh();</script>"""
+async function loadModels(){let r=await fetch('/api/models'), m=await r.json(); for(let [target,values,current] of [['asr-model',m.asr,m.settings.asr_model],['diarization-model',m.diarization,m.settings.diarization_model]]){let s=document.getElementById(target);s.innerHTML=Object.entries(values).map(([id,v])=>`<option value='${id}'>${v.label}</option>`).join('');s.value=current}}
+modelSettings=document.getElementById('model-settings'); modelSettings.onsubmit=async(e)=>{e.preventDefault();let r=await fetch('/api/models/select',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({asr_model:document.getElementById('asr-model').value,diarization_model:document.getElementById('diarization-model').value})});document.getElementById('model-message').textContent=r.ok?'Сохранено':'Ошибка сохранения'};
+up.onsubmit=async(e)=>{e.preventDefault();let fd=new FormData(up);await fetch('/api/jobs',{method:'POST',body:fd});up.reset();refresh()};loadModels();setInterval(refresh,1500);refresh();</script>"""

@@ -58,7 +58,7 @@ scripts/preflight.sh gpu
 docker compose -f compose.yaml -f compose.gpu.yaml up -d --build
 ```
 
-GPU-сборка использует `requirements-cu128.txt` с `torch==2.7.0`, `torchaudio==2.7.0` и индексом `https://download.pytorch.org/whl/cu128`. Для RTX 5060 Ti проверяйте, что `torch.cuda.get_arch_list()` содержит `sm_120`, а реальная CUDA-операция проходит. Версия CUDA в `nvidia-smi` и `torch.version.cuda` может отличаться; это нормально при достаточно новом драйвере.
+GPU-сборка использует `requirements-cu128.txt` с жёсткими пинами `torch==2.7.0+cu128`, `torchaudio==2.7.0+cu128` и индексом `https://download.pytorch.org/whl/cu128`. Суффикс `+cu128` обязателен: он не даёт pip незаметно выбрать CPU, cu121 или cu124 wheel. При старте GPU-контейнера автоматически выполняется CUDA smoke-test; для RTX 5060 Ti он требует CUDA 12.8 и наличие `sm_120`.
 
 ## Проверка PyTorch внутри контейнера
 
@@ -87,13 +87,13 @@ HF_TOKEN=... python scripts/download_models.py --models-dir ./models --skip-giga
 python scripts/download_models.py --models-dir ./models --offline
 ```
 
-`gigaam==0.1.0` устанавливается в Docker через `pip install --no-deps`, потому что metadata пакета ограничивает `torch<=2.5.1`. Это временный обход ограничения metadata, а не скрытие конфликта; совместимость должна подтверждаться smoke-тестами импорта, загрузки `v2_ctc`/`v3_ctc`, CPU/CUDA-инференса, длинного аудио и повторной загрузки.
+`requirements-gigaam.txt` содержит только runtime-зависимости GigaAM (`hydra-core`, `omegaconf`, `sentencepiece`). Затем `gigaam==0.1.0` устанавливается ровно один раз через `pip install --no-deps`, потому что metadata пакета ограничивает `torch<=2.5.1`. Это сохраняет уже установленный CUDA 12.8 PyTorch и исключает повторную установку `torch`/`torchaudio`.
 
 Для локального pyannote используется путь к `config.yaml`, marker `.pyannote-ready.json` создаётся только после загрузочной проверки. HF token лучше передавать одноразово или через secret; не публикуйте вывод `docker compose config`, он может раскрыть `.env`.
 
 ## API и UI
 
-Доступны `/api/models`, `/api/models/status`, `/api/models/download`, `/api/models/verify`, `/api/models/select`, `DELETE /api/models/{model_id}`, `/api/models/{model_id}/test`, `/api/system`, `/api/system/gpu`, а также `/health/live`, `/health/ready`, `/health/models`, `/health/gpu`.
+Доступны `/api/models`, `/api/models/status`, `/api/models/download`, `/api/models/verify`, `/api/models/select`, `DELETE /api/models/{model_id}`, `/api/models/{model_id}/test`, `/api/system`, `/api/system/gpu`, а также `/health/live`, `/health/ready`, `/health/models`, `/health/gpu`. `/health/models` выполняет загрузочную проверку и возвращает отдельные статусы `import`, `dependencies`, `checkpoint`, `load` и `device`; `/api/models/status` показывает путь, размер, готовность к загрузке и состояние тестового inference для каждой модели.
 
 ## Snap Docker не поддерживается для GPU
 
@@ -112,7 +112,7 @@ docker compose down
 
 ## Права и .env
 
-Контейнер запускается не от root и поддерживает `HOST_UID`/`HOST_GID`. После изменения `.env` пересоздайте контейнер:
+Контейнер при каждом старте создаёт `data/`, `data/uploads/` и `models/`, исправляет их владельца на `HOST_UID`/`HOST_GID`, затем запускает приложение с этими правами. После изменения `.env` пересоздайте контейнер:
 
 ```bash
 docker compose up -d --force-recreate
