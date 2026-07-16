@@ -30,11 +30,11 @@ def gigaam_marker_path(base: Path, model_name: str) -> Path:
 
 
 def pyannote_target(base: Path) -> Path:
-    return base / PYANNOTE_DIRNAME
+    return pyannote_target_for(base, "pyannote-3.1")
 
 
-def pyannote_marker_path(base: Path) -> Path:
-    return pyannote_target(base) / PYANNOTE_MARKER_NAME
+def pyannote_marker_path(base: Path, model_id: str = "pyannote-3.1") -> Path:
+    return pyannote_target_for(base, model_id) / PYANNOTE_MARKER_NAME
 
 
 def sha256_file(path: Path) -> str:
@@ -97,21 +97,25 @@ def assert_gigaam_ready(base: Path, model_name: str) -> None:
         raise RuntimeError(f"GigaAM model '{model_name}' is not prepared at {gigaam_checkpoint_path(base, model_name)}. Run scripts/download_models.py first.")
 
 
-def is_pyannote_ready(base: Path) -> bool:
-    marker = _read_json(pyannote_marker_path(base))
-    target = pyannote_target(base)
-    if not marker or marker.get("repo_id") != PYANNOTE_REPO_ID: return False
+def is_pyannote_ready(base: Path, model_id: str = "pyannote-3.1") -> bool:
+    if model_id == "none": return True
+    meta = SUPPORTED_DIARIZATION_MODELS.get(model_id)
+    if not meta: return False
+    marker = _read_json(pyannote_marker_path(base, model_id))
+    target = pyannote_target_for(base, model_id)
+    if not marker or marker.get("repo_id") != meta["repo_id"]: return False
     if marker.get("path") != str(target): return False
     if not (target / "config.yaml").is_file(): return False
     nested = marker.get("nested_repos") or []
     return PYANNOTE_SEGMENTATION_REPO_ID in nested and bool(marker.get("offline_verified"))
 
 
-def write_pyannote_marker(base: Path) -> None:
-    target = pyannote_target(base)
+def write_pyannote_marker(base: Path, model_id: str = "pyannote-3.1") -> None:
+    if model_id == "none": return
+    target = pyannote_target_for(base, model_id)
     if not (target / "config.yaml").is_file():
         raise RuntimeError(f"Pyannote snapshot is incomplete: {target}")
-    atomic_write_json(pyannote_marker_path(base), {"repo_id": PYANNOTE_REPO_ID, "path": str(target), "nested_repos": [PYANNOTE_SEGMENTATION_REPO_ID], "offline_verified": True})
+    atomic_write_json(pyannote_marker_path(base, model_id), {"repo_id": SUPPORTED_DIARIZATION_MODELS[model_id]["repo_id"], "path": str(target), "nested_repos": [PYANNOTE_SEGMENTATION_REPO_ID], "offline_verified": True})
 
 SUPPORTED_GIGAAM_MODELS = {
     "gigaam-v2-ctc": {"kind":"asr","label":"GigaAM v2_ctc","model_name":"v2_ctc","version":"v2_ctc","speed":"быстро","vram":"низкая","hf_token_required":False,"terms_required":False},
@@ -153,4 +157,4 @@ def save_settings(settings: dict[str, Any], base: Path | None = None) -> dict[st
 
 def pyannote_target_for(base: Path, model_id: str) -> Path:
     if model_id == "pyannote-community-1": return base / "pyannote-speaker-diarization-community-1"
-    return pyannote_target(base)
+    return base / PYANNOTE_DIRNAME

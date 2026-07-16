@@ -11,9 +11,9 @@ import tempfile
 from pathlib import Path
 
 from model_store import (
-    PYANNOTE_REPO_ID, PYANNOTE_SEGMENTATION_REPO_ID, GIGAAM_MARKER_NAME,
+    PYANNOTE_REPO_ID, PYANNOTE_SEGMENTATION_REPO_ID, GIGAAM_MARKER_NAME, SUPPORTED_DIARIZATION_MODELS,
     PYANNOTE_MARKER_NAME, gigaam_cache_dir, gigaam_checkpoint_path,
-    is_gigaam_ready, is_pyannote_ready, pyannote_target, write_gigaam_marker,
+    is_gigaam_ready, is_pyannote_ready, pyannote_target, pyannote_target_for, write_gigaam_marker,
     write_pyannote_marker,
 )
 
@@ -27,29 +27,31 @@ def configure_model_dirs(models_dir: Path, *, offline: bool = False) -> None:
     gigaam_cache_dir(models_dir).mkdir(parents=True, exist_ok=True)
 
 
-def download_pyannote(models_dir: Path, token: str | None, *, force: bool = False) -> Path:
-    target = pyannote_target(models_dir)
-    if is_pyannote_ready(models_dir) and not force:
+def download_pyannote(models_dir: Path, token: str | None, *, model_id: str = "pyannote-3.1", force: bool = False) -> Path:
+    if model_id not in SUPPORTED_DIARIZATION_MODELS or model_id == "none": raise RuntimeError("Unsupported pyannote model")
+    repo_id = SUPPORTED_DIARIZATION_MODELS[model_id]["repo_id"]
+    target = pyannote_target_for(models_dir, model_id)
+    if is_pyannote_ready(models_dir, model_id) and not force:
         print(f"Pyannote already present and offline-verified: {target}")
         return target
-    if not token and not is_pyannote_ready(models_dir):
+    if not token and not is_pyannote_ready(models_dir, model_id):
         raise RuntimeError(
             "HF_TOKEN is required to download complete pyannote cache. Accept terms for "
-            f"{PYANNOTE_REPO_ID} and gated dependency {PYANNOTE_SEGMENTATION_REPO_ID}."
+            f"{repo_id} and gated dependency {PYANNOTE_SEGMENTATION_REPO_ID}."
         )
     from huggingface_hub import snapshot_download
     from pyannote.audio import Pipeline
 
     os.environ["HF_HUB_OFFLINE"] = "0"
     target.mkdir(parents=True, exist_ok=True)
-    snapshot_download(repo_id=PYANNOTE_REPO_ID, local_dir=target, local_dir_use_symlinks=False, token=token, force_download=force)
+    snapshot_download(repo_id=repo_id, local_dir=target, local_dir_use_symlinks=False, token=token, force_download=force)
     # Materialize gated nested dependency used by pipeline config.
     snapshot_download(repo_id=PYANNOTE_SEGMENTATION_REPO_ID, token=token, force_download=force)
     config = target / "config.yaml"
     Pipeline.from_pretrained(str(config), use_auth_token=token)
     os.environ["HF_HUB_OFFLINE"] = "1"
     Pipeline.from_pretrained(str(config))
-    write_pyannote_marker(models_dir)
+    write_pyannote_marker(models_dir, model_id)
     return target
 
 
