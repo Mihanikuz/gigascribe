@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from model_store import assert_gigaam_ready, gigaam_cache_dir, is_gigaam_ready, is_pyannote_ready, pyannote_target, load_settings, SUPPORTED_GIGAAM_MODELS
+from model_store import assert_gigaam_ready, gigaam_cache_dir, is_gigaam_ready, is_pyannote_ready, pyannote_target, pyannote_target_for, load_settings, SUPPORTED_GIGAAM_MODELS
 
 MODELS_DIR = Path(os.getenv("GIGASCRIBE_MODELS_DIR", "./models")).resolve()
 os.environ.setdefault("HF_HOME", str(MODELS_DIR / "huggingface"))
@@ -134,12 +134,16 @@ class GPUMemoryManager:
 
 
 class AudioProcessor:
-    def __init__(self):
+    def __init__(self, snapshot: Optional[Dict] = None):
+        self.snapshot = dict(snapshot or load_settings(MODELS_DIR))
+        self.asr_model_name = SUPPORTED_GIGAAM_MODELS[self.snapshot["asr_model"]]["model_name"]
+        self.pyannote_model_id = self.snapshot.get("diarization_model", "none")
         self.gigaam_model = None
         self.diarization_pipeline = None
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self.memory_manager = GPUMemoryManager()
-        self.device = DEVICE
+        requested = self.snapshot.get("device", "cpu")
+        self.device = torch.device("cuda" if torch is not None and requested == "cuda" and torch.cuda.is_available() else "cpu") if torch is not None else DEVICE
 
         print(f"Инициализация AudioProcessor на устройстве: {self.device}")
         if torch is not None and torch.cuda.is_available():
@@ -155,30 +159,30 @@ class AudioProcessor:
         # Загружаем GigaAM только из уже подготовленного локального кэша.
         if not GIGAAM_AVAILABLE:
             raise RuntimeError("gigaam is not installed; transcription cannot run")
-        assert_gigaam_ready(MODELS_DIR, GIGAAM_MODEL_NAME)
+        assert_gigaam_ready(MODELS_DIR, self.asr_model_name)
         devices_to_try = [str(self.device)] if getattr(self.device, "type", str(self.device)) == 'cuda' else ['cpu']
         if getattr(self.device, "type", str(self.device)) == 'cuda':
             devices_to_try.append('cpu')
         last_error = None
         for device in devices_to_try:
             try:
-                self.gigaam_model = gigaam.load_model(GIGAAM_MODEL_NAME, device=device, download_root=str(GIGAAM_CACHE_DIR))
+                self.gigaam_model = gigaam.load_model(self.asr_model_name, device=device, download_root=str(GIGAAM_CACHE_DIR))
                 print(f"GigaAM модель загружена успешно на {device} из локального кэша")
                 break
             except Exception as e:
                 last_error = e
                 print(f"Ошибка загрузки GigaAM на {device}: {e}")
         if self.gigaam_model is None:
-            raise RuntimeError(f"GigaAM model '{GIGAAM_MODEL_NAME}' is unavailable locally: {last_error}")
+            raise RuntimeError(f"GigaAM model '{self.asr_model_name}' is unavailable locally: {last_error}")
 
         if progress_callback:
             progress_callback(0.3,
                               "Загрузка модели для разделения спикеров на GPU..." if getattr(self.device, "type", str(self.device)) == 'cuda' else "Загрузка модели для разделения спикеров на CPU...")
 
         # Загружаем pyannote только из локального snapshot; отсутствие не критично.
-        if load_settings(MODELS_DIR).get("diarization_model") != "none" and PYANNOTE_AVAILABLE and _has_pyannote_model():
+        if self.pyannote_model_id != "none" and PYANNOTE_AVAILABLE and is_pyannote_ready(MODELS_DIR, self.pyannote_model_id):
             try:
-                self.diarization_pipeline = Pipeline.from_pretrained(str(PYANNOTE_LOCAL_PATH / "config.yaml"))
+                self.diarization_pipeline = Pipeline.from_pretrained(str(pyannote_target_for(MODELS_DIR, self.pyannote_model_id) / "config.yaml"))
                 if getattr(self.device, "type", str(self.device)) == 'cuda':
                     self.diarization_pipeline = self.diarization_pipeline.to(self.device)
                 print(f"Pyannote модель загружена успешно на {self.device} из {PYANNOTE_LOCAL_PATH}")

@@ -22,7 +22,6 @@ import time
 import uuid
 import logging
 import importlib
-from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Optional
 
@@ -49,6 +48,7 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 RESULT_DIR = BASE_DIR / "results"
 USER_DB = Path(os.getenv("GIGASCRIBE_USERS_FILE", BASE_DIR / "users.json"))
 SECRET_KEY = os.getenv("GIGASCRIBE_SECRET_KEY", secrets.token_urlsafe(32))
+SECRET_KEY_CONFIGURED = bool(os.getenv("GIGASCRIBE_SECRET_KEY"))
 MAX_UPLOAD_BYTES = int(os.getenv("GIGASCRIBE_MAX_UPLOAD_BYTES", str(1024 * 1024 * 1024)))
 for directory in (UPLOAD_DIR, RESULT_DIR, USER_DB.parent):
     directory.mkdir(parents=True, exist_ok=True)
@@ -69,32 +69,22 @@ pwd_context = SafeBcryptContext()
 security = HTTPBasic()
 logger = logging.getLogger(__name__)
 app = FastAPI(title="GigaScribe Local Server")
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax")
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site=os.getenv("GIGASCRIBE_SESSION_SAMESITE", "lax"), https_only=os.getenv("GIGASCRIBE_SESSION_SECURE", "0") == "1")
+
+@app.on_event("startup")
+async def resume_persistent_queue() -> None:
+    for row in job_store.list(active_only=True):
+        if row["status"] == "queued": schedule_job(row["id"])
 
 
-@dataclass
-class JobState:
-    id: str
-    username: str
-    filename: str
-    status: str = "queued"
-    progress: float = 0.0
-    message: str = "В очереди"
-    created_at: float = field(default_factory=time.time)
-    transcript_path: Optional[Path] = None
-    log_path: Optional[Path] = None
-    original_path: Optional[Path] = None
-    wav_path: Optional[Path] = None
-    error: Optional[str] = None
-    settings_snapshot: dict[str, Any] = field(default_factory=dict)
-    started_at: Optional[float] = None
-    finished_at: Optional[float] = None
-    max_vram_bytes: Optional[int] = None
-
-
-jobs: dict[str, JobState] = {}
-jobs_lock = asyncio.Lock()
-processor_lock = asyncio.Lock()
+from job_store import JobStore
+job_store = JobStore(BASE_DIR / "jobs.sqlite3")
+job_store.recover()
+# Model instances are isolated by immutable snapshot.  GPU work is serialized;
+# CPU concurrency is explicitly configurable.
+gpu_worker = asyncio.Semaphore(max(1, int(os.getenv("GIGASCRIBE_GPU_WORKERS", "1"))))
+cpu_worker = asyncio.Semaphore(max(1, int(os.getenv("GIGASCRIBE_CPU_WORKERS", "2"))))
+scheduled_jobs: set[str] = set()
 model_download_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -109,7 +99,9 @@ def _validate_password(password: str) -> None:
 
 def _load_users() -> dict[str, Any]:
     if not USER_DB.exists():
-        admin_password = os.getenv("GIGASCRIBE_ADMIN_PASSWORD", "admin")
+        admin_password = os.getenv("GIGASCRIBE_ADMIN_PASSWORD")
+        if not admin_password or admin_password == "admin":
+            raise RuntimeError("GIGASCRIBE_ADMIN_PASSWORD must be set and must not be the default 'admin'")
         _validate_password(admin_password)
         USER_DB.write_text(
             json.dumps({"admin": {"password_hash": pwd_context.hash(admin_password), "disabled": False}}, indent=2),
@@ -172,6 +164,10 @@ def is_admin(username: str) -> bool:
     users = _load_users()
     return bool(username == "admin" and users.get(username) and not users[username].get("disabled"))
 
+def require_admin(username: str = Depends(current_user)) -> str:
+    if not is_admin(username): raise HTTPException(403, detail="Administrator authorization required")
+    return username
+
 
 def validate_upload_name(filename: str) -> str:
     safe = safe_name(filename or "audio")
@@ -211,14 +207,16 @@ def _model_checks(load: bool = False) -> dict[str, Any]:
         "gigaam_files": is_gigaam_ready(MODELS_DIR, asr_name),
         "gigaam_import": gigaam_import,
         "gigaam_load": False,
-        "pyannote_files": st["diarization_model"] == "none" or is_pyannote_ready(MODELS_DIR),
+        "pyannote_files": st["diarization_model"] == "none" or is_pyannote_ready(MODELS_DIR, st["diarization_model"]),
         "pyannote_import": pyannote_import,
         "pyannote_load": st["diarization_model"] == "none",
     }
     # A load test is deliberately opt-in: /health/ready must remain cheap and
     # must not allocate a second model instance during normal request probes.
-    checks["gigaam_load"] = checks["gigaam_files"] and checks["gigaam_import"]
-    checks["pyannote_load"] = checks["pyannote_files"] and checks["pyannote_import"] if st["diarization_model"] != "none" else True
+    # Presence is deliberately not a load result.  Explicit /health/models or
+    # model test records a real load attempt; ready stays inexpensive.
+    checks["gigaam_load"] = False
+    checks["pyannote_load"] = st["diarization_model"] == "none"
     if load and checks["gigaam_load"]:
         try:
             import gigaam
@@ -236,7 +234,7 @@ def _model_checks(load: bool = False) -> dict[str, Any]:
             checks["pyannote_error"] = str(exc)
     checks["gigaam"] = {
         "import": "ok" if gigaam_import else "failed", "dependencies": "ok" if gigaam_import else "failed",
-        "checkpoint": "exists" if checks["gigaam_files"] else "missing", "load": "ok" if checks["gigaam_load"] else "failed",
+        "checkpoint": "exists" if checks["gigaam_files"] else "missing", "load": "ok" if checks["gigaam_load"] else "not_run",
         "device": "ok" if st["device"] == "cpu" or checks["gigaam_load"] else "failed",
     }
     return checks
@@ -246,8 +244,8 @@ def health_ready():
     from model_store import load_settings
     from system_info import gpu_info
     settings = load_settings(MODELS_DIR)
-    checks = {"data_writable": _writable_dir(BASE_DIR), "models_writable": _writable_dir(MODELS_DIR), "ffmpeg": shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None, **_model_checks()}
-    checks["gigaam"] = checks["gigaam_files"] and checks["gigaam_import"] and checks["gigaam_load"]
+    checks = {"data_writable": _writable_dir(BASE_DIR), "models_writable": _writable_dir(MODELS_DIR), "secret_key_configured": SECRET_KEY_CONFIGURED, "ffmpeg": shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None, **_model_checks()}
+    checks["gigaam"] = checks["gigaam_files"] and checks["gigaam_import"]
     checks["pyannote"] = checks["pyannote_files"] and checks["pyannote_import"] and checks["pyannote_load"]
     gpu = gpu_info(real_test=settings["device"] == "cuda")
     checks["device_works"] = settings["device"] == "cpu" or bool(gpu.get("real_cuda_test",{}).get("ok"))
@@ -315,78 +313,84 @@ async def create_job(file: UploadFile = File(...), username: str = Depends(curre
             original_path.unlink()
         raise
     from model_store import load_settings
-    job = JobState(id=job_id, username=username, filename=original_path.name, original_path=original_path, log_path=user_result_dir / "job.log", settings_snapshot=load_settings(MODELS_DIR))
-    async with jobs_lock:
-        jobs[job_id] = job
-    asyncio.create_task(run_job(job, user_result_dir))
+    job_store.create(id=job_id, username=username, filename=original_path.name, original_path=str(original_path), log_path=str(user_result_dir / "job.log"), settings_snapshot=load_settings(MODELS_DIR), message="В очереди", timeout_seconds=int(os.getenv("GIGASCRIBE_JOB_TIMEOUT_SECONDS", "0")) or None)
+    schedule_job(job_id)
     return {"job_id": job_id}
 
 
-async def run_job(job: JobState, result_dir: Path) -> None:
+def schedule_job(job_id: str) -> None:
+    if job_id not in scheduled_jobs:
+        scheduled_jobs.add(job_id)
+        asyncio.create_task(run_job(job_id))
+
+
+async def run_job(job_id: str) -> None:
+    job = job_store.get(job_id)
+    if not job or job["status"] != "queued": return
+    result_dir = Path(job["log_path"]).parent
     def log(line: str) -> None:
-        if job.log_path:
-            with job.log_path.open("a", encoding="utf-8") as fh:
-                fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
-
+        with Path(job["log_path"]).open("a", encoding="utf-8") as fh: fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
     def progress(value: float, message: str) -> None:
-        job.progress = round(max(0.0, min(1.0, value)), 3)
-        job.message = message
-        log(f"{job.progress:.0%} {message}")
-
+        value = round(max(0.0, min(1.0, value)), 3); job_store.update(job_id, progress=value, message=message); log(f"{value:.0%} {message}")
     try:
-        job.status = "running"
-        job.started_at = time.time()
-        progress(0.01, "Инициализация задания")
-        async with processor_lock:
-            if giga_app.processor.gigaam_model is None:
-                await giga_app.processor.initialize_models(lambda p, m: progress(p * 0.1, m))
-            result = await giga_app.processor.process_single_file(
-                str(job.original_path), progress, original_filename=job.filename, artifacts_dir=str(result_dir)
-            )
-        transcript_path = result_dir / f"{Path(job.filename).stem}.txt"
-        transcript_path.write_text(result.full_text, encoding="utf-8")
-        job.transcript_path = transcript_path
-        wav = result_dir / "normalized.wav"
-        job.wav_path = wav if wav.exists() else None
-        job.status = "completed"
-        job.finished_at = time.time()
-        progress(1.0, "Готово")
-    except Exception as exc:
-        job.status = "failed"
-        job.finished_at = time.time()
-        job.error = str(exc)
-        logger.exception("Ошибка транскрипции job_id=%s settings=%s", job.id, job.settings_snapshot)
-        progress(job.progress, f"Ошибка: {exc}")
+        job_store.update(job_id, status="running", started_at=time.time(), attempts=job["attempts"] + 1)
+        snapshot = job["settings_snapshot"]; progress(.01, "Инициализация задания")
+        processor = giga_app.AudioProcessor(snapshot=snapshot)
+        worker = gpu_worker if snapshot.get("device") == "cuda" else cpu_worker
+        async with worker:
+            await processor.initialize_models(lambda p,m: progress(p*.1,m))
+            work = processor.process_single_file(job["original_path"], progress, original_filename=job["filename"], artifacts_dir=str(result_dir))
+            result = await asyncio.wait_for(work, job["timeout_seconds"]) if job["timeout_seconds"] else await work
+        if job_store.get(job_id)["cancel_requested"]:
+            job_store.update(job_id,status="cancelled",finished_at=time.time(),message="Отменено"); return
+        transcript = result_dir / f"{Path(job['filename']).stem}.txt"; transcript.write_text(result.full_text, encoding="utf-8")
+        wav=result_dir/"normalized.wav"
+        job_store.update(job_id,status="completed",finished_at=time.time(),progress=1,message="Готово",transcript_path=str(transcript),wav_path=str(wav) if wav.exists() else None,actual_device=str(processor.device),actual_models={"asr_model":snapshot.get("asr_model"),"diarization_model":snapshot.get("diarization_model")})
+    except asyncio.TimeoutError:
+        job_store.update(job_id,status="failed",finished_at=time.time(),error="Job timed out",message="Превышено время выполнения")
+    except Exception:
+        job_store.update(job_id,status="failed",finished_at=time.time(),error="Processing failed",message="Ошибка обработки")
+        logger.exception("transcription failed job_id=%s model=%s device=%s", job_id, job["settings_snapshot"], job["settings_snapshot"].get("device"))
+    finally: scheduled_jobs.discard(job_id)
 
 
 @app.get("/api/jobs")
 async def list_jobs(username: str = Depends(current_user)):
-    return [serialize_job(j) for j in jobs.values() if j.username == username]
-
+    return [serialize_job(j) for j in job_store.list(username)]
 
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str, username: str = Depends(current_user)):
-    job = jobs.get(job_id)
-    if not job or job.username != username:
-        raise HTTPException(404)
+    job=job_store.get(job_id)
+    if not job or job["username"] != username: raise HTTPException(404)
     return serialize_job(job)
 
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str, username: str = Depends(current_user)):
+    job=job_store.get(job_id)
+    if not job or job["username"] != username: raise HTTPException(404)
+    if job["status"] in {"completed","failed","cancelled"}: raise HTTPException(409, detail="Job is already terminal")
+    job_store.request_cancel(job_id)
+    if job["status"] == "queued": job_store.update(job_id,status="cancelled",finished_at=time.time())
+    return serialize_job(job_store.get(job_id))
 
-def serialize_job(job: JobState) -> dict[str, Any]:
-    return {"id": job.id, "filename": job.filename, "status": job.status, "progress": job.progress, "message": job.message, "error": job.error, "settings": job.settings_snapshot, "started_at": job.started_at, "duration": (job.finished_at-job.started_at) if job.started_at and job.finished_at else None,
-            "downloads": {"transcript": bool(job.transcript_path), "log": bool(job.log_path), "original": bool(job.original_path), "wav": bool(job.wav_path)}}
+@app.post("/api/jobs/{job_id}/retry")
+async def retry_job(job_id: str, username: str = Depends(current_user)):
+    job=job_store.get(job_id)
+    if not job or job["username"] != username: raise HTTPException(404)
+    if job["status"] not in {"failed","cancelled"}: raise HTTPException(409, detail="Only failed or cancelled jobs can be retried")
+    job_store.update(job_id,status="queued",progress=0,message="В очереди",error=None,started_at=None,finished_at=None,cancel_requested=0); schedule_job(job_id)
+    return serialize_job(job_store.get(job_id))
 
+def serialize_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {"id":job["id"],"filename":job["filename"],"status":job["status"],"progress":job["progress"],"message":job["message"],"error":job["error"],"settings":job["settings_snapshot"],"actual_device":job["actual_device"],"actual_models":job["actual_models"],"downloads":{k:bool(job[f"{k}_path"]) for k in ("transcript","log","original","wav")}}
 
 @app.get("/api/jobs/{job_id}/download/{kind}")
 def download(job_id: str, kind: str, username: str = Depends(current_user)):
-    job = jobs.get(job_id)
-    if not job or job.username != username:
-        raise HTTPException(404)
-    mapping = {"transcript": job.transcript_path, "log": job.log_path, "original": job.original_path, "wav": job.wav_path}
-    path = mapping.get(kind)
-    if not path or not path.exists():
-        raise HTTPException(404)
-    return FileResponse(path, filename=path.name)
+    job=job_store.get(job_id)
+    if not job or job["username"] != username: raise HTTPException(404)
+    path=job.get(f"{kind}_path")
+    if not path or not Path(path).exists(): raise HTTPException(404)
+    return FileResponse(path, filename=Path(path).name)
 
 
 @app.post("/admin/users")
@@ -415,12 +419,12 @@ def api_models_status(username: str = Depends(current_user)):
         ckpt = gigaam_checkpoint_path(MODELS_DIR, meta["model_name"]); installed = is_gigaam_ready(MODELS_DIR, meta["model_name"])
         out.append({**meta,"id":mid,"installed":installed,"path":str(ckpt),"size":ckpt.stat().st_size if ckpt.exists() else 0,"active":settings["asr_model"]==mid,"integrity":"ok" if installed else "missing","loadable": installed and _import_ok("gigaam"),"test_inference":"not_run","cpu_compatible":True,"gpu_compatible":True,"download_status":"idle","error":None})
     for mid, meta in SUPPORTED_DIARIZATION_MODELS.items():
-        path = pyannote_target_for(MODELS_DIR, mid); installed = mid == "none" or is_pyannote_ready(MODELS_DIR)
+        path = pyannote_target_for(MODELS_DIR, mid); installed = mid == "none" or is_pyannote_ready(MODELS_DIR, mid)
         out.append({**meta,"id":mid,"installed":installed,"path":str(path),"size":sum(f.stat().st_size for f in path.rglob('*') if f.is_file()) if path.exists() else 0,"active":settings["diarization_model"]==mid,"integrity":"ok" if installed else "missing","loadable": mid == "none" or (installed and _import_ok("pyannote.audio")),"test_inference":"not_run","cpu_compatible":True,"gpu_compatible":mid != "none","download_status":"idle","error":None})
     return {"models": out}
 
 @app.post("/api/models/select")
-async def api_models_select(payload: dict[str, Any], username: str = Depends(current_user)):
+async def api_models_select(payload: dict[str, Any], username: str = Depends(require_admin)):
     from model_store import save_settings, PROFILES
     if profile := payload.get("profile"):
         if profile not in PROFILES: raise HTTPException(400, detail="Unknown profile")
@@ -430,36 +434,55 @@ async def api_models_select(payload: dict[str, Any], username: str = Depends(cur
     return {"ok": True, "settings": settings}
 
 @app.post("/api/models/verify")
-def api_models_verify(username: str = Depends(current_user)): return {"checks": _model_checks()}
+def api_models_verify(username: str = Depends(require_admin)): return {"checks": _model_checks()}
 
 @app.post("/api/models/download")
-async def api_models_download(payload: dict[str, Any], username: str = Depends(current_user)):
+async def api_models_download(payload: dict[str, Any], username: str = Depends(require_admin)):
     model_id = str(payload.get("model_id", "")); force = bool(payload.get("force", False))
-    from model_store import SUPPORTED_GIGAAM_MODELS
-    if model_id not in SUPPORTED_GIGAAM_MODELS: raise HTTPException(400, detail="Only GigaAM download is supported by this endpoint in this build")
+    from model_store import SUPPORTED_GIGAAM_MODELS, SUPPORTED_DIARIZATION_MODELS
+    if model_id not in {*SUPPORTED_GIGAAM_MODELS, *SUPPORTED_DIARIZATION_MODELS} or model_id == "none": raise HTTPException(400, detail="Unsupported model")
     lock = model_download_locks.setdefault(model_id, asyncio.Lock())
     if lock.locked(): raise HTTPException(409, detail="Model download is already running")
     async with lock:
         import scripts.download_models as dl
         await asyncio.to_thread(dl.configure_model_dirs, MODELS_DIR, offline=False)
-        await asyncio.to_thread(dl.warm_up_gigaam, MODELS_DIR, SUPPORTED_GIGAAM_MODELS[model_id]["model_name"], force=force)
-    return {"ok": True}
+        if model_id in SUPPORTED_GIGAAM_MODELS:
+            await asyncio.to_thread(dl.warm_up_gigaam, MODELS_DIR, SUPPORTED_GIGAAM_MODELS[model_id]["model_name"], force=force)
+        else:
+            await asyncio.to_thread(dl.download_pyannote, MODELS_DIR, os.getenv("HF_TOKEN") or None, model_id=model_id, force=force)
+    return {"ok": True, "model_id": model_id}
 
 @app.delete("/api/models/{model_id}")
-def api_models_delete(model_id: str, username: str = Depends(current_user)):
+def api_models_delete(model_id: str, username: str = Depends(require_admin)):
     from model_store import SUPPORTED_GIGAAM_MODELS, SUPPORTED_DIARIZATION_MODELS, gigaam_checkpoint_path, pyannote_target_for
-    if any(j.status in {"queued","running"} and model_id in {j.settings_snapshot.get("asr_model"), j.settings_snapshot.get("diarization_model")} for j in jobs.values()): raise HTTPException(409, detail="Model is used by an active job")
+    if any(model_id in {j["settings_snapshot"].get("asr_model"), j["settings_snapshot"].get("diarization_model")} for j in job_store.list(active_only=True)): raise HTTPException(409, detail="Model is used by an active job")
     if model_id in SUPPORTED_GIGAAM_MODELS: gigaam_checkpoint_path(MODELS_DIR, SUPPORTED_GIGAAM_MODELS[model_id]["model_name"]).unlink(missing_ok=True); return {"ok": True}
     if model_id in SUPPORTED_DIARIZATION_MODELS and model_id != "none": shutil.rmtree(pyannote_target_for(MODELS_DIR, model_id), ignore_errors=True); return {"ok": True}
     raise HTTPException(400, detail="Unsupported model")
 
 @app.post("/api/models/{model_id}/test")
-def api_models_test(model_id: str, username: str = Depends(current_user)): return {"ok": True, "checks": _model_checks(load=True)}
+def api_models_test(model_id: str, username: str = Depends(require_admin)):
+    from model_store import SUPPORTED_GIGAAM_MODELS, SUPPORTED_DIARIZATION_MODELS, is_gigaam_ready, is_pyannote_ready, gigaam_checkpoint_path, pyannote_target_for
+    try:
+        if model_id in SUPPORTED_GIGAAM_MODELS:
+            meta=SUPPORTED_GIGAAM_MODELS[model_id]
+            if not is_gigaam_ready(MODELS_DIR, meta["model_name"]): raise RuntimeError("Model is not installed or integrity verification failed")
+            import gigaam; gigaam.load_model(meta["model_name"], device="cpu", download_root=str(MODELS_DIR / "gigaam-cache"))
+        elif model_id in SUPPORTED_DIARIZATION_MODELS and model_id != "none":
+            if not is_pyannote_ready(MODELS_DIR, model_id): raise RuntimeError("Model is not installed or integrity verification failed")
+            from pyannote.audio import Pipeline; Pipeline.from_pretrained(str(pyannote_target_for(MODELS_DIR, model_id) / "config.yaml"))
+        elif model_id == "none": return {"ok": True, "model_id": model_id, "load_test": "not_applicable"}
+        else: raise HTTPException(404, detail="Unknown model")
+        return {"ok": True, "model_id": model_id, "load_test": "ok", "inference_test": "not_run"}
+    except HTTPException: raise
+    except Exception as exc:
+        logger.exception("model test failed model_id=%s", model_id)
+        return JSONResponse({"ok": False, "model_id": model_id, "load_test": "failed", "error": "Model test failed"}, status_code=422)
 
 @app.get("/api/system")
 def api_system(username: str = Depends(current_user)):
     from system_info import gpu_info
-    return {"gpu": gpu_info(real_test=False), "active_gpu_job": any(j.status == "running" and j.settings_snapshot.get("device") == "cuda" for j in jobs.values())}
+    return {"gpu": gpu_info(real_test=False), "active_gpu_job": any(j["status"] == "running" and j["settings_snapshot"].get("device") == "cuda" for j in job_store.list(active_only=True))}
 
 @app.get("/api/system/gpu")
 def api_system_gpu(username: str = Depends(current_user)):
