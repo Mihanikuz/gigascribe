@@ -21,6 +21,7 @@ import requests
 
 from model_store import assert_gigaam_ready, gigaam_cache_dir, is_gigaam_ready, is_pyannote_ready, pyannote_target, pyannote_target_for, load_settings, SUPPORTED_GIGAAM_MODELS
 from asr_backend import ASRBackend
+from diarization_backend import DiarizationBackend
 
 MODELS_DIR = Path(os.getenv("GIGASCRIBE_MODELS_DIR", "./models")).resolve()
 DATA_DIR = Path(os.getenv("GIGASCRIBE_DATA_DIR", "./data")).resolve()
@@ -158,9 +159,12 @@ class AudioProcessor:
         self.gigaam_model = None
         self.asr_backend = ASRBackend(str(GIGAAM_CACHE_DIR))
         self.diarization_pipeline = None
+        self.diarization_backend = DiarizationBackend(str(MODELS_DIR))
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self.memory_manager = GPUMemoryManager()
         requested = self.snapshot.get("device", "cpu")
+        if requested == "cuda" and (torch is None or not torch.cuda.is_available()) and os.getenv("GIGASCRIBE_ALLOW_CPU_FALLBACK") != "1":
+            raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
         self.device = torch.device("cuda" if torch is not None and requested == "cuda" and torch.cuda.is_available() else "cpu") if torch is not None else DEVICE
 
         print(f"Инициализация AudioProcessor на устройстве: {self.device}")
@@ -179,8 +183,6 @@ class AudioProcessor:
             raise RuntimeError("gigaam is not installed; transcription cannot run")
         assert_gigaam_ready(MODELS_DIR, self.asr_model_name)
         devices_to_try = [str(self.device)] if getattr(self.device, "type", str(self.device)) == 'cuda' else ['cpu']
-        if getattr(self.device, "type", str(self.device)) == 'cuda':
-            devices_to_try.append('cpu')
         last_error = None
         for device in devices_to_try:
             try:
@@ -201,9 +203,8 @@ class AudioProcessor:
         # Загружаем pyannote только из локального snapshot; отсутствие не критично.
         if self.pyannote_model_id != "none" and PYANNOTE_AVAILABLE and is_pyannote_ready(MODELS_DIR, self.pyannote_model_id):
             try:
-                self.diarization_pipeline = Pipeline.from_pretrained(str(pyannote_target_for(MODELS_DIR, self.pyannote_model_id) / "config.yaml"))
-                if getattr(self.device, "type", str(self.device)) == 'cuda':
-                    self.diarization_pipeline = self.diarization_pipeline.to(self.device)
+                self.diarization_backend.load(self.pyannote_model_id, str(self.device))
+                self.diarization_pipeline = self.diarization_backend.pipeline
                 print(f"Pyannote модель загружена успешно на {self.device} из {PYANNOTE_LOCAL_PATH}")
             except Exception as e:
                 print(f"Предупреждение: pyannote недоступен локально, режим без разделения спикеров: {e}")
@@ -384,14 +385,8 @@ class AudioProcessor:
             )
 
             # Преобразуем результат в удобный формат
-            segments = []
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
-                segments.append({
-                    'start': turn.start,
-                    'end': turn.end,
-                    'speaker': speaker,
-                    'duration': turn.end - turn.start
-                })
+            from diarization_backend import normalize_diarization
+            segments = normalize_diarization(diarization)
 
             return {
                 'segments': segments,

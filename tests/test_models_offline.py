@@ -19,7 +19,7 @@ class FakeModel:
 def ready_gigaam(base, model="v2_ctc", data=b"ckpt"):
     ckpt = ms.gigaam_checkpoint_path(base, model)
     ckpt.parent.mkdir(parents=True, exist_ok=True)
-    ckpt.write_bytes(data)
+    ckpt.write_bytes(data + b"x" * max(0, ms.MIN_CHECKPOINT_BYTES - len(data)))
     ms.write_gigaam_marker(base, model)
     return ckpt
 
@@ -28,11 +28,11 @@ def test_gigaam_saved_in_cache_and_load_model_gets_download_root(tmp_path, monke
     calls=[]
     def load_model(name, device="cpu", download_root=None):
         calls.append((name, device, download_root))
-        p=Path(download_root)/"v2_ctc.ckpt"; p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(b"x")
+        p=Path(download_root)/"v2_ctc.ckpt"; p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(b"x" * ms.MIN_CHECKPOINT_BYTES)
         return FakeModel()
     monkeypatch.setitem(sys.modules,"gigaam", types.SimpleNamespace(load_model=load_model))
     dm.warm_up_gigaam(tmp_path,"v2_ctc")
-    assert calls == [("v2_ctc","cpu",str(ms.gigaam_cache_dir(tmp_path)))]
+    assert len(calls) == 1 and calls[0][:2] == ("v2_ctc", "cpu") and calls[0][2].endswith("/gigaam-cache")
     assert (tmp_path/"gigaam-cache"/"v2_ctc.ckpt").is_file()
 
 
@@ -59,11 +59,11 @@ def test_empty_or_corrupt_checkpoint_not_ready(tmp_path):
 def test_force_redownloads_and_replaces_atomically(tmp_path, monkeypatch):
     old=ready_gigaam(tmp_path, data=b"old")
     def load_model(name, device="cpu", download_root=None):
-        p=Path(download_root)/"v2_ctc.ckpt"; p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(b"new")
+        p=Path(download_root)/"v2_ctc.ckpt"; p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(b"new" + b"x" * ms.MIN_CHECKPOINT_BYTES)
         return FakeModel()
     monkeypatch.setitem(sys.modules,"gigaam", types.SimpleNamespace(load_model=load_model))
     dm.warm_up_gigaam(tmp_path,"v2_ctc",force=True)
-    assert old.read_bytes()==b"new"
+    assert old.read_bytes().startswith(b"new")
 
 
 def test_force_error_keeps_working_model(tmp_path, monkeypatch):
@@ -71,7 +71,7 @@ def test_force_error_keeps_working_model(tmp_path, monkeypatch):
     def fail(*a,**k): raise RuntimeError("boom")
     monkeypatch.setitem(sys.modules,"gigaam", types.SimpleNamespace(load_model=fail))
     with pytest.raises(RuntimeError): dm.warm_up_gigaam(tmp_path,"v2_ctc",force=True)
-    assert old.read_bytes()==b"old" and ms.is_gigaam_ready(tmp_path,"v2_ctc")
+    assert old.read_bytes().startswith(b"old") and ms.is_gigaam_ready(tmp_path,"v2_ctc")
 
 
 def test_runtime_without_checkpoint_fails_before_network(tmp_path, monkeypatch):

@@ -1,33 +1,45 @@
+x-environment: &environment
+  GIGASCRIBE_DATA_DIR: /opt/gigascribe/data
+  GIGASCRIBE_MODELS_DIR: /opt/gigascribe/models
+  HF_HOME: /opt/gigascribe/models/huggingface
+  HF_HUB_OFFLINE: "1"
+  XDG_CACHE_HOME: /opt/gigascribe/data/cache
+  MPLCONFIGDIR: /opt/gigascribe/data/cache/matplotlib
+x-common: &common
+  env_file: [.env]
+  ports: ["8000:8000"]
+  environment: *environment
+  volumes:
+    - ./data:/opt/gigascribe/data
+    - ./models:/opt/gigascribe/models
+  restart: unless-stopped
+
 services:
-  gigascribe:
+  gigascribe-cpu:
+    <<: *common
+    profiles: [cpu]
+    image: gigascribe:local
     build:
       context: .
       args:
         HOST_UID: ${HOST_UID:-1000}
         HOST_GID: ${HOST_GID:-1000}
         TORCH_REQUIREMENTS: requirements-cpu.txt
-    image: gigascribe:local
-    ports: ["8000:8000"]
-    env_file: [.env]
     environment:
-      GIGASCRIBE_DATA_DIR: /opt/gigascribe/data
-      GIGASCRIBE_MODELS_DIR: /opt/gigascribe/models
+      <<: *environment
       GIGASCRIBE_DEVICE: cpu
-      HF_HOME: /opt/gigascribe/models/huggingface
-      HF_HUB_OFFLINE: "1"
-      XDG_CACHE_HOME: /opt/gigascribe/data/cache
-      MPLCONFIGDIR: /opt/gigascribe/data/cache/matplotlib
-    volumes:
-      - ./data:/opt/gigascribe/data
-      - ./models:/opt/gigascribe/models
-    restart: unless-stopped
   gigascribe-gpu:
+    <<: *common
     profiles: [gpu]
-    extends: gigascribe
+    image: gigascribe:gpu-local
     build:
+      context: .
       args:
+        HOST_UID: ${HOST_UID:-1000}
+        HOST_GID: ${HOST_GID:-1000}
         TORCH_REQUIREMENTS: requirements-cu128.txt
     environment:
+      <<: *environment
       GIGASCRIBE_DEVICE: cuda
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility

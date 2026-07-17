@@ -37,7 +37,7 @@ def download_pyannote(models_dir: Path, token: str | None, *, model_id: str = "p
     if not token and not is_pyannote_ready(models_dir, model_id):
         raise RuntimeError(
             "HF_TOKEN is required to download complete pyannote cache. Accept terms for "
-            f"{repo_id} and gated dependency {PYANNOTE_SEGMENTATION_REPO_ID}."
+            f"{repo_id} and any dependencies referenced by its snapshot."
         )
     from huggingface_hub import snapshot_download
     from pyannote.audio import Pipeline
@@ -45,19 +45,24 @@ def download_pyannote(models_dir: Path, token: str | None, *, model_id: str = "p
     os.environ["HF_HUB_OFFLINE"] = "0"
     target.mkdir(parents=True, exist_ok=True)
     snapshot_download(repo_id=repo_id, local_dir=target, local_dir_use_symlinks=False, token=token, force_download=force)
-    # Materialize gated nested dependency used by pipeline config.
-    snapshot_download(repo_id=PYANNOTE_SEGMENTATION_REPO_ID, token=token, force_download=force)
+    # Only legacy 3.1 declares segmentation-3.0. Community-1 dependencies are
+    # snapshot metadata, not a global hard-coded legacy repository.
+    dependencies = list(SUPPORTED_DIARIZATION_MODELS[model_id]["nested_dependencies"])
+    for dependency in dependencies:
+        snapshot_download(repo_id=dependency, token=token, force_download=force)
     config = target / "config.yaml"
     Pipeline.from_pretrained(str(config), use_auth_token=token)
     os.environ["HF_HUB_OFFLINE"] = "1"
     Pipeline.from_pretrained(str(config))
-    write_pyannote_marker(models_dir, model_id)
+    write_pyannote_marker(models_dir, model_id, nested_repos=dependencies)
     return target
 
 
 def _load_gigaam(model_name: str, cache_dir: Path, device: str = "cpu"):
-    import gigaam
-    return gigaam.load_model(model_name, device=device, download_root=str(cache_dir))
+    from asr_backend import ASRBackend
+    model_id=next(k for k,v in SUPPORTED_GIGAAM_MODELS.items() if v["model_name"] == model_name)
+    backend=ASRBackend(str(cache_dir)); backend.load(model_id, device)
+    return backend.model
 
 
 def warm_up_gigaam(models_dir: Path, model_name: str, *, force: bool = False) -> Path:
@@ -80,6 +85,9 @@ def warm_up_gigaam(models_dir: Path, model_name: str, *, force: bool = False) ->
                 raise RuntimeError(f"GigaAM loader produced a corrupt checkpoint (<{MIN_CHECKPOINT_BYTES} bytes): {tmp_ckpt}")
             cache_dir.mkdir(parents=True, exist_ok=True)
             os.replace(tmp_ckpt, gigaam_checkpoint_path(models_dir, model_name))
+            # The constructor above is the offline load test: it has already
+            # materialized the checkpoint in an isolated cache. Never mark a
+            # file ready before that real backend load succeeds.
             write_gigaam_marker(models_dir, model_name)
         finally:
             shutil.rmtree(tmp_parent, ignore_errors=True)
@@ -108,7 +116,7 @@ def main() -> int:
 
     models_dir = Path(args.models_dir).expanduser().resolve()
     configure_model_dirs(models_dir, offline=args.offline)
-    paths: dict[str, str] = {}
+    paths: dict[str, str] = {}; failures: dict[str, str] = {}
     try:
         if args.offline:
             asr_ids = list(SUPPORTED_GIGAAM_MODELS) if args.all else [args.asr or args.gigaam_model or "gigaam-v2-ctc"]
@@ -122,13 +130,16 @@ def main() -> int:
         asr_ids = list(SUPPORTED_GIGAAM_MODELS) if args.all else [args.asr or args.gigaam_model or "gigaam-v2-ctc"]
         diar_ids = [k for k in SUPPORTED_DIARIZATION_MODELS if k != "none"] if args.all else [args.diarization or args.pyannote_model]
         if not args.skip_gigaam:
-            for mid in asr_ids: paths[mid] = str(warm_up_gigaam(models_dir, SUPPORTED_GIGAAM_MODELS[mid]["model_name"], force=args.force or args.repair))
+            for mid in asr_ids:
+                try: paths[mid] = str(warm_up_gigaam(models_dir, SUPPORTED_GIGAAM_MODELS[mid]["model_name"], force=args.force or args.repair))
+                except Exception as exc: failures[mid] = str(exc)
         if not args.skip_pyannote:
-            for mid in diar_ids: paths[mid] = str(download_pyannote(models_dir, os.getenv("HF_TOKEN") or None, model_id=mid, force=args.force or args.repair))
-        print("Model paths:")
-        for name, path in paths.items():
-            print(f"  {name}: {path}")
-        return 0
+            for mid in diar_ids:
+                try: paths[mid] = str(download_pyannote(models_dir, os.getenv("HF_TOKEN") or None, model_id=mid, force=args.force or args.repair))
+                except Exception as exc: failures[mid] = str(exc)
+        print("Model status:")
+        for name in [*asr_ids, *diar_ids]: print(f"  {name}: {'ok ' + paths[name] if name in paths else 'failed: ' + failures.get(name, 'skipped')}")
+        return 1 if failures else 0
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

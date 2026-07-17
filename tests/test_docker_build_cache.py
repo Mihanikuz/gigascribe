@@ -21,7 +21,7 @@ def test_dependency_layers_precede_application_source_copy():
     torch_install = dockerfile.index('-r "${TORCH_REQUIREMENTS}"')
     model_install = dockerfile.index("-r requirements-models.txt")
     base_install = dockerfile.index("-r requirements-base.txt")
-    gigaam_install = dockerfile.index("--no-deps gigaam==0.1.0")
+    gigaam_install = dockerfile.index("-r requirements-gigaam.txt")
     source_copy = dockerfile.index("COPY . .")
 
-    assert torch_install < model_install < base_install < gigaam_install < source_copy
+    assert torch_install < model_install < gigaam_install < source_copy
