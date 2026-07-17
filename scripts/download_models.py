@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import os
+import os, json, socket, subprocess
 import shutil
 import sys
 import tempfile
@@ -15,6 +15,7 @@ from model_store import (
     PYANNOTE_MARKER_NAME, gigaam_cache_dir, gigaam_checkpoint_path,
     is_gigaam_ready, is_pyannote_ready, pyannote_target, pyannote_target_for, write_gigaam_marker,
     write_pyannote_marker, SUPPORTED_GIGAAM_MODELS, MIN_CHECKPOINT_BYTES,
+    LEGACY_PYANNOTE_PYTHON,
 )
 
 
@@ -40,7 +41,6 @@ def download_pyannote(models_dir: Path, token: str | None, *, model_id: str = "p
             f"{repo_id} and any dependencies referenced by its snapshot."
         )
     from huggingface_hub import snapshot_download
-    from pyannote.audio import Pipeline
 
     os.environ["HF_HUB_OFFLINE"] = "0"
     target.mkdir(parents=True, exist_ok=True)
@@ -51,10 +51,23 @@ def download_pyannote(models_dir: Path, token: str | None, *, model_id: str = "p
     for dependency in dependencies:
         snapshot_download(repo_id=dependency, token=token, force_download=force)
     config = target / "config.yaml"
-    Pipeline.from_pretrained(str(config), use_auth_token=token)
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    Pipeline.from_pretrained(str(config))
-    write_pyannote_marker(models_dir, model_id, nested_repos=dependencies)
+    if model_id == "pyannote-3.1":
+        # Never import 3.x into this (4.x Community-1) interpreter.
+        worker = Path(__file__).resolve().parents[1] / "workers" / "pyannote_legacy_worker.py"
+        python = os.getenv("GIGASCRIBE_LEGACY_PYTHON", LEGACY_PYANNOTE_PYTHON)
+        completed = subprocess.run([python, str(worker)], input=json.dumps({"command":"load_test", "snapshot_path":str(target), "device":"cpu"}) + "\n", text=True, capture_output=True, env={**os.environ, "HF_HUB_OFFLINE":"1", "TRANSFORMERS_OFFLINE":"1"})
+        if completed.returncode:
+            raise RuntimeError(f"legacy pyannote offline load-test failed: {completed.stderr.strip()}")
+        report = json.loads(completed.stdout)
+        if not str(report.get("pyannote_audio_version", "")).startswith("3."):
+            raise RuntimeError("legacy worker did not use pyannote.audio 3.x")
+        write_pyannote_marker(models_dir, model_id, nested_repos=dependencies, runtime_version=report["pyannote_audio_version"], torch_version=report.get("torch_version"))
+    else:
+        from pyannote.audio import Pipeline
+        Pipeline.from_pretrained(str(config), token=token)
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        Pipeline.from_pretrained(str(config))
+        write_pyannote_marker(models_dir, model_id, nested_repos=dependencies)
     return target
 
 
@@ -85,10 +98,32 @@ def warm_up_gigaam(models_dir: Path, model_name: str, *, force: bool = False) ->
                 raise RuntimeError(f"GigaAM loader produced a corrupt checkpoint (<{MIN_CHECKPOINT_BYTES} bytes): {tmp_ckpt}")
             cache_dir.mkdir(parents=True, exist_ok=True)
             os.replace(tmp_ckpt, gigaam_checkpoint_path(models_dir, model_name))
-            # The constructor above is the offline load test: it has already
-            # materialized the checkpoint in an isolated cache. Never mark a
-            # file ready before that real backend load succeeds.
-            write_gigaam_marker(models_dir, model_name)
+            # Prove the final cache works in a fresh backend while all common
+            # download routes are offline and sockets are blocked.
+            del model
+            old_env = {key: os.environ.get(key) for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")}
+            old_connect, old_create = socket.socket.connect, socket.create_connection
+            def blocked(*_a, **_kw): raise RuntimeError("network attempted during GigaAM offline reload")
+            try:
+                os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
+                socket.socket.connect = blocked
+                socket.create_connection = blocked
+                model_id = next(k for k,v in SUPPORTED_GIGAAM_MODELS.items() if v["model_name"] == model_name)
+                backend = __import__("asr_backend", fromlist=["ASRBackend"]).ASRBackend(str(cache_dir))
+                backend.load(model_id, "cpu")
+                if backend.model is None or not hasattr(backend.model, "transcribe") or backend.model_id != model_id or backend.actual_device != "cpu":
+                    raise RuntimeError("GigaAM final-cache offline reload verification failed")
+                backend.unload()
+            except Exception:
+                # Do not bless a checkpoint which could only be loaded online.
+                gigaam_checkpoint_path(models_dir, model_name).unlink(missing_ok=True)
+                raise
+            finally:
+                socket.socket.connect, socket.create_connection = old_connect, old_create
+                for key, value in old_env.items():
+                    if value is None: os.environ.pop(key, None)
+                    else: os.environ[key] = value
+            write_gigaam_marker(models_dir, model_name, offline_reload_verified=True)
         finally:
             shutil.rmtree(tmp_parent, ignore_errors=True)
         return target

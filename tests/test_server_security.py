@@ -53,7 +53,7 @@ def test_health_live_and_ready(srv, tmp_path):
     import model_store as ms
     ckpt=ms.gigaam_checkpoint_path(srv.MODELS_DIR, "v2_ctc")
     ckpt.parent.mkdir(parents=True, exist_ok=True); ckpt.write_bytes(b"ok")
-    ms.write_gigaam_marker(srv.MODELS_DIR, "v2_ctc")
+    ms.write_gigaam_marker(srv.MODELS_DIR, "v2_ctc", offline_reload_verified=True)
     c = TestClient(srv.app)
     assert c.get("/health/live").status_code == 200
     r = c.get("/health/ready")
