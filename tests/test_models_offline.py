@@ -20,7 +20,7 @@ def ready_gigaam(base, model="v2_ctc", data=b"ckpt"):
     ckpt = ms.gigaam_checkpoint_path(base, model)
     ckpt.parent.mkdir(parents=True, exist_ok=True)
     ckpt.write_bytes(data + b"x" * max(0, ms.MIN_CHECKPOINT_BYTES - len(data)))
-    ms.write_gigaam_marker(base, model)
+    ms.write_gigaam_marker(base, model, offline_reload_verified=True)
     return ckpt
 
 
@@ -32,7 +32,7 @@ def test_gigaam_saved_in_cache_and_load_model_gets_download_root(tmp_path, monke
         return FakeModel()
     monkeypatch.setitem(sys.modules,"gigaam", types.SimpleNamespace(load_model=load_model))
     dm.warm_up_gigaam(tmp_path,"v2_ctc")
-    assert len(calls) == 1 and calls[0][:2] == ("v2_ctc", "cpu") and calls[0][2].endswith("/gigaam-cache")
+    assert len(calls) == 2 and calls[0][:2] == ("v2_ctc", "cpu") and calls[-1][2].endswith("/gigaam-cache")
     assert (tmp_path/"gigaam-cache"/"v2_ctc.ckpt").is_file()
 
 
@@ -99,19 +99,19 @@ def test_runtime_with_checkpoint_no_network_and_download_root(tmp_path, monkeypa
 def test_pyannote_marker_only_after_offline_check(tmp_path, monkeypatch):
     created=[]
     def snap(repo_id, **kw):
-        if repo_id == ms.PYANNOTE_REPO_ID:
+        if "local_dir" in kw:
             target=Path(kw["local_dir"]); target.mkdir(parents=True, exist_ok=True); (target/"config.yaml").write_text("x")
     class P:
         @staticmethod
         def from_pretrained(path, **kw): created.append((path, kw)); return object()
     monkeypatch.setitem(sys.modules,"huggingface_hub", types.SimpleNamespace(snapshot_download=snap))
-    monkeypatch.setitem(sys.modules,"pyannote.audio", types.SimpleNamespace(Pipeline=P))
-    dm.download_pyannote(tmp_path,"tok")
-    assert ms.is_pyannote_ready(tmp_path) and len(created)==2
+    monkeypatch.setitem(sys.modules,"pyannote.audio", types.SimpleNamespace(Pipeline=P, __version__="4.0.1"))
+    dm.download_pyannote(tmp_path,"tok", model_id="pyannote-community-1")
+    assert ms.is_pyannote_ready(tmp_path, "pyannote-community-1") and len(created)==2
 
 
 def test_incomplete_pyannote_not_ready_and_ready_needs_no_token(tmp_path):
     target=ms.pyannote_target(tmp_path); target.mkdir(parents=True); (target/"config.yaml").write_text("x")
     assert not ms.is_pyannote_ready(tmp_path)
-    ms.write_pyannote_marker(tmp_path)
-    assert dm.download_pyannote(tmp_path, None) == target
+    # A legacy marker is rejected without its separate 3.x interpreter.
+    assert not ms.is_pyannote_ready(tmp_path)

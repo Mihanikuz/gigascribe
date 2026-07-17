@@ -202,7 +202,16 @@ def _model_checks(load: bool = False) -> dict[str, Any]:
     from model_store import load_settings, SUPPORTED_GIGAAM_MODELS, is_gigaam_ready, is_pyannote_ready
     st = load_settings(MODELS_DIR); asr_name = SUPPORTED_GIGAAM_MODELS[st["asr_model"]]["model_name"]
     gigaam_import = _import_ok("gigaam")
-    pyannote_import = st["diarization_model"] == "none" or _import_ok("pyannote.audio")
+    if st["diarization_model"] == "pyannote-3.1":
+        from model_store import LEGACY_PYANNOTE_PYTHON
+        import subprocess
+        if Path(LEGACY_PYANNOTE_PYTHON).is_file():
+            legacy = subprocess.run([LEGACY_PYANNOTE_PYTHON, "-c", "import pyannote.audio; assert pyannote.audio.__version__.startswith('3.')"], capture_output=True, text=True)
+            pyannote_import = legacy.returncode == 0
+        else:
+            pyannote_import = False
+    else:
+        pyannote_import = st["diarization_model"] == "none" or _import_ok("pyannote.audio")
     checks = {
         "gigaam_files": is_gigaam_ready(MODELS_DIR, asr_name),
         "gigaam_import": gigaam_import,
@@ -225,9 +234,10 @@ def _model_checks(load: bool = False) -> dict[str, Any]:
             checks["gigaam_error"] = str(exc)
     if load and st["diarization_model"] != "none":
         try:
-            from pyannote.audio import Pipeline
-            from model_store import pyannote_target_for
-            Pipeline.from_pretrained(str(pyannote_target_for(MODELS_DIR, st["diarization_model"]) / "config.yaml"))
+            from diarization_backend import DiarizationBackend
+            backend = DiarizationBackend(str(MODELS_DIR))
+            backend.load(st["diarization_model"], st["device"])
+            backend.unload()
             checks["pyannote_load"] = "ok"
         except Exception as exc:
             checks["pyannote_load"] = "failed"

@@ -3,6 +3,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from diarization_backend import normalize_diarization
+from workers.pyannote_legacy_worker import normalize as normalize_legacy
 
 
 class Turn:
@@ -24,3 +25,9 @@ def test_normalizes_community_and_prefers_exclusive_result():
         speaker_diarization = Annotation()
         exclusive_speaker_diarization = Annotation()
     assert normalize_diarization(Output())[0]["speaker"] == "SPEAKER_00"
+
+
+def test_legacy_worker_returns_diagnostics_for_annotation():
+    segments, diagnostics = normalize_legacy(Annotation())
+    assert segments[0]["duration"] == 1.5
+    assert diagnostics == {"speaker_count": 1, "segment_count": 1, "speaker_durations": {"SPEAKER_00": 1.5}}
