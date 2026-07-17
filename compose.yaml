@@ -15,7 +15,20 @@ services:
       GIGASCRIBE_DEVICE: cpu
       HF_HOME: /opt/gigascribe/models/huggingface
       HF_HUB_OFFLINE: "1"
+      XDG_CACHE_HOME: /opt/gigascribe/data/cache
+      MPLCONFIGDIR: /opt/gigascribe/data/cache/matplotlib
     volumes:
       - ./data:/opt/gigascribe/data
       - ./models:/opt/gigascribe/models
     restart: unless-stopped
+  gigascribe-gpu:
+    profiles: [gpu]
+    extends: gigascribe
+    build:
+      args:
+        TORCH_REQUIREMENTS: requirements-cu128.txt
+    environment:
+      GIGASCRIBE_DEVICE: cuda
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    gpus: all

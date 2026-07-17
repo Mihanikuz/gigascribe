@@ -14,7 +14,7 @@ from model_store import (
     PYANNOTE_REPO_ID, PYANNOTE_SEGMENTATION_REPO_ID, GIGAAM_MARKER_NAME, SUPPORTED_DIARIZATION_MODELS,
     PYANNOTE_MARKER_NAME, gigaam_cache_dir, gigaam_checkpoint_path,
     is_gigaam_ready, is_pyannote_ready, pyannote_target, pyannote_target_for, write_gigaam_marker,
-    write_pyannote_marker,
+    write_pyannote_marker, SUPPORTED_GIGAAM_MODELS, MIN_CHECKPOINT_BYTES,
 )
 
 
@@ -66,7 +66,9 @@ def warm_up_gigaam(models_dir: Path, model_name: str, *, force: bool = False) ->
     if is_gigaam_ready(models_dir, model_name) and not force:
         print(f"GigaAM already present: {gigaam_checkpoint_path(models_dir, model_name)}")
         return target
-    if force:
+    # Always warm into an isolated cache.  A failed HTTP response must never
+    # become the live checkpoint or receive a readiness marker.
+    if force or not is_gigaam_ready(models_dir, model_name):
         tmp_parent = Path(tempfile.mkdtemp(prefix="gigaam-force-", dir=str(models_dir)))
         try:
             tmp_cache = gigaam_cache_dir(tmp_parent); tmp_cache.mkdir(parents=True, exist_ok=True)
@@ -74,49 +76,55 @@ def warm_up_gigaam(models_dir: Path, model_name: str, *, force: bool = False) ->
             if model is None or not hasattr(model, "transcribe"):
                 raise RuntimeError(f"GigaAM loader returned an invalid model for {model_name}")
             tmp_ckpt = gigaam_checkpoint_path(tmp_parent, model_name)
-            if not tmp_ckpt.is_file() or tmp_ckpt.stat().st_size <= 0:
-                raise RuntimeError(f"GigaAM loader did not create checkpoint: {tmp_ckpt}")
+            if not tmp_ckpt.is_file() or tmp_ckpt.stat().st_size < MIN_CHECKPOINT_BYTES:
+                raise RuntimeError(f"GigaAM loader produced a corrupt checkpoint (<{MIN_CHECKPOINT_BYTES} bytes): {tmp_ckpt}")
             cache_dir.mkdir(parents=True, exist_ok=True)
             os.replace(tmp_ckpt, gigaam_checkpoint_path(models_dir, model_name))
             write_gigaam_marker(models_dir, model_name)
         finally:
             shutil.rmtree(tmp_parent, ignore_errors=True)
         return target
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    model = _load_gigaam(model_name, cache_dir)
-    if model is None or not hasattr(model, "transcribe"):
-        raise RuntimeError(f"GigaAM loader returned an invalid model for {model_name}")
-    write_gigaam_marker(models_dir, model_name)
     return target
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Download GigaScribe models to a persistent directory")
     parser.add_argument("--models-dir", default=os.getenv("GIGASCRIBE_MODELS_DIR", "./models"))
-    parser.add_argument("--gigaam-model", default=os.getenv("GIGASCRIBE_GIGAAM_MODEL", "v2_ctc"), choices=["v2_ctc", "v3_ctc"])
+    parser.add_argument("--gigaam-model", default=None, choices=list(SUPPORTED_GIGAAM_MODELS))
+    parser.add_argument("--asr", choices=list(SUPPORTED_GIGAAM_MODELS), help="ASR registry ID")
+    parser.add_argument("--diarization", choices=[k for k in SUPPORTED_DIARIZATION_MODELS if k != "none"])
+    parser.add_argument("--all", action="store_true", help="download every ASR and diarization model")
+    parser.add_argument("--list", action="store_true", help="list registry IDs without downloading")
+    parser.add_argument("--repair", action="store_true", help="replace invalid checkpoints/snapshots")
     parser.add_argument("--offline", "--offline-verify", dest="offline", action="store_true", help="verify existing markers without network downloads")
     parser.add_argument("--pyannote-model", default="pyannote-3.1", choices=["pyannote-3.1", "pyannote-community-1"])
     parser.add_argument("--skip-gigaam", action="store_true")
     parser.add_argument("--skip-pyannote", action="store_true")
     parser.add_argument("--force", action="store_true", help="download/warm up models again even if readiness markers exist")
     args = parser.parse_args()
+    if args.list:
+        for mid, meta in SUPPORTED_GIGAAM_MODELS.items(): print(f"asr {mid}: {meta['model_name']}")
+        for mid, meta in SUPPORTED_DIARIZATION_MODELS.items(): print(f"diarization {mid}: {meta.get('repo_id', 'none')}")
+        return 0
 
     models_dir = Path(args.models_dir).expanduser().resolve()
     configure_model_dirs(models_dir, offline=args.offline)
     paths: dict[str, str] = {}
     try:
         if args.offline:
-            if not args.skip_gigaam and not is_gigaam_ready(models_dir, args.gigaam_model):
+            asr_ids = list(SUPPORTED_GIGAAM_MODELS) if args.all else [args.asr or args.gigaam_model or "gigaam-v2-ctc"]
+            diar_ids = [k for k in SUPPORTED_DIARIZATION_MODELS if k != "none"] if args.all else [args.diarization or args.pyannote_model]
+            if not args.skip_gigaam and any(not is_gigaam_ready(models_dir, SUPPORTED_GIGAAM_MODELS[x]["model_name"]) for x in asr_ids):
                 raise RuntimeError("GigaAM offline verification failed")
-            if not args.skip_pyannote and not is_pyannote_ready(models_dir, args.pyannote_model):
+            if not args.skip_pyannote and any(not is_pyannote_ready(models_dir, x) for x in diar_ids):
                 raise RuntimeError("Pyannote offline verification failed")
             print("Offline verification passed")
             return 0
+        asr_ids = list(SUPPORTED_GIGAAM_MODELS) if args.all else [args.asr or args.gigaam_model or "gigaam-v2-ctc"]
+        diar_ids = [k for k in SUPPORTED_DIARIZATION_MODELS if k != "none"] if args.all else [args.diarization or args.pyannote_model]
         if not args.skip_gigaam:
-            print(f"Preparing GigaAM model '{args.gigaam_model}' in {models_dir}")
-            paths["gigaam"] = str(warm_up_gigaam(models_dir, args.gigaam_model, force=args.force))
+            for mid in asr_ids: paths[mid] = str(warm_up_gigaam(models_dir, SUPPORTED_GIGAAM_MODELS[mid]["model_name"], force=args.force or args.repair))
         if not args.skip_pyannote:
-            print(f"Preparing pyannote model in {models_dir}")
-            paths["pyannote"] = str(download_pyannote(models_dir, os.getenv("HF_TOKEN") or None, model_id=args.pyannote_model, force=args.force))
+            for mid in diar_ids: paths[mid] = str(download_pyannote(models_dir, os.getenv("HF_TOKEN") or None, model_id=mid, force=args.force or args.repair))
         print("Model paths:")
         for name, path in paths.items():
             print(f"  {name}: {path}")

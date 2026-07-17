@@ -7,6 +7,7 @@ uid="${HOST_UID:-1000}"
 gid="${HOST_GID:-1000}"
 for dir in "${GIGASCRIBE_DATA_DIR:-/opt/gigascribe/data}" \
            "${GIGASCRIBE_DATA_DIR:-/opt/gigascribe/data}/uploads" \
+           "${GIGASCRIBE_DATA_DIR:-/opt/gigascribe/data}/cache/matplotlib" \
            "${GIGASCRIBE_MODELS_DIR:-/opt/gigascribe/models}"; do
     mkdir -p "$dir"
     chown -R "$uid:$gid" "$dir"

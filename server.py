@@ -423,7 +423,8 @@ def create_local_user(credentials: HTTPBasicCredentials = Depends(security), use
 @app.get("/api/models")
 def api_models(username: str = Depends(current_user)):
     from model_store import SUPPORTED_GIGAAM_MODELS, SUPPORTED_DIARIZATION_MODELS, PROFILES, load_settings
-    return {"asr": SUPPORTED_GIGAAM_MODELS, "diarization": SUPPORTED_DIARIZATION_MODELS, "profiles": PROFILES, "settings": load_settings(MODELS_DIR)}
+    from system_info import gpu_info
+    return {"asr": SUPPORTED_GIGAAM_MODELS, "diarization": SUPPORTED_DIARIZATION_MODELS, "profiles": PROFILES, "settings": load_settings(MODELS_DIR), "cuda_available": bool(gpu_info().get("cuda_available"))}
 
 @app.get("/api/models/status")
 def api_models_status(username: str = Depends(current_user)):
@@ -445,6 +446,10 @@ async def api_models_select(payload: dict[str, Any], username: str = Depends(req
         payload = {k:v for k,v in PROFILES[profile].items() if k in {"asr_model","diarization_model","device"}}
     try: settings = save_settings(payload, MODELS_DIR)
     except ValueError as exc: raise HTTPException(400, detail=str(exc))
+    if settings["device"] == "cuda":
+        from system_info import gpu_info
+        if not gpu_info(real_test=True).get("real_cuda_test", {}).get("ok"):
+            return JSONResponse({"ok":False,"error":"CUDA requested but unavailable; CPU remains the actual runtime","settings":settings}, status_code=422)
     return {"ok": True, "settings": settings}
 
 @app.post("/api/models/verify")
@@ -522,8 +527,8 @@ def api_system_gpu(username: str = Depends(current_user)):
     return gpu_info(real_test=True)
 
 LOGIN_HTML = """<!doctype html><meta charset='utf-8'><title>GigaScribe login</title><style>body{font-family:sans-serif;max-width:420px;margin:10vh auto}.err{color:#b00}input,button{width:100%;padding:10px;margin:6px 0}</style><h1>GigaScribe</h1><!--ERROR--><form method='post'><input name='username' placeholder='Пользователь'><input name='password' type='password' placeholder='Пароль'><button>Войти</button></form>"""
-INDEX_HTML = """<!doctype html><meta charset='utf-8'><title>GigaScribe</title><style>body{font-family:sans-serif;max-width:900px;margin:30px auto}.job{border:1px solid #ddd;padding:12px;margin:10px 0}progress{width:100%}label,select{margin:4px}</style><h1>Локальная транскрибация</h1><form id='up'><input type='file' name='file' required><button>Запустить</button></form><form id='model-settings'><label>ASR <select id='asr-model'></select></label><label>Диаризация <select id='diarization-model'></select></label><button>Сохранить модели</button><span id='model-message'></span></form><form method='post' action='/logout'><button>Выйти</button></form><div id='jobs'></div><script>
+INDEX_HTML = """<!doctype html><meta charset='utf-8'><title>GigaScribe</title><style>body{font-family:sans-serif;max-width:900px;margin:30px auto}.job{border:1px solid #ddd;padding:12px;margin:10px 0}progress{width:100%}label,select{margin:4px}</style><h1>Локальная транскрибация</h1><form id='up'><input type='file' name='file' required><button>Запустить</button></form><form id='model-settings'><label>ASR <select id='asr-model'></select></label><label>Диаризация <select id='diarization-model'></select></label><label>Устройство <select id='device'><option value='cpu'>CPU</option><option value='cuda'>CUDA</option></select></label><button>Сохранить модели</button><span id='model-message'></span></form><form method='post' action='/logout'><button>Выйти</button></form><div id='jobs'></div><script>
 async function refresh(){let r=await fetch('/api/jobs');let js=await r.json();jobs.innerHTML=js.reverse().map(j=>`<div class='job'><b>${j.filename}</b> — ${j.status}<br><progress value='${j.progress}' max='1'></progress> ${Math.round(j.progress*100)}%<br>${j.message}<br>${['transcript','log','original','wav'].filter(k=>j.downloads[k]).map(k=>`<a href='/api/jobs/${j.id}/download/${k}'>скачать ${k}</a>`).join(' | ')}</div>`).join('')}
-async function loadModels(){let r=await fetch('/api/models'), m=await r.json(); for(let [target,values,current] of [['asr-model',m.asr,m.settings.asr_model],['diarization-model',m.diarization,m.settings.diarization_model]]){let s=document.getElementById(target);s.innerHTML=Object.entries(values).map(([id,v])=>`<option value='${id}'>${v.label}</option>`).join('');s.value=current}}
-modelSettings=document.getElementById('model-settings'); modelSettings.onsubmit=async(e)=>{e.preventDefault();let r=await fetch('/api/models/select',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({asr_model:document.getElementById('asr-model').value,diarization_model:document.getElementById('diarization-model').value})});document.getElementById('model-message').textContent=r.ok?'Сохранено':'Ошибка сохранения'};
-up.onsubmit=async(e)=>{e.preventDefault();let fd=new FormData(up);await fetch('/api/jobs',{method:'POST',body:fd});up.reset();refresh()};loadModels();setInterval(refresh,1500);refresh();</script>"""
+async function loadModels(){let r=await fetch('/api/models'), m=await r.json(); for(let [target,values,current] of [['asr-model',m.asr,m.settings.asr_model],['diarization-model',m.diarization,m.settings.diarization_model]]){let s=document.getElementById(target);s.innerHTML=Object.entries(values).map(([id,v])=>`<option value='${id}'>${v.label}</option>`).join('');s.value=current} device.value=m.settings.device; device.querySelector("option[value=cuda]").disabled=!m.cuda_available}
+modelSettings=document.getElementById('model-settings'); modelSettings.onsubmit=async(e)=>{e.preventDefault();let r=await fetch('/api/models/select',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({asr_model:asrModel.value,diarization_model:diarizationModel.value,device:device.value})});document.getElementById('model-message').textContent=r.ok?'Сохранено':'Ошибка сохранения'};
+let asrModel=document.getElementById('asr-model'),diarizationModel=document.getElementById('diarization-model'),device=document.getElementById('device');let poll=3000;async function tick(){await refresh();setTimeout(tick,document.hidden?10000:poll)};up.onsubmit=async(e)=>{e.preventDefault();let fd=new FormData(up);await fetch('/api/jobs',{method:'POST',body:fd});up.reset();refresh()};loadModels();tick();</script>"""

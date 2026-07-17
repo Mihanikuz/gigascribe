@@ -27,7 +27,7 @@ RUN --mount=type=cache,id=gigascribe-pip-cache,target=/root/.cache/pip,sharing=l
         --no-deps gigaam==0.1.0
 COPY . .
 RUN apt-get update && apt-get install -y --no-install-recommends gosu && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p "$GIGASCRIBE_DATA_DIR/uploads" "$GIGASCRIBE_MODELS_DIR" \
+    && mkdir -p "$GIGASCRIBE_DATA_DIR/uploads" "$GIGASCRIBE_DATA_DIR/cache/matplotlib" "$GIGASCRIBE_MODELS_DIR" \
     && chmod +x /app/scripts/container-entrypoint.sh
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD curl -fsS http://127.0.0.1:8000/health/ready >/dev/null || exit 1

@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 import requests
 
 from model_store import assert_gigaam_ready, gigaam_cache_dir, is_gigaam_ready, is_pyannote_ready, pyannote_target, pyannote_target_for, load_settings, SUPPORTED_GIGAAM_MODELS
+from asr_backend import ASRBackend
 
 MODELS_DIR = Path(os.getenv("GIGASCRIBE_MODELS_DIR", "./models")).resolve()
 DATA_DIR = Path(os.getenv("GIGASCRIBE_DATA_DIR", "./data")).resolve()
@@ -27,6 +28,10 @@ os.environ.setdefault("HF_HOME", str(MODELS_DIR / "huggingface"))
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("XDG_CACHE_HOME", str(DATA_DIR / "cache"))
+os.environ.setdefault("MPLCONFIGDIR", str(DATA_DIR / "cache" / "matplotlib"))
+Path(os.environ["XDG_CACHE_HOME"]).mkdir(parents=True, exist_ok=True)
+Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
 
 PYANNOTE_LOCAL_PATH = Path(os.getenv("GIGASCRIBE_PYANNOTE_MODEL", pyannote_target(MODELS_DIR))).resolve()
 GIGAAM_MODEL_NAME = SUPPORTED_GIGAAM_MODELS[load_settings(MODELS_DIR)["asr_model"]]["model_name"]
@@ -151,6 +156,7 @@ class AudioProcessor:
         self.asr_model_name = SUPPORTED_GIGAAM_MODELS[self.snapshot["asr_model"]]["model_name"]
         self.pyannote_model_id = self.snapshot.get("diarization_model", "none")
         self.gigaam_model = None
+        self.asr_backend = ASRBackend(str(GIGAAM_CACHE_DIR))
         self.diarization_pipeline = None
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self.memory_manager = GPUMemoryManager()
@@ -178,7 +184,8 @@ class AudioProcessor:
         last_error = None
         for device in devices_to_try:
             try:
-                self.gigaam_model = gigaam.load_model(self.asr_model_name, device=device, download_root=str(GIGAAM_CACHE_DIR))
+                self.asr_backend.load(self.snapshot["asr_model"], device)
+                self.gigaam_model = self.asr_backend.model
                 print(f"GigaAM модель загружена успешно на {device} из локального кэша")
                 break
             except Exception as e:
@@ -316,9 +323,9 @@ class AudioProcessor:
 
         return segments
 
-    @staticmethod
-    def split_asr_interval(start: float, end: float, max_duration: float = MAX_DURATION_CHUNK) -> List[Tuple[float, float]]:
+    def split_asr_interval(self, start: float, end: float, max_duration: float | None = None) -> List[Tuple[float, float]]:
         """Return contiguous, non-empty ASR intervals no longer than the safe limit."""
+        max_duration = max_duration or SUPPORTED_GIGAAM_MODELS[self.snapshot["asr_model"]]["safe_segment_seconds"]
         if max_duration <= 0:
             raise ValueError("max_duration must be positive")
         start, end = float(start), float(end)
@@ -427,7 +434,8 @@ class AudioProcessor:
                 results.append("[Ошибка: файл не найден или пуст]")
                 continue
             try:
-                value = await loop.run_in_executor(self.executor, self.gigaam_model.transcribe, audio_path)
+                transcribe = self.asr_backend.transcribe if self.asr_backend.model is self.gigaam_model else self.gigaam_model.transcribe
+                value = await loop.run_in_executor(self.executor, transcribe, audio_path)
                 results.append(value.strip() if value else "")
             except Exception as exc:
                 results.append(self._transcription_error(audio_path, exc))
