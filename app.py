@@ -22,9 +22,11 @@ import requests
 from model_store import assert_gigaam_ready, gigaam_cache_dir, is_gigaam_ready, is_pyannote_ready, pyannote_target, pyannote_target_for, load_settings, SUPPORTED_GIGAAM_MODELS
 
 MODELS_DIR = Path(os.getenv("GIGASCRIBE_MODELS_DIR", "./models")).resolve()
+DATA_DIR = Path(os.getenv("GIGASCRIBE_DATA_DIR", "./data")).resolve()
 os.environ.setdefault("HF_HOME", str(MODELS_DIR / "huggingface"))
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 PYANNOTE_LOCAL_PATH = Path(os.getenv("GIGASCRIBE_PYANNOTE_MODEL", pyannote_target(MODELS_DIR))).resolve()
 GIGAAM_MODEL_NAME = SUPPORTED_GIGAAM_MODELS[load_settings(MODELS_DIR)["asr_model"]]["model_name"]
@@ -55,12 +57,20 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('transcription_app.log'),
+        logging.FileHandler(DATA_DIR / 'transcription_app.log'),
         logging.StreamHandler()
     ]
 )
 
 logger = logging.getLogger(__name__)
+_log_path = str(DATA_DIR / "transcription_app.log")
+# ``basicConfig`` is a no-op when uvicorn/pytest configured root logging first.
+# Attach our own handler so the persistent job log is never silently omitted.
+if not any(getattr(handler, "baseFilename", None) == _log_path for handler in logger.handlers):
+    _file_handler = logging.FileHandler(_log_path)
+    _file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(_file_handler)
+logger.setLevel(logging.INFO)
 
 # Импортируем библиотеки для обработки аудио и AI
 try:
@@ -85,7 +95,9 @@ except Exception:
     PYANNOTE_AVAILABLE = False
 
 # Конфигурация
-MAX_DURATION_CHUNK = 29  # секунд для одного чанка транскрипции
+# Keep a margin below GigaAM's ~30 second wav limit.  Never feed a larger
+# interval to ``transcribe``: longform would create a separate VAD dependency.
+MAX_DURATION_CHUNK = 24
 MAX_FILE_DURATION = 9000  # 2 часа в секундах
 SUPPORTED_FORMATS = ['.mp3', '.wav', '.mp4', '.avi', '.webm', '.m4a', '.flac', '.ogg']
 
@@ -285,7 +297,7 @@ class AudioProcessor:
                 "ffmpeg", "-i", str(input_path),
                 "-f", "segment",
                 "-segment_time", str(chunk_duration),
-                "-c", "copy",
+                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
                 "-reset_timestamps", "1",
                 "-y", output_pattern
             ]
@@ -303,6 +315,44 @@ class AudioProcessor:
             print(f"Ошибка разделения аудио: {e}")
 
         return segments
+
+    @staticmethod
+    def split_asr_interval(start: float, end: float, max_duration: float = MAX_DURATION_CHUNK) -> List[Tuple[float, float]]:
+        """Return contiguous, non-empty ASR intervals no longer than the safe limit."""
+        if max_duration <= 0:
+            raise ValueError("max_duration must be positive")
+        start, end = float(start), float(end)
+        if end <= start:
+            return []
+        intervals = []
+        cursor = start
+        # Deriving every boundary from the original clock prevents drift in
+        # timestamps and preserves the final short remainder.
+        while cursor < end:
+            next_end = min(cursor + max_duration, end)
+            if next_end > cursor:
+                intervals.append((cursor, next_end))
+            cursor = next_end
+        return intervals
+
+    def prepare_asr_segments(self, source_path: str, output_dir: str, intervals: List[Dict]) -> List[Dict]:
+        """Extract safe ASR wavs while retaining absolute speaker timestamps."""
+        prepared = []
+        for index, segment in enumerate(intervals):
+            for part, (start, end) in enumerate(self.split_asr_interval(segment["start"], segment["end"])):
+                path = os.path.join(output_dir, f"asr_{index:04d}_{part:03d}.wav")
+                duration = end - start
+                if self.extract_audio_segment(source_path, path, start, duration):
+                    prepared.append({**segment, "start": start, "end": end, "duration": duration, "path": path})
+                else:
+                    logger.error("Could not extract ASR segment path=%s start=%.3f duration=%.3f", path, start, duration)
+        return prepared
+
+    def _transcription_error(self, audio_path: str, exc: Exception) -> str:
+        duration = self.get_audio_duration(audio_path)
+        logger.exception("ASR failed path=%s duration=%.3fs model=%s device=%s", audio_path, duration, self.asr_model_name, self.device)
+        # The UI/job result remains actionable without exposing a traceback.
+        return f"[Ошибка транскрипции: {type(exc).__name__}: {exc}]"
 
     async def perform_diarization(self, audio_path: str) -> Optional[Dict]:
         """Выполнение speaker diarization с GPU оптимизацией"""
@@ -363,157 +413,25 @@ class AudioProcessor:
             raise
 
     async def transcribe_audio_batch(self, audio_paths: List[str]) -> List[str]:
-        """Батчевая транскрипция аудио с адаптивным размером батча"""
-        if not audio_paths:
-            return []
+        """Transcribe independently so one bad segment cannot discard its neighbours.
+
+        All callers prepare intervals below ``MAX_DURATION_CHUNK``; deliberately
+        use GigaAM's normal ``transcribe`` API, never ``transcribe_longform``.
+        """
         if not self.gigaam_model:
             raise RuntimeError("GigaAM model is not loaded")
-
+        loop = asyncio.get_running_loop()
         results = []
-        current_batch_size = self.memory_manager.get_current_batch_size()
-
-        # Обрабатываем файлы батчами
-        for i in range(0, len(audio_paths), current_batch_size):
-            batch = audio_paths[i:i + current_batch_size]
-            batch_results = []
-
+        for audio_path in audio_paths:
+            if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+                results.append("[Ошибка: файл не найден или пуст]")
+                continue
             try:
-                # Проверяем существование всех файлов в батче
-                valid_batch = []
-                for path in batch:
-                    if os.path.exists(path) and os.path.getsize(path) > 0:
-                        valid_batch.append(path)
-                    else:
-                        batch_results.append("[Ошибка: файл не найден или пуст]")
-
-                if not valid_batch:
-                    results.extend(batch_results)
-                    continue
-
-                # Очищаем кэш перед каждым батчем
-                self.memory_manager.clear_cache()
-
-                # Обрабатываем батч
-                loop = asyncio.get_event_loop()
-
-                if len(valid_batch) == 1:
-                    # Одиночная обработка
-                    try:
-                        result = await loop.run_in_executor(
-                            self.executor,
-                            self.gigaam_model.transcribe,
-                            valid_batch[0]
-                        )
-                        batch_results.append(result.strip() if result else "")
-                    except Exception as e:
-                        logger.exception("Ошибка транскрипции файла %s", valid_batch[0])
-                        batch_results.append(f"[Ошибка транскрипции: {type(e).__name__}]")
-                else:
-                    # Батчевая обработка если поддерживается
-                    try:
-                        batch_results_inner = await loop.run_in_executor(
-                            self.executor,
-                            self._transcribe_batch_sync,
-                            valid_batch
-                        )
-                        batch_results.extend([r.strip() if r else "" for r in batch_results_inner])
-                    except (AttributeError, CUDA_OOM):
-                        # Fallback на одиночную обработку
-                        for audio_path in valid_batch:
-                            try:
-                                result = await loop.run_in_executor(
-                                    self.executor,
-                                    self.gigaam_model.transcribe,
-                                    audio_path
-                                )
-                                batch_results.append(result.strip() if result else "")
-                            except Exception as e:
-                                logger.error(f"Ошибка транскрипции файла {audio_path}: {e}")
-                                batch_results.append(f"[Ошибка транскрипции: {type(e).__name__}]")
-                    except Exception as e:
-                        # Fallback на одиночную обработку при других ошибках
-                        logger.exception("Ошибка батчевой транскрипции")
-                        for audio_path in valid_batch:
-                            try:
-                                result = await loop.run_in_executor(
-                                    self.executor,
-                                    self.gigaam_model.transcribe,
-                                    audio_path
-                                )
-                                batch_results.append(result.strip() if result else "")
-                            except Exception as e2:
-                                logger.error(f"Ошибка транскрипции файла {audio_path}: {e2}")
-                                batch_results.append(f"[Ошибка транскрипции: {type(e2).__name__}]")
-
-            except CUDA_OOM:
-                print(f"GPU память закончилась при обработке батча размером {len(batch)}")
-                self.memory_manager.handle_memory_error()
-                self.memory_manager.clear_cache()
-
-                # Обрабатываем текущий батч по одному
-                for audio_path in batch:
-                    try:
-                        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
-                            result = await loop.run_in_executor(
-                                self.executor,
-                                self.gigaam_model.transcribe,
-                                audio_path
-                            )
-                            batch_results.append(result.strip() if result else "")
-                        else:
-                            batch_results.append("[Ошибка: файл не найден или пуст]")
-                    except Exception as e:
-                        logger.error(f"Ошибка транскрипции {audio_path}: {e}")
-                        batch_results.append(f"[Ошибка транскрипции: {type(e).__name__}]")
-
-            except Exception as e:
-                print(f"Ошибка обработки батча: {e}")
-                logger.exception("Ошибка обработки батча")
-                # Fallback на одиночную обработку
-                for audio_path in batch:
-                    try:
-                        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
-                            result = await loop.run_in_executor(
-                                self.executor,
-                                self.gigaam_model.transcribe,
-                                audio_path
-                            )
-                            batch_results.append(result.strip() if result else "")
-                        else:
-                            batch_results.append("[Ошибка: файл не найден или пуст]")
-                    except Exception as e2:
-                        logger.error(f"Ошибка транскрипции {audio_path}: {e2}")
-                        batch_results.append(f"[Ошибка транскрипции: {type(e2).__name__}]")
-
-            results.extend(batch_results)
-
+                value = await loop.run_in_executor(self.executor, self.gigaam_model.transcribe, audio_path)
+                results.append(value.strip() if value else "")
+            except Exception as exc:
+                results.append(self._transcription_error(audio_path, exc))
         return results
-
-    def _transcribe_batch_sync(self, audio_paths: List[str]) -> List[str]:
-        """Синхронная обертка для батчевой транскрипции"""
-        try:
-            # Проверяем, поддерживает ли модель батчевую обработку
-            if hasattr(self.gigaam_model, 'transcribe_batch'):
-                return self.gigaam_model.transcribe_batch(audio_paths)
-            else:
-                # Fallback на последовательную обработку
-                results = []
-                for path in audio_paths:
-                    try:
-                        if os.path.exists(path) and os.path.getsize(path) > 0:
-                            result = self.gigaam_model.transcribe(path)
-                            results.append(result)
-                        else:
-                            results.append("[Ошибка: файл не найден или пуст]")
-                    except Exception as e:
-                        logger.error(f"Ошибка транскрипции файла {path}: {e}")
-                        results.append(f"[Ошибка транскрипции: {type(e).__name__}]")
-                return results
-        except CUDA_OOM:
-            raise
-        except Exception as e:
-            print(f"Ошибка в _transcribe_batch_sync: {e}")
-            raise
 
     async def transcribe_audio(self, audio_path: str) -> str:
         """Транскрипция одного аудио файла"""
@@ -588,108 +506,25 @@ class AudioProcessor:
             full_text_parts = []
 
             if diarization_result and len(diarization_result['segments']) > 0:
-                # Подготавливаем сегменты для батчевой обработки
-                segment_paths = []
-                segment_info = []
-
-                for i, seg in enumerate(diarization_result['segments']):
-                    # Извлекаем сегмент аудио
-                    segment_path = os.path.join(temp_dir, f"segment_{i}.wav")
-
-                    # Используем улучшенную функцию извлечения
-                    if self.extract_audio_segment(wav_path, segment_path, seg['start'], seg['duration']):
-                        segment_paths.append(segment_path)
-                        segment_info.append(seg)
-                    else:
-                        print(f"Ошибка извлечения сегмента {i}")
-                        continue
-
-                # Батчевая транскрипция всех сегментов
-                if segment_paths:
-                    transcriptions = await self.transcribe_audio_batch(segment_paths)
-
-                    # Объединяем результаты
-                    for seg_info, text in zip(segment_info, transcriptions):
-                        if text and text.strip() and not text.startswith("[Ошибка"):
-                            segments.append({
-                                'start': seg_info['start'],
-                                'end': seg_info['end'],
-                                'speaker': seg_info['speaker'],
-                                'text': text,
-                                'duration': seg_info['duration']
-                            })
-
-                            speaker_num = seg_info['speaker'].replace('SPEAKER_', '') if 'SPEAKER_' in seg_info[
-                                'speaker'] else seg_info['speaker']
-                            time_start = self.format_time(seg_info['start'])
-                            time_end = self.format_time(seg_info['end'])
-                            full_text_parts.append(f"Спикер {speaker_num} [{time_start} - {time_end}]: {text}")
-                else:
-                    # Если не удалось извлечь сегменты, используем fallback
-                    text = await self.transcribe_audio(wav_path)
-                    segments.append({
-                        'start': 0,
-                        'end': duration,
-                        'speaker': 'SPEAKER_1',
-                        'text': text,
-                        'duration': duration
-                    })
-                    time_end = self.format_time(duration)
-                    full_text_parts.append(f"Спикер 1 [00:00 - {time_end}]: {text}")
-
+                source_intervals = diarization_result['segments']
             else:
-                # Fallback: обрабатываем как одного спикера
-                if duration <= MAX_DURATION_CHUNK:
-                    # Короткий файл - транскрибируем целиком
-                    text = await self.transcribe_audio(wav_path)
-                    segments.append({
-                        'start': 0,
-                        'end': duration,
-                        'speaker': 'SPEAKER_1',
-                        'text': text,
-                        'duration': duration
-                    })
-                    time_end = self.format_time(duration)
-                    full_text_parts.append(f"Спикер 1 [00:00 - {time_end}]: {text}")
-                else:
-                    # Длинный файл - разбиваем на чанки и используем батчевую обработку
-                    chunks_dir = os.path.join(temp_dir, "chunks")
-                    os.makedirs(chunks_dir, exist_ok=True)
+                # Use the same safe splitter without diarization.  This is also
+                # the offline path: it has no pyannote/VAD dependency.
+                source_intervals = [{'start': 0.0, 'end': duration, 'duration': duration, 'speaker': 'SPEAKER_1'}]
 
-                    chunks = self.split_audio_by_duration(wav_path, chunks_dir)
-
-                    if chunks:
-                        # Батчевая транскрипция чанков
-                        transcriptions = await self.transcribe_audio_batch(chunks)
-
-                        for i, (chunk_path, text) in enumerate(zip(chunks, transcriptions)):
-                            chunk_duration = self.get_audio_duration(chunk_path)
-                            start_time = i * MAX_DURATION_CHUNK
-                            end_time = start_time + chunk_duration
-
-                            segments.append({
-                                'start': start_time,
-                                'end': end_time,
-                                'speaker': 'SPEAKER_1',
-                                'text': text,
-                                'duration': chunk_duration
-                            })
-
-                            time_start = self.format_time(start_time)
-                            time_end = self.format_time(end_time)
-                            full_text_parts.append(f"Спикер 1 [{time_start} - {time_end}]: {text}")
-                    else:
-                        # Если не удалось создать чанки, транскрибируем весь файл
-                        text = await self.transcribe_audio(wav_path)
-                        segments.append({
-                            'start': 0,
-                            'end': duration,
-                            'speaker': 'SPEAKER_1',
-                            'text': text,
-                            'duration': duration
-                        })
-                        time_end = self.format_time(duration)
-                        full_text_parts.append(f"Спикер 1 [00:00 - {time_end}]: {text}")
+            prepared = self.prepare_asr_segments(wav_path, temp_dir, source_intervals)
+            transcriptions = await self.transcribe_audio_batch([item['path'] for item in prepared])
+            for seg_info, text in zip(prepared, transcriptions):
+                if not text or text.startswith("[Ошибка"):
+                    continue
+                segments.append({
+                    'start': seg_info['start'], 'end': seg_info['end'],
+                    'speaker': seg_info['speaker'], 'text': text, 'duration': seg_info['duration'],
+                })
+                speaker_num = seg_info['speaker'].replace('SPEAKER_', '') if 'SPEAKER_' in seg_info['speaker'] else seg_info['speaker']
+                full_text_parts.append(
+                    f"Спикер {speaker_num} [{self.format_time(seg_info['start'])} - {self.format_time(seg_info['end'])}]: {text}"
+                )
 
             if progress_callback:
                 progress_callback(0.9, f"Обработка {filename}: финализация...")

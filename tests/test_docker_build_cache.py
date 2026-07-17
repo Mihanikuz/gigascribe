@@ -9,9 +9,10 @@ def test_pip_installs_use_a_shared_buildkit_cache_and_network_retries():
 
     assert "# syntax=docker/dockerfile:1.7" in dockerfile
     assert "PIP_CACHE_DIR=/root/.cache/pip" in dockerfile
-    assert "PIP_DEFAULT_TIMEOUT=600 PIP_RETRIES=20 PIP_RESUME_RETRIES=50" in dockerfile
+    assert "PIP_DEFAULT_TIMEOUT=600 PIP_RETRIES=20" in dockerfile
+    assert "--resume-retries" not in dockerfile
     assert dockerfile.count("--mount=type=cache,id=gigascribe-pip-cache,target=/root/.cache/pip,sharing=locked") == 3
-    assert dockerfile.count("--resume-retries 50") == 5
+    assert "--resume-retries" not in dockerfile
 
 
 def test_dependency_layers_precede_application_source_copy():

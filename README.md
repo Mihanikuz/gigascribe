@@ -19,9 +19,9 @@ CPU-образ использует `requirements-cpu.txt` и не скачив�
 
 ## Устойчивость сборки к обрывам сети
 
-Dockerfile использует BuildKit cache mount с постоянным идентификатором `gigascribe-pip-cache` для `/root/.cache/pip`. Этот каталог управляется builder'ом Docker, а не находится внутри финального образа: он сохраняет HTTP-кэш и полностью скачанные wheels между запусками `docker compose build` на том же builder'е. Поэтому уже завершённые загрузки, включая `torch`, `torchaudio`, `nvidia-cudnn` и `nvidia-cublas`, при неизменных версиях берутся из кэша, а не загружаются повторно.
+Dockerfile использует BuildKit cache mount с постоянным идентификатором `gigascribe-pip-cache` для `/root/.cache/pip`. Этот каталог управляется builder'ом Docker, а не находится внутри финального образа: он сохраняет HTTP-кэш и полностью скачанные wheels между запусками `docker compose build` на том же builder'е. Поэтому уже завершённые загрузки, включая CPU wheels `torch` и `torchaudio`, при неизменных версиях берутся из кэша, а не загружаются повторно.
 
-Каждая установка зависимостей использует таймаут 600 секунд, 20 попыток сетевого подключения и до 50 попыток докачки в рамках запуска `pip`. Pip обновляется перед установкой зависимостей, чтобы поддерживалась опция `--resume-retries`. Если соединение оборвалось во время работающего `pip`, он запрашивает оставшийся диапазон файла; после успешного завершения wheel сохраняется в BuildKit cache. Если сам процесс сборки принудительно остановлен до завершения конкретного wheel, pip удаляет свой временный неполный файл, поэтому следующий запуск не может докачать именно этот незавершённый файл: он скачает только этот wheel заново, сохранив все уже завершённые wheels. Это ограничение pip, а не очистка BuildKit cache.
+Каждая установка зависимостей использует таймаут 600 секунд и 20 попыток сетевого подключения. Неподдерживаемая pip-опция `--resume-retries` намеренно не используется. Завершённые wheels сохраняются в BuildKit cache; если сборка прервана до завершения конкретного wheel, pip скачает только этот незавершённый wheel заново.
 
 Для работы cache mount нужен BuildKit. В актуальном Docker Compose v2 он обычно включён по умолчанию; при старой конфигурации запускайте сборку так:
 
@@ -87,7 +87,7 @@ HF_TOKEN=... python scripts/download_models.py --models-dir ./models --skip-giga
 python scripts/download_models.py --models-dir ./models --offline
 ```
 
-`requirements-gigaam.txt` содержит только runtime-зависимости GigaAM (`hydra-core`, `omegaconf`, `sentencepiece`). Затем `gigaam==0.1.0` устанавливается ровно один раз через `pip install --no-deps`, потому что metadata пакета ограничивает `torch<=2.5.1`. Это сохраняет уже установленный CUDA 12.8 PyTorch и исключает повторную установку `torch`/`torchaudio`.
+`requirements-gigaam.txt` закрепляет совместимые runtime-зависимости GigaAM (`onnx`, `onnxruntime`, `hydra-core`, `omegaconf`, `sentencepiece`). Затем `gigaam==0.1.0` устанавливается ровно один раз через `pip install --no-deps`, потому что metadata пакета ограничивает `torch<=2.5.1`. Это сохраняет уже установленный CUDA 12.8 PyTorch и исключает повторную установку `torch`/`torchaudio`.
 
 Для локального pyannote используется путь к `config.yaml`, marker `.pyannote-ready.json` создаётся только после загрузочной проверки. HF token лучше передавать одноразово или через secret; не публикуйте вывод `docker compose config`, он может раскрыть `.env`.
 
@@ -140,3 +140,7 @@ scripts/preflight.sh cpu
 ## Известные ограничения
 
 В этом репозитории нет доступа к реальной RTX 5060 Ti, поэтому фактические замеры VRAM и скорости должны выполняться на целевом хосте через `/api/system/gpu` и job logs. Реальный CUDA-smoke, pyannote gated downloads и инференс зависят от установленного драйвера, HF-доступа и локальных model snapshots.
+
+## Compose
+
+`compose.yaml` is the sole canonical Compose definition. Use `docker compose -f compose.yaml ...`; the legacy `docker-compose.yml` was removed to avoid Compose selecting an ambiguous configuration.
