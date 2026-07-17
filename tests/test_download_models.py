@@ -6,7 +6,7 @@ import scripts.download_models as dm
 
 
 def _ready(base):
-    ckpt=ms.gigaam_checkpoint_path(base,"v2_ctc"); ckpt.parent.mkdir(parents=True, exist_ok=True); ckpt.write_bytes(b"ok")
+    ckpt=ms.gigaam_checkpoint_path(base,"v2_ctc"); ckpt.parent.mkdir(parents=True, exist_ok=True); ckpt.write_bytes(b"ok" + b"x" * ms.MIN_CHECKPOINT_BYTES)
     ms.write_gigaam_marker(base,"v2_ctc")
 
 

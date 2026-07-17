@@ -4,7 +4,34 @@
 
 ## Поддерживаемые модели
 
-ASR: `GigaAM v2_ctc`, `GigaAM v3_ctc`. Диаризация: `pyannote speaker-diarization-3.1`, `pyannote speaker-diarization-community-1`, `Без диаризации`. Выбор сохраняется в `models/settings.json`; новые задания получают снимок настроек, уже запущенные задания не переключаются молча.
+ASR: `GigaAM v2_ctc`, `GigaAM v3_ctc`, `GigaAM v3_e2e_rnnt`. Диаризация: `pyannote speaker-diarization-3.1`, `pyannote Community-1`, `Без диаризации`. Выбор сохраняется в `models/settings.json`; новые задания получают снимок настроек, уже запущенные задания не переключаются молча.
+
+### Совместимость моделей
+
+GigaAM устанавливается из официального репозитория `salute-developers/GigaAM` по
+зафиксированному release `v0.3.0` (см. `requirements-gigaam.txt`), а не из
+устаревшего `gigaam==0.1.0`. Официальные имена, передаваемые в
+`gigaam.load_model`, — `v2_ctc`, `v3_ctc` и `v3_e2e_rnnt`.
+
+CPU использует `torch/torchaudio 2.7.0+cpu`; GPU — официальный
+`2.7.0+cu128`. Маркер модели создаётся загрузчиком только после конструирования
+модели в изолированном кэше; он содержит SHA-256 checkpoint, release backend и
+версию PyTorch. Смена release или PyTorch делает старый marker неготовым.
+
+`speaker-diarization-3.1` — legacy pipeline (`pyannote.audio 3.1.*`), тогда как
+Community-1 использует современный API (`pyannote.audio 4.*`). Их нельзя
+считать взаимозаменяемыми: production deployment должен предоставлять legacy
+runtime отдельно, пока не пройдёт offline load-test именно этой pipeline.
+Community-1 не скачивает `segmentation-3.0`; загрузчик получает только
+зависимости, объявленные metadata выбранной pipeline.
+
+Запускайте ровно один профиль:
+
+```bash
+docker compose -f compose.yaml --profile cpu up -d
+# или
+docker compose -f compose.yaml --profile gpu up -d
+```
 
 ## Быстрый старт CPU
 

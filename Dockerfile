@@ -23,8 +23,7 @@ COPY requirements-base.txt requirements-gigaam.txt ./
 RUN --mount=type=cache,id=gigascribe-pip-cache,target=/root/.cache/pip,sharing=locked \
     python -m pip install --timeout 600 --retries 20 \
         -c constraints.txt -r requirements-base.txt -r requirements-gigaam.txt \
-    && python -m pip install --timeout 600 --retries 20 \
-        --no-deps gigaam==0.1.0
+    && python -m pip check
 COPY . .
 RUN apt-get update && apt-get install -y --no-install-recommends gosu && rm -rf /var/lib/apt/lists/* \
     && mkdir -p "$GIGASCRIBE_DATA_DIR/uploads" "$GIGASCRIBE_DATA_DIR/cache/matplotlib" "$GIGASCRIBE_MODELS_DIR" \
