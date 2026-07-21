@@ -1,9 +1,2 @@
-# Community-1 requires the current pyannote API. Legacy 3.1 is loaded by the
-# isolated legacy runtime in production; it must not be claimed compatible here.
-pyannote.audio==4.0.1
-numpy>=1.24.0,<2.0.0
-scipy>=1.10.0,<1.14.0
-librosa>=0.10.0,<0.11.0
-soundfile>=0.12.1,<0.13.0
-pydub>=0.25.1,<0.26.0
-huggingface_hub>=0.20.0,<0.30.0
+huggingface_hub>=0.25
+pyannote.audio>=4,<5

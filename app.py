@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from model_store import assert_gigaam_ready, gigaam_cache_dir, is_gigaam_ready, is_pyannote_ready, pyannote_target, pyannote_target_for, load_settings, SUPPORTED_GIGAAM_MODELS
+from model_store import ASR_MODEL_ID, DIARIZATION_MODEL_ID, assert_gigaam_ready, gigaam_cache_dir, is_gigaam_ready, is_pyannote_ready, pyannote_target, load_settings, SUPPORTED_GIGAAM_MODELS
 from asr_backend import ASRBackend
 from diarization_backend import DiarizationBackend
 
@@ -84,7 +84,7 @@ try:
 
     GIGAAM_AVAILABLE = True
 except Exception as e:
-    print(f"Warning: gigaam not available, will use fallback: {e}")
+    print(f"Warning: gigaam not available: {e}")
     GIGAAM_AVAILABLE = False
 
 try:
@@ -108,7 +108,7 @@ MAX_FILE_DURATION = 9000  # 2 часа в секундах
 SUPPORTED_FORMATS = ['.mp3', '.wav', '.mp4', '.avi', '.webm', '.m4a', '.flac', '.ogg']
 
 # GPU конфигурация
-DEVICE = torch.device("cuda" if torch is not None and load_settings(MODELS_DIR).get("device") == "cuda" and torch.cuda.is_available() else "cpu") if torch is not None else type("CPUDevice", (), {"type": "cpu", "__str__": lambda self: "cpu"})()
+DEVICE = torch.device("cuda") if torch is not None else None
 CUDA_OOM = torch.cuda.OutOfMemoryError if torch is not None else RuntimeError
 MAX_BATCH_SIZE = 8  # Начальный размер батча для параллельной обработки
 MIN_BATCH_SIZE = 1  # Минимальный размер батча при нехватке памяти
@@ -162,10 +162,10 @@ class AudioProcessor:
         self.diarization_backend = DiarizationBackend(str(MODELS_DIR))
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self.memory_manager = GPUMemoryManager()
-        requested = self.snapshot.get("device", "cpu")
-        if requested == "cuda" and (torch is None or not torch.cuda.is_available()) and os.getenv("GIGASCRIBE_ALLOW_CPU_FALLBACK") != "1":
-            raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
-        self.device = torch.device("cuda" if torch is not None and requested == "cuda" and torch.cuda.is_available() else "cpu") if torch is not None else DEVICE
+        if torch is None or not torch.cuda.is_available():
+            raise RuntimeError("CUDA_NOT_AVAILABLE: torch.cuda.is_available() is false")
+        torch.ones((1,), device="cuda")
+        self.device = torch.device("cuda")
 
         print(f"Инициализация AudioProcessor на устройстве: {self.device}")
         if torch is not None and torch.cuda.is_available():
@@ -182,35 +182,24 @@ class AudioProcessor:
         if not GIGAAM_AVAILABLE:
             raise RuntimeError("gigaam is not installed; transcription cannot run")
         assert_gigaam_ready(MODELS_DIR, self.asr_model_name)
-        devices_to_try = [str(self.device)] if getattr(self.device, "type", str(self.device)) == 'cuda' else ['cpu']
-        last_error = None
-        for device in devices_to_try:
-            try:
-                self.asr_backend.load(self.snapshot["asr_model"], device)
-                self.gigaam_model = self.asr_backend.model
-                print(f"GigaAM модель загружена успешно на {device} из локального кэша")
-                break
-            except Exception as e:
-                last_error = e
-                print(f"Ошибка загрузки GigaAM на {device}: {e}")
-        if self.gigaam_model is None:
-            raise RuntimeError(f"GigaAM model '{self.asr_model_name}' is unavailable locally: {last_error}")
+        try:
+            self.asr_backend.load(ASR_MODEL_ID, "cuda")
+            self.gigaam_model = self.asr_backend.model
+            print("GigaAM RNNT модель загружена успешно на cuda из локального кэша")
+        except Exception as e:
+            raise RuntimeError(f"ASR_MODEL_LOAD_FAILED: {e}") from e
 
         if progress_callback:
             progress_callback(0.3,
                               "Загрузка модели для разделения спикеров на GPU..." if getattr(self.device, "type", str(self.device)) == 'cuda' else "Загрузка модели для разделения спикеров на CPU...")
 
-        # Загружаем pyannote только из локального snapshot; отсутствие не критично.
-        if self.pyannote_model_id != "none" and PYANNOTE_AVAILABLE and is_pyannote_ready(MODELS_DIR, self.pyannote_model_id):
-            try:
-                self.diarization_backend.load(self.pyannote_model_id, str(self.device))
-                self.diarization_pipeline = self.diarization_backend.pipeline
-                print(f"Pyannote модель загружена успешно на {self.device} из {PYANNOTE_LOCAL_PATH}")
-            except Exception as e:
-                print(f"Предупреждение: pyannote недоступен локально, режим без разделения спикеров: {e}")
-                self.diarization_pipeline = None
+        if self.pyannote_model_id != "none":
+            if not PYANNOTE_AVAILABLE or not is_pyannote_ready(MODELS_DIR, self.pyannote_model_id):
+                raise RuntimeError("DIARIZATION_MODEL_NOT_FOUND: pyannote Community-1 is not ready locally")
+            self.diarization_backend.load(self.pyannote_model_id, "cuda")
+            self.diarization_pipeline = self.diarization_backend.pipeline
+            print(f"Pyannote Community-1 загружена успешно на cuda из {PYANNOTE_LOCAL_PATH}")
         else:
-            print(f"Предупреждение: локальная pyannote модель не найдена в {PYANNOTE_LOCAL_PATH}; используется один спикер")
             self.diarization_pipeline = None
 
         if progress_callback:
@@ -377,16 +366,7 @@ class AudioProcessor:
 
             loop = asyncio.get_event_loop()
 
-            # Обработка на GPU или CPU в зависимости от устройства
-            diarization = await loop.run_in_executor(
-                self.executor,
-                self._run_diarization_sync,
-                audio_path
-            )
-
-            # Преобразуем результат в удобный формат
-            from diarization_backend import normalize_diarization
-            segments = normalize_diarization(diarization)
+            segments = await loop.run_in_executor(self.executor, self.diarization_backend.diarize, audio_path)
 
             return {
                 'segments': segments,
@@ -400,9 +380,8 @@ class AudioProcessor:
             # Повторяем попытку
             return await self.perform_diarization(audio_path)
         except Exception as e:
-            print(f"Ошибка diarization: {e}")
             logger.error(f"Ошибка diarization для файла {audio_path}: {e}")
-            return None
+            raise RuntimeError(f"DIARIZATION_MODEL_LOAD_FAILED: {e}") from e
 
     def _run_diarization_sync(self, audio_path: str):
         """Синхронная обертка для diarization"""
@@ -554,8 +533,8 @@ class AudioProcessor:
             )
 
 
-# Глобальный процессор
-processor = AudioProcessor()
+# Глобальный процессор создается лениво, чтобы /health/ready мог объяснить отсутствие CUDA.
+processor = None
 
 
 async def process_files(files, progress=gr.Progress()):
@@ -563,6 +542,9 @@ async def process_files(files, progress=gr.Progress()):
     if not files:
         return "Файлы не загружены", None, None
 
+    global processor
+    if processor is None:
+        processor = AudioProcessor()
     # Инициализируем модели если нужно
     if processor.gigaam_model is None:
         progress(0.05, f"Инициализация моделей на {processor.device}...")
@@ -646,7 +628,7 @@ async def process_files(files, progress=gr.Progress()):
             for file_path, arc_name in output_files:
                 zipf.write(file_path, arc_name)
 
-        device_info = f" (GPU: {torch.cuda.get_device_name()})" if torch.cuda.is_available() else " (CPU)"
+        device_info = f" (GPU: {torch.cuda.get_device_name()})"
         progress(1.0, f"Обработка завершена{device_info}! Обработано файлов: {len(results)}")
 
         # Создаем сводку
@@ -659,7 +641,7 @@ async def process_files(files, progress=gr.Progress()):
 
         return summary, zip_path, output_files[0][0] if output_files else None
     elif len(output_files) == 1:
-        device_info = f" (GPU: {torch.cuda.get_device_name()})" if torch.cuda.is_available() else " (CPU)"
+        device_info = f" (GPU: {torch.cuda.get_device_name()})"
         progress(1.0, f"Обработка завершена{device_info}!")
         result = results[0]
         if isinstance(result, TranscriptionResult):
@@ -674,7 +656,7 @@ async def process_files(files, progress=gr.Progress()):
 
 # Создаем Gradio интерфейс
 def create_interface():
-    device_info = f"GPU: {torch.cuda.get_device_name()}" if torch.cuda.is_available() else "CPU"
+    device_info = f"GPU: {torch.cuda.get_device_name()}" if torch is not None and torch.cuda.is_available() else "CUDA недоступна"
 
     with gr.Blocks(title="Транскрипция аудио с разделением по спикерам (GPU)",
                    theme=gr.themes.Soft()) as demo:
