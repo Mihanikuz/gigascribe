@@ -87,6 +87,8 @@ job_store.recover()
 gpu_worker = asyncio.Semaphore(1)
 scheduled_jobs: set[str] = set()
 model_download_locks: dict[str, asyncio.Lock] = {}
+from model_manager import ModelManager
+MODEL_MANAGER = ModelManager(MODELS_DIR)
 
 
 def _validate_password(password: str) -> None:
@@ -199,13 +201,11 @@ def _import_ok(name: str) -> bool:
     except Exception: return False
 
 def _model_checks(load: bool = False) -> dict[str, Any]:
-    from model_manager import ModelManager
-    return ModelManager(MODELS_DIR).health_status()
+    return MODEL_MANAGER.health_status(deep=load)
 
 @app.get("/health/ready")
 def health_ready():
-    from model_manager import ModelManager
-    status = ModelManager(MODELS_DIR).health_status()
+    status = MODEL_MANAGER.health_status(deep=False)
     checks = {"data_writable": _writable_dir(BASE_DIR), "models_writable": _writable_dir(MODELS_DIR), "secret_key_configured": SECRET_KEY_CONFIGURED, "ffmpeg": shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None}
     ready = status["status"] == "ready" and all(checks.values())
     status["checks"] = checks
@@ -294,17 +294,29 @@ async def run_job(job_id: str) -> None:
         value = round(max(0.0, min(1.0, value)), 3); job_store.update(job_id, progress=value, message=message); log(f"{value:.0%} {message}")
     try:
         snapshot = job["settings_snapshot"]; progress(.01, "Инициализация задания")
-        processor = giga_app.AudioProcessor(snapshot=snapshot)
+        import torch
+        log(f"job_id={job_id}")
+        log(f"ASR model: {snapshot.get('asr_model')}")
+        log(f"Diarization model: {snapshot.get('diarization_model')}")
+        log(f"Device: {snapshot.get('device')}")
+        log(f"GPU name: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'unavailable'}")
+        log(f"PyTorch version: {torch.__version__}")
+        log(f"CUDA runtime: {torch.version.cuda}")
+        from model_store import gigaam_cache_dir, pyannote_target_for
+        log(f"ASR model path: {gigaam_cache_dir(MODELS_DIR)}")
+        log(f"Diarization model path: {pyannote_target_for(MODELS_DIR, snapshot.get('diarization_model', 'none'))}")
+        t0=time.perf_counter(); processor = giga_app.AudioProcessor(snapshot=snapshot)
         if job_store.get(job_id)["cancel_requested"]:
             job_store.update(job_id,status="cancelled",finished_at=time.time(),message="Отменено"); return
         async with gpu_worker:
             if job_store.get(job_id)["cancel_requested"]:
                 job_store.update(job_id,status="cancelled",finished_at=time.time(),message="Отменено"); return
-            await processor.initialize_models(lambda p,m: progress(p*.1,m))
+            await processor.initialize_models(lambda p,m: progress(p*.1,m)); log(f"model_initialization_seconds={time.perf_counter()-t0:.3f}")
             if job_store.get(job_id)["cancel_requested"]:
                 job_store.update(job_id,status="cancelled",finished_at=time.time(),message="Отменено"); return
             work = processor.process_single_file(job["original_path"], progress, original_filename=job["filename"], artifacts_dir=str(result_dir))
             result = await asyncio.wait_for(work, job["timeout_seconds"]) if job["timeout_seconds"] else await work
+            log(f"total_seconds={time.perf_counter()-t0:.3f}")
         if job_store.get(job_id)["cancel_requested"]:
             job_store.update(job_id,status="cancelled",finished_at=time.time(),message="Отменено"); return
         transcript = result_dir / f"{Path(job['filename']).stem}.txt"; transcript.write_text(result.full_text, encoding="utf-8")
@@ -312,8 +324,8 @@ async def run_job(job_id: str) -> None:
         job_store.update(job_id,status="completed",finished_at=time.time(),progress=1,message="Готово",transcript_path=str(transcript),wav_path=str(wav) if wav.exists() else None,actual_device=str(processor.device),actual_models={"asr_model":snapshot.get("asr_model"),"diarization_model":snapshot.get("diarization_model")})
     except asyncio.TimeoutError:
         job_store.update(job_id,status="failed",finished_at=time.time(),error="Job timed out",message="Превышено время выполнения")
-    except Exception:
-        job_store.update(job_id,status="failed",finished_at=time.time(),error="Processing failed",message="Ошибка обработки")
+    except Exception as exc:
+        job_store.update(job_id,status="failed",finished_at=time.time(),error=str(exc),message="Ошибка обработки")
         logger.exception("transcription failed job_id=%s model=%s device=%s", job_id, job["settings_snapshot"], job["settings_snapshot"].get("device"))
     finally: scheduled_jobs.discard(job_id)
 
@@ -401,8 +413,13 @@ async def api_models_select(payload: dict[str, Any], username: str = Depends(req
         raise HTTPException(400, detail="Profiles are not supported in CUDA-only mode")
     from model_store import save_settings, is_pyannote_ready
     diar = payload.get("diarization_model")
-    if diar and diar != "none" and not is_pyannote_ready(MODELS_DIR, diar):
-        return JSONResponse({"ok":False,"error":"DIARIZATION_MODEL_NOT_FOUND: pyannote Community-1 is not ready"}, status_code=422)
+    if diar and diar != "none":
+        if not is_pyannote_ready(MODELS_DIR, diar):
+            return JSONResponse({"ok":False,"error_code":"DIARIZATION_MODEL_NOT_READY","error":"pyannote Community-1 is not ready locally"}, status_code=422)
+        try:
+            MODEL_MANAGER.load_diarization(diar)
+        except Exception as exc:
+            return JSONResponse({"ok":False,"error_code":"DIARIZATION_MODEL_NOT_READY","error":str(exc)}, status_code=422)
     try: settings = save_settings(payload, MODELS_DIR)
     except ValueError as exc: raise HTTPException(400, detail=str(exc))
     return {"ok": True, "settings": settings}
@@ -436,7 +453,7 @@ def api_models_test(model_id: str, username: str = Depends(require_admin)):
         elif model_id in SUPPORTED_DIARIZATION_MODELS and model_id != "none":
             if not is_pyannote_ready(MODELS_DIR, model_id): raise RuntimeError("Model is not installed or integrity verification failed")
             from pyannote.audio import Pipeline
-            pipeline = Pipeline.from_pretrained(str(pyannote_target_for(MODELS_DIR, model_id) / "config.yaml"))
+            pipeline = Pipeline.from_pretrained(str(pyannote_target_for(MODELS_DIR, model_id)))
             # Pipeline invocation is intentional; loading alone is not a smoke test.
             import wave
             probe = MODELS_DIR / ".model-test.wav"
