@@ -1,5 +1,6 @@
 from __future__ import annotations
 import gc, logging, os, threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from asr_backend import ASRBackend
@@ -7,6 +8,12 @@ from diarization_backend import DiarizationBackend
 from errors import GigaScribeError
 from model_store import ASR_MODEL_ID, ASR_MODEL_NAME, DIARIZATION_MODEL_ID, assert_gigaam_ready, gigaam_cache_dir, is_pyannote_ready, load_settings, validate_gigaam_files, validate_pyannote_files, pyannote_target_for
 logger=logging.getLogger(__name__)
+
+@dataclass(frozen=True)
+class ModelConfiguration:
+    asr_backend: ASRBackend
+    diarization_backend: DiarizationBackend | None
+    snapshot: dict[str, Any]
 
 class ModelManager:
     """Single CUDA model owner. RNNT is shared; diarization is loaded only on demand."""
@@ -25,28 +32,43 @@ class ModelManager:
         except GigaScribeError: raise
         except Exception as exc: raise GigaScribeError("CUDA_SMOKE_TEST_FAILED", str(exc)) from exc
 
-    def ensure_loaded(self, settings: dict[str, Any]|None=None) -> None:
-        settings=settings or load_settings(self.models_dir)
-        if settings.get("asr_model") != ASR_MODEL_ID or settings.get("device") != "cuda":
+    def configure(self, snapshot: dict[str, Any]) -> ModelConfiguration:
+        snapshot = dict(snapshot)
+        if snapshot.get("asr_model") != ASR_MODEL_ID or snapshot.get("device") != "cuda":
             raise GigaScribeError("UNSUPPORTED_CONFIGURATION", "Only gigaam-v3-e2e-rnnt on cuda is supported")
-        diar=settings.get("diarization_model", "none")
+        diar = snapshot.get("diarization_model", "none")
         with self.lock:
-            self.check_cuda(); self.load_asr()
-            if diar == "none": self.unload_diarization()
-            else: self.load_diarization(diar)
-            self._health_cache=None
+            self.check_cuda()
+            self.load_asr()
+            if diar == "none":
+                if self.diarization is not None:
+                    logger.info("Unloading pyannote-community-1")
+                self.unload_diarization()
+                logger.info("Diarization disabled for this job")
+            else:
+                self.load_diarization(diar)
+            self._health_cache = None
+            return ModelConfiguration(asr_backend=self.get_asr(), diarization_backend=self.diarization, snapshot=snapshot)
+
+    def ensure_loaded(self, settings: dict[str, Any]|None=None) -> None:
+        self.configure(settings or load_settings(self.models_dir))
 
     def load_asr(self) -> None:
         assert_gigaam_ready(self.models_dir, ASR_MODEL_NAME)
         if self.asr is None:
+            logger.info("Loading RNNT on cuda")
             self.asr=ASRBackend(str(gigaam_cache_dir(self.models_dir))); self.asr.load(ASR_MODEL_ID, "cuda")
-            logger.info("Loaded ASR model %s from %s on cuda", ASR_MODEL_ID, gigaam_cache_dir(self.models_dir))
+        else:
+            logger.info("Reusing loaded RNNT on cuda")
 
     def load_diarization(self, model_id: str=DIARIZATION_MODEL_ID) -> None:
         if model_id != DIARIZATION_MODEL_ID: raise GigaScribeError("UNSUPPORTED_CONFIGURATION", f"Unsupported diarization model: {model_id}")
         if not is_pyannote_ready(self.models_dir, model_id): raise GigaScribeError("DIARIZATION_MODEL_NOT_READY", validate_pyannote_files(self.models_dir, model_id)[1] or "not ready")
         if self.diarization is None or self.loaded_diarization != model_id:
+            logger.info("Loading pyannote-community-1 on cuda")
             self.unload_diarization(); self.diarization=DiarizationBackend(str(self.models_dir)); self.diarization.load(model_id, "cuda"); self.loaded_diarization=model_id
+        else:
+            logger.info("Reusing loaded pyannote-community-1 on cuda")
 
     def unload_diarization(self) -> None:
         if self.diarization: self.diarization.unload()
