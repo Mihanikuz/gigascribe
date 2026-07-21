@@ -84,11 +84,10 @@ from job_store import JobStore
 job_store = JobStore(BASE_DIR / "jobs.sqlite3")
 job_store.recover()
 # GPU work is serialized: one CUDA worker per container.
-gpu_worker = asyncio.Semaphore(1)
+gpu_worker = giga_app.GPU_JOB_LOCK
 scheduled_jobs: set[str] = set()
 model_download_locks: dict[str, asyncio.Lock] = {}
-from model_manager import ModelManager
-MODEL_MANAGER = ModelManager(MODELS_DIR)
+MODEL_MANAGER = giga_app.MODEL_MANAGER
 
 
 def _validate_password(password: str) -> None:
@@ -305,7 +304,7 @@ async def run_job(job_id: str) -> None:
         from model_store import gigaam_cache_dir, pyannote_target_for
         log(f"ASR model path: {gigaam_cache_dir(MODELS_DIR)}")
         log(f"Diarization model path: {pyannote_target_for(MODELS_DIR, snapshot.get('diarization_model', 'none'))}")
-        t0=time.perf_counter(); processor = giga_app.AudioProcessor(snapshot=snapshot)
+        t0=time.perf_counter(); processor = giga_app.AudioProcessor(snapshot=snapshot, model_manager=MODEL_MANAGER)
         if job_store.get(job_id)["cancel_requested"]:
             job_store.update(job_id,status="cancelled",finished_at=time.time(),message="Отменено"); return
         async with gpu_worker:
@@ -413,16 +412,11 @@ async def api_models_select(payload: dict[str, Any], username: str = Depends(req
         raise HTTPException(400, detail="Profiles are not supported in CUDA-only mode")
     from model_store import save_settings, is_pyannote_ready
     diar = payload.get("diarization_model")
-    if diar and diar != "none":
-        if not is_pyannote_ready(MODELS_DIR, diar):
-            return JSONResponse({"ok":False,"error_code":"DIARIZATION_MODEL_NOT_READY","error":"pyannote Community-1 is not ready locally"}, status_code=422)
-        try:
-            MODEL_MANAGER.load_diarization(diar)
-        except Exception as exc:
-            return JSONResponse({"ok":False,"error_code":"DIARIZATION_MODEL_NOT_READY","error":str(exc)}, status_code=422)
+    if diar and diar != "none" and not is_pyannote_ready(MODELS_DIR, diar):
+        return JSONResponse({"saved":False,"error_code":"DIARIZATION_MODEL_NOT_READY","error":"pyannote Community-1 is not ready locally"}, status_code=422)
     try: settings = save_settings(payload, MODELS_DIR)
     except ValueError as exc: raise HTTPException(400, detail=str(exc))
-    return {"ok": True, "settings": settings}
+    return {"saved": True, "applies_to": "next_job", "settings": settings}
 
 @app.delete("/api/models/{model_id}")
 def api_models_delete(model_id: str, username: str = Depends(require_admin)):

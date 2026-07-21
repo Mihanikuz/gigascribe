@@ -114,6 +114,7 @@ DEVICE = torch.device("cuda") if torch is not None else None
 CUDA_OOM = torch.cuda.OutOfMemoryError if torch is not None else RuntimeError
 MAX_OOM_RETRIES = 1
 MODEL_MANAGER = ModelManager(MODELS_DIR)
+GPU_JOB_LOCK = asyncio.Lock()
 MAX_BATCH_SIZE = 8  # Начальный размер батча для параллельной обработки
 MIN_BATCH_SIZE = 1  # Минимальный размер батча при нехватке памяти
 
@@ -156,12 +157,12 @@ class GPUMemoryManager:
 
 
 class AudioProcessor:
-    def __init__(self, snapshot: Optional[Dict] = None):
-        self.snapshot = dict(snapshot or load_settings(MODELS_DIR))
+    def __init__(self, snapshot: Dict, model_manager: ModelManager):
+        self.snapshot = dict(snapshot)
         self.asr_model_name = SUPPORTED_GIGAAM_MODELS[self.snapshot["asr_model"]]["model_name"]
         self.pyannote_model_id = self.snapshot.get("diarization_model", "none")
         self.gigaam_model = None
-        self.model_manager = MODEL_MANAGER
+        self.model_manager = model_manager
         self.asr_backend = None
         self.diarization_pipeline = None
         self.diarization_backend = None
@@ -187,29 +188,26 @@ class AudioProcessor:
         # переиспользуем единый экземпляр между заданиями.
         if not GIGAAM_AVAILABLE:
             raise RuntimeError("ASR_MODEL_LOAD_FAILED: gigaam is not installed; transcription cannot run")
-        self.model_manager.ensure_loaded(self.snapshot)
-        self.asr_backend = self.model_manager.get_asr()
-        self.gigaam_model = self.asr_backend.model
-        print("GigaAM RNNT модель готова на cuda из локального кэша")
+        logger.info("Job settings snapshot:\nASR=%s\nDiarization=%s\nDevice=%s", self.snapshot.get("asr_model"), self.snapshot.get("diarization_model"), self.snapshot.get("device"))
+        configuration = self.model_manager.configure(self.snapshot)
+        self.asr_backend = configuration.asr_backend
+        self.gigaam_model = configuration.asr_backend.model
 
         if progress_callback:
             progress_callback(0.3,
-                              "Загрузка модели для разделения спикеров на GPU..." if getattr(self.device, "type", str(self.device)) == 'cuda' else "Загрузка модели для разделения спикеров на CPU...")
+                              "Подготовка модели для разделения спикеров на GPU..." if self.pyannote_model_id != "none" else "Диаризация выключена для этого задания")
 
-        if self.pyannote_model_id != "none":
-            if not PYANNOTE_AVAILABLE or not is_pyannote_ready(MODELS_DIR, self.pyannote_model_id):
-                raise RuntimeError("DIARIZATION_MODEL_NOT_READY: pyannote Community-1 is not ready locally")
-            self.diarization_backend = self.model_manager.get_diarization()
-            self.diarization_pipeline = self.diarization_backend.pipeline if self.diarization_backend else None
-            if self.diarization_pipeline is None:
-                raise RuntimeError("DIARIZATION_MODEL_LOAD_FAILED: pyannote Community-1 was not loaded")
-            print(f"Pyannote Community-1 готова на cuda из {PYANNOTE_LOCAL_PATH}")
-        else:
-            self.diarization_backend = None
-            self.diarization_pipeline = None
+        self.diarization_backend = configuration.diarization_backend
+        self.diarization_pipeline = (
+            configuration.diarization_backend.pipeline
+            if configuration.diarization_backend
+            else None
+        )
+        if self.pyannote_model_id != "none" and self.diarization_pipeline is None:
+            raise RuntimeError("DIARIZATION_MODEL_LOAD_FAILED: pyannote Community-1 was not loaded")
 
         if progress_callback:
-            progress_callback(0.5, "Обязательные модели готовы")
+            progress_callback(0.5, "Models ready for job")
 
         # Очищаем кэш после инициализации
         self.memory_manager.clear_cache()
@@ -543,23 +541,20 @@ class AudioProcessor:
             )
 
 
-# Глобальный процессор создается лениво, чтобы /health/ready мог объяснить отсутствие CUDA.
-processor = None
-
-
 async def process_files(files, progress=gr.Progress()):
     """Обработка списка файлов с улучшенной обработкой ошибок"""
     if not files:
         return "Файлы не загружены", None, None
 
-    global processor
-    if processor is None:
-        processor = AudioProcessor()
-    # Инициализируем модели если нужно
-    if processor.gigaam_model is None:
+    snapshot = load_settings(MODELS_DIR)
+    async with GPU_JOB_LOCK:
+        processor = AudioProcessor(snapshot=snapshot, model_manager=MODEL_MANAGER)
         progress(0.05, f"Инициализация моделей на {processor.device}...")
         await processor.initialize_models(lambda p, msg: progress(p * 0.1, msg))
+        return await _process_files_with_processor(processor, files, progress)
 
+
+async def _process_files_with_processor(processor, files, progress):
     results = []
     output_files = []
 
