@@ -13,7 +13,7 @@ for dir in "${GIGASCRIBE_DATA_DIR:-/opt/gigascribe/data}" \
     chown -R "$uid:$gid" "$dir"
 done
 
-if [ "${GIGASCRIBE_DEVICE:-cpu}" = "cuda" ]; then
+if [ "${GIGASCRIBE_DEVICE:-cuda}" = "cuda" ]; then
     python /app/scripts/gpu_smoke_test.py --require-cuda
 fi
 

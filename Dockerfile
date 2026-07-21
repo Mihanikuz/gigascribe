@@ -2,7 +2,7 @@
 FROM python:3.11-slim
 ARG HOST_UID=1000
 ARG HOST_GID=1000
-ARG TORCH_REQUIREMENTS=requirements-cpu.txt
+ARG TORCH_REQUIREMENTS=requirements-cu128.txt
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
     PIP_CACHE_DIR=/root/.cache/pip PIP_NO_CACHE_DIR=0 \
     PIP_DEFAULT_TIMEOUT=600 PIP_RETRIES=20 \
@@ -11,7 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
 ENV HOST_UID=${HOST_UID} HOST_GID=${HOST_GID}
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg build-essential git curl && rm -rf /var/lib/apt/lists/*
-COPY requirements-cpu.txt requirements-cu128.txt ./
+COPY requirements-cu128.txt ./
 RUN --mount=type=cache,id=gigascribe-pip-cache,target=/root/.cache/pip,sharing=locked \
     python -m pip install --upgrade pip --timeout 600 --retries 20 \
     && python -m pip install --timeout 600 --retries 20 -r "${TORCH_REQUIREMENTS}"
@@ -19,16 +19,11 @@ COPY requirements-models.txt constraints.txt ./
 RUN --mount=type=cache,id=gigascribe-pip-cache,target=/root/.cache/pip,sharing=locked \
     python -m pip install --timeout 600 --retries 20 \
         -c constraints.txt -r requirements-models.txt
-COPY requirements-base.txt requirements-gigaam.txt requirements-pyannote-legacy.txt ./
+COPY requirements-base.txt requirements-gigaam.txt ./
 RUN --mount=type=cache,id=gigascribe-pip-cache,target=/root/.cache/pip,sharing=locked \
     python -m pip install --timeout 600 --retries 20 \
         -c constraints.txt -r requirements-base.txt -r requirements-gigaam.txt \
     && python -m pip check
-RUN python -m venv /opt/gigascribe/venvs/pyannote-legacy \
-    && /opt/gigascribe/venvs/pyannote-legacy/bin/pip install --upgrade pip \
-    && /opt/gigascribe/venvs/pyannote-legacy/bin/pip install -r requirements-pyannote-legacy.txt \
-    && /opt/gigascribe/venvs/pyannote-legacy/bin/python -c 'import pyannote.audio; assert pyannote.audio.__version__.startswith("3.")' \
-    && /opt/gigascribe/venvs/pyannote-legacy/bin/pip check
 COPY . .
 RUN apt-get update && apt-get install -y --no-install-recommends gosu && rm -rf /var/lib/apt/lists/* \
     && mkdir -p "$GIGASCRIBE_DATA_DIR/uploads" "$GIGASCRIBE_DATA_DIR/cache/matplotlib" "$GIGASCRIBE_MODELS_DIR" \

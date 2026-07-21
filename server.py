@@ -41,6 +41,9 @@ spec.loader.exec_module(giga_app)
 MODELS_DIR = Path(os.getenv("GIGASCRIBE_MODELS_DIR", "./models")).resolve()
 os.environ.setdefault("HF_HOME", str(MODELS_DIR / "huggingface"))
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "0")
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 BASE_DIR = Path(os.getenv("GIGASCRIBE_DATA_DIR", "./data")).resolve()
@@ -80,10 +83,8 @@ async def resume_persistent_queue() -> None:
 from job_store import JobStore
 job_store = JobStore(BASE_DIR / "jobs.sqlite3")
 job_store.recover()
-# Model instances are isolated by immutable snapshot.  GPU work is serialized;
-# CPU concurrency is explicitly configurable.
-gpu_worker = asyncio.Semaphore(max(1, int(os.getenv("GIGASCRIBE_GPU_WORKERS", "1"))))
-cpu_worker = asyncio.Semaphore(max(1, int(os.getenv("GIGASCRIBE_CPU_WORKERS", "2"))))
+# GPU work is serialized: one CUDA worker per container.
+gpu_worker = asyncio.Semaphore(1)
 scheduled_jobs: set[str] = set()
 model_download_locks: dict[str, asyncio.Lock] = {}
 
@@ -198,71 +199,18 @@ def _import_ok(name: str) -> bool:
     except Exception: return False
 
 def _model_checks(load: bool = False) -> dict[str, Any]:
-    """Report every prerequisite separately; never hide an import failure as "false"."""
-    from model_store import load_settings, SUPPORTED_GIGAAM_MODELS, is_gigaam_ready, is_pyannote_ready
-    st = load_settings(MODELS_DIR); asr_name = SUPPORTED_GIGAAM_MODELS[st["asr_model"]]["model_name"]
-    gigaam_import = _import_ok("gigaam")
-    if st["diarization_model"] == "pyannote-3.1":
-        from model_store import LEGACY_PYANNOTE_PYTHON
-        import subprocess
-        if Path(LEGACY_PYANNOTE_PYTHON).is_file():
-            legacy = subprocess.run([LEGACY_PYANNOTE_PYTHON, "-c", "import pyannote.audio; assert pyannote.audio.__version__.startswith('3.')"], capture_output=True, text=True)
-            pyannote_import = legacy.returncode == 0
-        else:
-            pyannote_import = False
-    else:
-        pyannote_import = st["diarization_model"] == "none" or _import_ok("pyannote.audio")
-    checks = {
-        "gigaam_files": is_gigaam_ready(MODELS_DIR, asr_name),
-        "gigaam_import": gigaam_import,
-        "gigaam_load": "not_run",
-        "pyannote_files": st["diarization_model"] == "none" or is_pyannote_ready(MODELS_DIR, st["diarization_model"]),
-        "pyannote_import": pyannote_import,
-        "pyannote_load": "ok" if st["diarization_model"] == "none" else "not_run",
-    }
-    # A load test is deliberately opt-in: /health/ready must remain cheap and
-    # must not allocate a second model instance during normal request probes.
-    # Presence is deliberately not a load result.  Explicit /health/models or
-    # model test records a real load attempt; ready stays inexpensive.
-    if load:
-        try:
-            import gigaam
-            gigaam.load_model(asr_name, device=st["device"], download_root=str(MODELS_DIR / "gigaam-cache"))
-            checks["gigaam_load"] = "ok"
-        except Exception as exc:
-            checks["gigaam_load"] = "failed"
-            checks["gigaam_error"] = str(exc)
-    if load and st["diarization_model"] != "none":
-        try:
-            from diarization_backend import DiarizationBackend
-            backend = DiarizationBackend(str(MODELS_DIR))
-            backend.load(st["diarization_model"], st["device"])
-            backend.unload()
-            checks["pyannote_load"] = "ok"
-        except Exception as exc:
-            checks["pyannote_load"] = "failed"
-            checks["pyannote_error"] = str(exc)
-    checks["gigaam"] = {
-        "import": "ok" if gigaam_import else "failed", "dependencies": "ok" if gigaam_import else "failed",
-        "checkpoint": "exists" if checks["gigaam_files"] else "missing", "load": checks["gigaam_load"],
-        "device": "not_run" if st["device"] == "cuda" and not load else ("ok" if st["device"] == "cpu" or checks["gigaam_load"] == "ok" else "failed"),
-    }
-    return checks
+    from model_manager import ModelManager
+    return ModelManager(MODELS_DIR).health_status()
 
 @app.get("/health/ready")
 def health_ready():
-    from model_store import load_settings
-    from system_info import gpu_info
-    settings = load_settings(MODELS_DIR)
-    checks = {"data_writable": _writable_dir(BASE_DIR), "models_writable": _writable_dir(MODELS_DIR), "secret_key_configured": SECRET_KEY_CONFIGURED, "ffmpeg": shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None, **_model_checks()}
-    checks["gigaam"] = checks["gigaam_files"] and checks["gigaam_import"]
-    # Readiness deliberately does not represent a model load: the explicit models
-    # endpoint is the only endpoint that allocates a test model instance.
-    checks["pyannote"] = checks["pyannote_files"] and checks["pyannote_import"]
-    gpu = gpu_info(real_test=settings["device"] == "cuda")
-    checks["device_works"] = settings["device"] == "cpu" or bool(gpu.get("real_cuda_test",{}).get("ok"))
-    required = all(checks.values())
-    return JSONResponse({"status":"ready" if required else "not_ready", "checks":checks, "settings":settings}, status_code=200 if required else 503)
+    from model_manager import ModelManager
+    status = ModelManager(MODELS_DIR).health_status()
+    checks = {"data_writable": _writable_dir(BASE_DIR), "models_writable": _writable_dir(MODELS_DIR), "secret_key_configured": SECRET_KEY_CONFIGURED, "ffmpeg": shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None}
+    ready = status["status"] == "ready" and all(checks.values())
+    status["checks"] = checks
+    status["status"] = "ready" if ready else "not_ready"
+    return JSONResponse(status, status_code=200 if ready else 503)
 
 @app.get("/health/models")
 def health_models(): return _model_checks(load=True)
@@ -347,10 +295,9 @@ async def run_job(job_id: str) -> None:
     try:
         snapshot = job["settings_snapshot"]; progress(.01, "Инициализация задания")
         processor = giga_app.AudioProcessor(snapshot=snapshot)
-        worker = gpu_worker if snapshot.get("device") == "cuda" else cpu_worker
         if job_store.get(job_id)["cancel_requested"]:
             job_store.update(job_id,status="cancelled",finished_at=time.time(),message="Отменено"); return
-        async with worker:
+        async with gpu_worker:
             if job_store.get(job_id)["cancel_requested"]:
                 job_store.update(job_id,status="cancelled",finished_at=time.time(),message="Отменено"); return
             await processor.initialize_models(lambda p,m: progress(p*.1,m))
@@ -432,9 +379,9 @@ def create_local_user(credentials: HTTPBasicCredentials = Depends(security), use
 
 @app.get("/api/models")
 def api_models(username: str = Depends(current_user)):
-    from model_store import SUPPORTED_GIGAAM_MODELS, SUPPORTED_DIARIZATION_MODELS, PROFILES, load_settings
+    from model_store import SUPPORTED_GIGAAM_MODELS, SUPPORTED_DIARIZATION_MODELS, load_settings
     from system_info import gpu_info
-    return {"asr": SUPPORTED_GIGAAM_MODELS, "diarization": SUPPORTED_DIARIZATION_MODELS, "profiles": PROFILES, "settings": load_settings(MODELS_DIR), "cuda_available": bool(gpu_info().get("cuda_available"))}
+    return {"asr": SUPPORTED_GIGAAM_MODELS, "diarization": SUPPORTED_DIARIZATION_MODELS, "profiles": {}, "settings": load_settings(MODELS_DIR), "cuda_available": bool(gpu_info().get("cuda_available"))}
 
 @app.get("/api/models/status")
 def api_models_status(username: str = Depends(current_user)):
@@ -442,44 +389,23 @@ def api_models_status(username: str = Depends(current_user)):
     settings = load_settings(MODELS_DIR); out=[]
     for mid, meta in SUPPORTED_GIGAAM_MODELS.items():
         ckpt = gigaam_checkpoint_path(MODELS_DIR, meta["model_name"]); installed = is_gigaam_ready(MODELS_DIR, meta["model_name"])
-        out.append({**meta,"id":mid,"installed":installed,"path":str(ckpt),"size":ckpt.stat().st_size if ckpt.exists() else 0,"active":settings["asr_model"]==mid,"integrity":"ok" if installed else "missing","loadable": installed and _import_ok("gigaam"),"test_inference":"not_run","cpu_compatible":True,"gpu_compatible":True,"download_status":"idle","error":None})
+        out.append({**meta,"id":mid,"installed":installed,"path":str(ckpt),"size":ckpt.stat().st_size if ckpt.exists() else 0,"active":settings["asr_model"]==mid,"integrity":"ok" if installed else "missing","loadable": installed and _import_ok("gigaam"),"test_inference":"not_run","cpu_compatible":False,"gpu_compatible":True,"download_status":"idle","error":None})
     for mid, meta in SUPPORTED_DIARIZATION_MODELS.items():
         path = pyannote_target_for(MODELS_DIR, mid); installed = mid == "none" or is_pyannote_ready(MODELS_DIR, mid)
-        out.append({**meta,"id":mid,"installed":installed,"path":str(path),"size":sum(f.stat().st_size for f in path.rglob('*') if f.is_file()) if path.exists() else 0,"active":settings["diarization_model"]==mid,"integrity":"ok" if installed else "missing","loadable": mid == "none" or (installed and _import_ok("pyannote.audio")),"test_inference":"not_run","cpu_compatible":True,"gpu_compatible":mid != "none","download_status":"idle","error":None})
+        out.append({**meta,"id":mid,"installed":installed,"path":str(path),"size":sum(f.stat().st_size for f in path.rglob('*') if f.is_file()) if path.exists() else 0,"active":settings["diarization_model"]==mid,"integrity":"ok" if installed else "missing","loadable": mid == "none" or (installed and _import_ok("pyannote.audio")),"test_inference":"not_run","cpu_compatible":False,"gpu_compatible":mid != "none","download_status":"idle","error":None})
     return {"models": out}
 
 @app.post("/api/models/select")
 async def api_models_select(payload: dict[str, Any], username: str = Depends(require_admin)):
-    from model_store import save_settings, PROFILES
-    if profile := payload.get("profile"):
-        if profile not in PROFILES: raise HTTPException(400, detail="Unknown profile")
-        payload = {k:v for k,v in PROFILES[profile].items() if k in {"asr_model","diarization_model","device"}}
+    if payload.get("profile"):
+        raise HTTPException(400, detail="Profiles are not supported in CUDA-only mode")
+    from model_store import save_settings, is_pyannote_ready
+    diar = payload.get("diarization_model")
+    if diar and diar != "none" and not is_pyannote_ready(MODELS_DIR, diar):
+        return JSONResponse({"ok":False,"error":"DIARIZATION_MODEL_NOT_FOUND: pyannote Community-1 is not ready"}, status_code=422)
     try: settings = save_settings(payload, MODELS_DIR)
     except ValueError as exc: raise HTTPException(400, detail=str(exc))
-    if settings["device"] == "cuda":
-        from system_info import gpu_info
-        if not gpu_info(real_test=True).get("real_cuda_test", {}).get("ok"):
-            return JSONResponse({"ok":False,"error":"CUDA requested but unavailable; CPU remains the actual runtime","settings":settings}, status_code=422)
     return {"ok": True, "settings": settings}
-
-@app.post("/api/models/verify")
-def api_models_verify(username: str = Depends(require_admin)): return {"checks": _model_checks()}
-
-@app.post("/api/models/download")
-async def api_models_download(payload: dict[str, Any], username: str = Depends(require_admin)):
-    model_id = str(payload.get("model_id", "")); force = bool(payload.get("force", False))
-    from model_store import SUPPORTED_GIGAAM_MODELS, SUPPORTED_DIARIZATION_MODELS
-    if model_id not in {*SUPPORTED_GIGAAM_MODELS, *SUPPORTED_DIARIZATION_MODELS} or model_id == "none": raise HTTPException(400, detail="Unsupported model")
-    lock = model_download_locks.setdefault(model_id, asyncio.Lock())
-    if lock.locked(): raise HTTPException(409, detail="Model download is already running")
-    async with lock:
-        import scripts.download_models as dl
-        await asyncio.to_thread(dl.configure_model_dirs, MODELS_DIR, offline=False)
-        if model_id in SUPPORTED_GIGAAM_MODELS:
-            await asyncio.to_thread(dl.warm_up_gigaam, MODELS_DIR, SUPPORTED_GIGAAM_MODELS[model_id]["model_name"], force=force)
-        else:
-            await asyncio.to_thread(dl.download_pyannote, MODELS_DIR, os.getenv("HF_TOKEN") or None, model_id=model_id, force=force)
-    return {"ok": True, "model_id": model_id}
 
 @app.delete("/api/models/{model_id}")
 def api_models_delete(model_id: str, username: str = Depends(require_admin)):
@@ -503,7 +429,7 @@ def api_models_test(model_id: str, username: str = Depends(require_admin)):
             with wave.open(str(probe), "wb") as wav:
                 wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(16000); wav.writeframes(b"\0\0" * 1600)
             try:
-                model = gigaam.load_model(meta["model_name"], device="cpu", download_root=str(MODELS_DIR / "gigaam-cache"))
+                model = gigaam.load_model(meta["model_name"], device="cuda", download_root=str(MODELS_DIR / "gigaam" / "v3_e2e_rnnt"))
                 result = model.transcribe(str(probe))
                 if result is None: raise RuntimeError("Inference returned no result")
             finally: probe.unlink(missing_ok=True)
@@ -537,8 +463,8 @@ def api_system_gpu(username: str = Depends(current_user)):
     return gpu_info(real_test=True)
 
 LOGIN_HTML = """<!doctype html><meta charset='utf-8'><title>GigaScribe login</title><style>body{font-family:sans-serif;max-width:420px;margin:10vh auto}.err{color:#b00}input,button{width:100%;padding:10px;margin:6px 0}</style><h1>GigaScribe</h1><!--ERROR--><form method='post'><input name='username' placeholder='Пользователь'><input name='password' type='password' placeholder='Пароль'><button>Войти</button></form>"""
-INDEX_HTML = """<!doctype html><meta charset='utf-8'><title>GigaScribe</title><style>body{font-family:sans-serif;max-width:900px;margin:30px auto}.job{border:1px solid #ddd;padding:12px;margin:10px 0}progress{width:100%}label,select{margin:4px}</style><h1>Локальная транскрибация</h1><form id='up'><input type='file' name='file' required><button>Запустить</button></form><form id='model-settings'><label>ASR <select id='asr-model'></select></label><label>Диаризация <select id='diarization-model'></select></label><label>Устройство <select id='device'><option value='cpu'>CPU</option><option value='cuda'>CUDA</option></select></label><button>Сохранить модели</button><span id='model-message'></span></form><form method='post' action='/logout'><button>Выйти</button></form><div id='jobs'></div><script>
+INDEX_HTML = """<!doctype html><meta charset='utf-8'><title>GigaScribe</title><style>body{font-family:sans-serif;max-width:900px;margin:30px auto}.job{border:1px solid #ddd;padding:12px;margin:10px 0}progress{width:100%}label,select{margin:4px}</style><h1>Локальная транскрибация</h1><form id='up'><input type='file' name='file' required><button>Запустить</button></form><form id='model-settings'><p>ASR: GigaAM v3 E2E RNNT</p><p>Устройство: NVIDIA CUDA</p><label>Диаризация <select id='diarization-model'></select></label><button>Сохранить</button><span id='model-message'></span></form><form method='post' action='/logout'><button>Выйти</button></form><div id='jobs'></div><script>
 async function refresh(){let r=await fetch('/api/jobs');let js=await r.json();jobs.innerHTML=js.reverse().map(j=>`<div class='job'><b>${j.filename}</b> — ${j.status}<br><progress value='${j.progress}' max='1'></progress> ${Math.round(j.progress*100)}%<br>${j.message}<br>${['transcript','log','original','wav'].filter(k=>j.downloads[k]).map(k=>`<a href='/api/jobs/${j.id}/download/${k}'>скачать ${k}</a>`).join(' | ')}</div>`).join('')}
-async function loadModels(){let r=await fetch('/api/models'), m=await r.json(); for(let [target,values,current] of [['asr-model',m.asr,m.settings.asr_model],['diarization-model',m.diarization,m.settings.diarization_model]]){let s=document.getElementById(target);s.innerHTML=Object.entries(values).map(([id,v])=>`<option value='${id}'>${v.label}</option>`).join('');s.value=current} device.value=m.settings.device; device.querySelector("option[value=cuda]").disabled=!m.cuda_available}
-modelSettings=document.getElementById('model-settings'); modelSettings.onsubmit=async(e)=>{e.preventDefault();let r=await fetch('/api/models/select',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({asr_model:asrModel.value,diarization_model:diarizationModel.value,device:device.value})});document.getElementById('model-message').textContent=r.ok?'Сохранено':'Ошибка сохранения'};
-let asrModel=document.getElementById('asr-model'),diarizationModel=document.getElementById('diarization-model'),device=document.getElementById('device');let poll=3000;async function tick(){await refresh();setTimeout(tick,document.hidden?10000:poll)};up.onsubmit=async(e)=>{e.preventDefault();let fd=new FormData(up);await fetch('/api/jobs',{method:'POST',body:fd});up.reset();refresh()};loadModels();tick();</script>"""
+async function loadModels(){let r=await fetch('/api/models'), m=await r.json(); for(let [target,values,current] of [['diarization-model',m.diarization,m.settings.diarization_model]]){let s=document.getElementById(target);s.innerHTML=Object.entries(values).map(([id,v])=>`<option value='${id}'>${v.label}</option>`).join('');s.value=current}}
+modelSettings=document.getElementById('model-settings'); modelSettings.onsubmit=async(e)=>{e.preventDefault();let r=await fetch('/api/models/select',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({diarization_model:diarizationModel.value})});document.getElementById('model-message').textContent=r.ok?'Сохранено':'Ошибка сохранения'};
+let diarizationModel=document.getElementById('diarization-model');let poll=3000;async function tick(){await refresh();setTimeout(tick,document.hidden?10000:poll)};up.onsubmit=async(e)=>{e.preventDefault();let fd=new FormData(up);await fetch('/api/jobs',{method:'POST',body:fd});up.reset();refresh()};loadModels();tick();</script>"""

@@ -1,4 +1,4 @@
-"""Adapters for the *documented* GigaAM v2/v3 public API."""
+"""CUDA-only adapter for the documented GigaAM v3 E2E RNNT public API."""
 from __future__ import annotations
 
 import gc
@@ -16,11 +16,9 @@ class ASRBackend:
         import gigaam
         if model_id not in SUPPORTED_GIGAAM_MODELS:
             raise ValueError(f"Unsupported ASR model: {model_id}")
-        if device not in SUPPORTED_GIGAAM_MODELS[model_id]["devices"]:
-            raise RuntimeError(f"{model_id} is not supported on {device}")
-        # Current official GigaAM exposes all three names through load_model.
-        # Keeping the call here makes a changed v3 API fail explicitly, rather
-        # than silently loading a different checkpoint.
+        if device != "cuda":
+            raise RuntimeError(f"{model_id} is CUDA-only")
+        # Keep the call here so a changed v3 RNNT API fails explicitly.
         self.model = gigaam.load_model(
             SUPPORTED_GIGAAM_MODELS[model_id]["official_model_name"],
             device=device, download_root=self.cache_dir,

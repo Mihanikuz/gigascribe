@@ -1,3 +1,1 @@
--r requirements-cpu.txt
--r requirements-models.txt
--r requirements-base.txt
+-r requirements-cu128.txt
