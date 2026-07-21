@@ -4,6 +4,7 @@ import gradio as gr
 import os
 import tempfile
 import asyncio
+import gc
 import subprocess
 import shutil
 from pathlib import Path
@@ -21,7 +22,8 @@ import requests
 
 from model_store import ASR_MODEL_ID, DIARIZATION_MODEL_ID, assert_gigaam_ready, gigaam_cache_dir, is_gigaam_ready, is_pyannote_ready, pyannote_target, load_settings, SUPPORTED_GIGAAM_MODELS
 from asr_backend import ASRBackend
-from diarization_backend import DiarizationBackend
+from diarization_backend import DiarizationBackend, map_speakers_to_asr
+from model_manager import ModelManager
 
 MODELS_DIR = Path(os.getenv("GIGASCRIBE_MODELS_DIR", "./models")).resolve()
 DATA_DIR = Path(os.getenv("GIGASCRIBE_DATA_DIR", "./data")).resolve()
@@ -110,6 +112,8 @@ SUPPORTED_FORMATS = ['.mp3', '.wav', '.mp4', '.avi', '.webm', '.m4a', '.flac', '
 # GPU конфигурация
 DEVICE = torch.device("cuda") if torch is not None else None
 CUDA_OOM = torch.cuda.OutOfMemoryError if torch is not None else RuntimeError
+MAX_OOM_RETRIES = 1
+MODEL_MANAGER = ModelManager(MODELS_DIR)
 MAX_BATCH_SIZE = 8  # Начальный размер батча для параллельной обработки
 MIN_BATCH_SIZE = 1  # Минимальный размер батча при нехватке памяти
 
@@ -157,9 +161,10 @@ class AudioProcessor:
         self.asr_model_name = SUPPORTED_GIGAAM_MODELS[self.snapshot["asr_model"]]["model_name"]
         self.pyannote_model_id = self.snapshot.get("diarization_model", "none")
         self.gigaam_model = None
-        self.asr_backend = ASRBackend(str(GIGAAM_CACHE_DIR))
+        self.model_manager = MODEL_MANAGER
+        self.asr_backend = None
         self.diarization_pipeline = None
-        self.diarization_backend = DiarizationBackend(str(MODELS_DIR))
+        self.diarization_backend = None
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self.memory_manager = GPUMemoryManager()
         if torch is None or not torch.cuda.is_available():
@@ -178,16 +183,14 @@ class AudioProcessor:
             progress_callback(0.1,
                               "Загрузка модели gigaam на GPU..." if getattr(self.device, "type", str(self.device)) == 'cuda' else "Загрузка модели gigaam на CPU...")
 
-        # Загружаем GigaAM только из уже подготовленного локального кэша.
+        # Загружаем GigaAM только из уже подготовленного локального кэша и
+        # переиспользуем единый экземпляр между заданиями.
         if not GIGAAM_AVAILABLE:
-            raise RuntimeError("gigaam is not installed; transcription cannot run")
-        assert_gigaam_ready(MODELS_DIR, self.asr_model_name)
-        try:
-            self.asr_backend.load(ASR_MODEL_ID, "cuda")
-            self.gigaam_model = self.asr_backend.model
-            print("GigaAM RNNT модель загружена успешно на cuda из локального кэша")
-        except Exception as e:
-            raise RuntimeError(f"ASR_MODEL_LOAD_FAILED: {e}") from e
+            raise RuntimeError("ASR_MODEL_LOAD_FAILED: gigaam is not installed; transcription cannot run")
+        self.model_manager.ensure_loaded(self.snapshot)
+        self.asr_backend = self.model_manager.get_asr()
+        self.gigaam_model = self.asr_backend.model
+        print("GigaAM RNNT модель готова на cuda из локального кэша")
 
         if progress_callback:
             progress_callback(0.3,
@@ -195,15 +198,18 @@ class AudioProcessor:
 
         if self.pyannote_model_id != "none":
             if not PYANNOTE_AVAILABLE or not is_pyannote_ready(MODELS_DIR, self.pyannote_model_id):
-                raise RuntimeError("DIARIZATION_MODEL_NOT_FOUND: pyannote Community-1 is not ready locally")
-            self.diarization_backend.load(self.pyannote_model_id, "cuda")
-            self.diarization_pipeline = self.diarization_backend.pipeline
-            print(f"Pyannote Community-1 загружена успешно на cuda из {PYANNOTE_LOCAL_PATH}")
+                raise RuntimeError("DIARIZATION_MODEL_NOT_READY: pyannote Community-1 is not ready locally")
+            self.diarization_backend = self.model_manager.get_diarization()
+            self.diarization_pipeline = self.diarization_backend.pipeline if self.diarization_backend else None
+            if self.diarization_pipeline is None:
+                raise RuntimeError("DIARIZATION_MODEL_LOAD_FAILED: pyannote Community-1 was not loaded")
+            print(f"Pyannote Community-1 готова на cuda из {PYANNOTE_LOCAL_PATH}")
         else:
+            self.diarization_backend = None
             self.diarization_pipeline = None
 
         if progress_callback:
-            progress_callback(0.5, "Модели загружены!")
+            progress_callback(0.5, "Обязательные модели готовы")
 
         # Очищаем кэш после инициализации
         self.memory_manager.clear_cache()
@@ -345,13 +351,12 @@ class AudioProcessor:
                     logger.error("Could not extract ASR segment path=%s start=%.3f duration=%.3f", path, start, duration)
         return prepared
 
-    def _transcription_error(self, audio_path: str, exc: Exception) -> str:
+    def _transcription_error(self, audio_path: str, exc: Exception, start: float | None = None, end: float | None = None) -> None:
         duration = self.get_audio_duration(audio_path)
-        logger.exception("ASR failed path=%s duration=%.3fs model=%s device=%s", audio_path, duration, self.asr_model_name, self.device)
-        # The UI/job result remains actionable without exposing a traceback.
-        return f"[Ошибка транскрипции: {type(exc).__name__}: {exc}]"
+        logger.exception("ASR failed path=%s duration=%.3fs range=%.3f-%.3f model=%s device=%s", audio_path, duration, start or 0.0, end or 0.0, self.asr_model_name, self.device)
+        raise RuntimeError(f"TRANSCRIPTION_FAILED: segment={audio_path} duration={duration:.3f} range={start}-{end}: {type(exc).__name__}: {exc}")
 
-    async def perform_diarization(self, audio_path: str) -> Optional[Dict]:
+    async def perform_diarization(self, audio_path: str, oom_retries: int = 0) -> Optional[Dict]:
         """Выполнение speaker diarization с GPU оптимизацией"""
         if not self.diarization_pipeline:
             return None
@@ -378,7 +383,11 @@ class AudioProcessor:
             self.memory_manager.handle_memory_error()
             self.memory_manager.clear_cache()
             # Повторяем попытку
-            return await self.perform_diarization(audio_path)
+            if torch is not None and torch.cuda.is_available():
+                gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+            if oom_retries >= MAX_OOM_RETRIES:
+                raise RuntimeError("GPU_OUT_OF_MEMORY: diarization CUDA OOM retry limit exceeded")
+            return await self.perform_diarization(audio_path, oom_retries + 1)
         except Exception as e:
             logger.error(f"Ошибка diarization для файла {audio_path}: {e}")
             raise RuntimeError(f"DIARIZATION_MODEL_LOAD_FAILED: {e}") from e
@@ -393,7 +402,7 @@ class AudioProcessor:
             print(f"Ошибка в _run_diarization_sync: {e}")
             raise
 
-    async def transcribe_audio_batch(self, audio_paths: List[str]) -> List[str]:
+    async def transcribe_audio_batch(self, audio_paths: List[str], segment_infos: Optional[List[Dict]] = None) -> List[str]:
         """Transcribe independently so one bad segment cannot discard its neighbours.
 
         All callers prepare intervals below ``MAX_DURATION_CHUNK``; deliberately
@@ -403,16 +412,22 @@ class AudioProcessor:
             raise RuntimeError("GigaAM model is not loaded")
         loop = asyncio.get_running_loop()
         results = []
-        for audio_path in audio_paths:
+        for idx, audio_path in enumerate(audio_paths):
             if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
-                results.append("[Ошибка: файл не найден или пуст]")
-                continue
+                raise RuntimeError(f"TRANSCRIPTION_FAILED: segment file is missing or empty: {audio_path}")
             try:
                 transcribe = self.asr_backend.transcribe if self.asr_backend.model is self.gigaam_model else self.gigaam_model.transcribe
                 value = await loop.run_in_executor(self.executor, transcribe, audio_path)
                 results.append(value.strip() if value else "")
             except Exception as exc:
-                results.append(self._transcription_error(audio_path, exc))
+                if torch is not None and torch.cuda.is_available():
+                    gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+                try:
+                    value = await loop.run_in_executor(self.executor, transcribe, audio_path)
+                    results.append(value.strip() if value else "")
+                except Exception as retry_exc:
+                    info = (segment_infos or [{}])[idx] if idx < len(segment_infos or []) else {}
+                    self._transcription_error(audio_path, retry_exc, info.get("start"), info.get("end"))
         return results
 
     async def transcribe_audio(self, audio_path: str) -> str:
@@ -474,7 +489,7 @@ class AudioProcessor:
 
             if progress_callback:
                 progress_callback(0.4,
-                                  f"Обработка {filename}: разделение по спикерам на GPU..." if getattr(self.device, "type", str(self.device)) == 'cuda' else f"Обработка {filename}: разделение по спикерам...")
+                                  f"Обработка {filename}: диаризация на GPU..." if self.diarization_pipeline else f"Обработка {filename}: подготовка чанков...")
 
             # Speaker diarization
             diarization_result = await self.perform_diarization(wav_path)
@@ -487,26 +502,21 @@ class AudioProcessor:
             segments = []
             full_text_parts = []
 
-            if diarization_result and len(diarization_result['segments']) > 0:
-                source_intervals = diarization_result['segments']
-            else:
-                # Use the same safe splitter without diarization.  This is also
-                # the offline path: it has no pyannote/VAD dependency.
-                source_intervals = [{'start': 0.0, 'end': duration, 'duration': duration, 'speaker': 'SPEAKER_1'}]
-
+            source_intervals = [{'start': 0.0, 'end': duration, 'duration': duration, 'speaker': 'Спикер 1'}]
             prepared = self.prepare_asr_segments(wav_path, temp_dir, source_intervals)
-            transcriptions = await self.transcribe_audio_batch([item['path'] for item in prepared])
+            transcriptions = await self.transcribe_audio_batch([item['path'] for item in prepared], prepared)
+            raw_asr_segments = []
             for seg_info, text in zip(prepared, transcriptions):
-                if not text or text.startswith("[Ошибка"):
+                if not text:
                     continue
-                segments.append({
-                    'start': seg_info['start'], 'end': seg_info['end'],
-                    'speaker': seg_info['speaker'], 'text': text, 'duration': seg_info['duration'],
-                })
-                speaker_num = seg_info['speaker'].replace('SPEAKER_', '') if 'SPEAKER_' in seg_info['speaker'] else seg_info['speaker']
-                full_text_parts.append(
-                    f"Спикер {speaker_num} [{self.format_time(seg_info['start'])} - {self.format_time(seg_info['end'])}]: {text}"
-                )
+                raw_asr_segments.append({'start': seg_info['start'], 'end': seg_info['end'], 'text': text, 'duration': seg_info['duration']})
+            if diarization_result and len(diarization_result['segments']) > 0:
+                segments = map_speakers_to_asr(raw_asr_segments, diarization_result['segments'])
+            else:
+                segments = [{**seg, 'speaker': 'Спикер 1'} for seg in raw_asr_segments]
+            for seg_info in segments:
+                speaker = seg_info.get('speaker') or 'Спикер ?'
+                full_text_parts.append(f"{speaker} [{self.format_time(seg_info['start'])} - {self.format_time(seg_info['end'])}]: {seg_info['text']}")
 
             if progress_callback:
                 progress_callback(0.9, f"Обработка {filename}: финализация...")

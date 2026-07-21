@@ -47,7 +47,9 @@ def map_speakers_to_asr(asr_segments: list[dict[str, Any]], diarization_segments
             max_overlap=max(overlaps.values()); tied=[k for k,v in overlaps.items() if v == max_overlap]
             chosen=center_label if center_label in tied else sorted(tied)[0]
         else:
-            chosen=center_label or "SPEAKER_00"
+            logger.warning("No diarization overlap for ASR segment start=%.3f end=%.3f text=%r", a0, a1, asr.get("text", "")[:80])
+            out.append({**asr,"speaker":None,"speaker_cluster":None})
+            continue
         out.append({**asr,"speaker":display(chosen),"speaker_cluster":chosen})
     return out
 
@@ -62,14 +64,21 @@ class DiarizationBackend:
             from pyannote.audio import Pipeline
             path=pyannote_target_for(Path(self.models_dir), model_id)
             logger.info("Loading pyannote Community-1 from %s on cuda", path)
-            self.pipeline = Pipeline.from_pretrained(str(path / "config.yaml"))
-            self.pipeline = self.pipeline.to(torch.device("cuda"))
+            self.pipeline = Pipeline.from_pretrained(str(path))
+            moved = self.pipeline.to(torch.device("cuda"))
+            if moved is not None:
+                self.pipeline = moved
             # Smoke a real device check where possible.
             params=[]
             if hasattr(self.pipeline, "parameters"):
                 params=list(self.pipeline.parameters())
             if params and any(getattr(p, "device", None).type != "cuda" for p in params):
                 raise RuntimeError("not all pyannote parameters are on cuda")
+            self.actual_device = "cuda"
+            for name in ("device", "_device"):
+                dev = getattr(self.pipeline, name, None)
+                if dev is not None and getattr(dev, "type", str(dev)) != "cuda":
+                    raise RuntimeError(f"pyannote pipeline {name} is not cuda: {dev}")
             self.model_id, self.actual_device = model_id, "cuda"
             logger.info("Loaded pyannote Community-1 path=%s device=cuda", path)
         except GigaScribeError: raise
