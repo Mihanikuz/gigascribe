@@ -18,13 +18,15 @@ jobs:
         run: python -m compileall app.py server.py model_store.py scripts tests
       - name: Pytest
         run: pytest -q
+      - name: Prepare .env for compose
+        run: cp .env.example .env
       - name: Docker compose config
         run: docker compose config
       - name: Build Docker image
         run: docker compose build
       - name: Container import smoke
-        run: docker compose run --rm --entrypoint python gigascribe -c "import gradio, requests, torch, torchaudio; import app; import server"
+        run: docker compose run --rm --entrypoint python gigascribe-gpu -c "import gradio, requests, torch, torchaudio; import app; import server"
       - name: Volume permission smoke
         run: |
           mkdir -p data models
-          docker compose run --rm --entrypoint sh gigascribe -c 'touch /opt/gigascribe/data/users.json /opt/gigascribe/models/.write-test'
+          docker compose run --rm --entrypoint sh gigascribe-gpu -c 'touch /opt/gigascribe/data/users.json /opt/gigascribe/models/.write-test'
