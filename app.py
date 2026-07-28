@@ -189,7 +189,11 @@ class AudioProcessor:
         if not GIGAAM_AVAILABLE:
             raise RuntimeError("ASR_MODEL_LOAD_FAILED: gigaam is not installed; transcription cannot run")
         logger.info("Job settings snapshot:\nASR=%s\nDiarization=%s\nDevice=%s", self.snapshot.get("asr_model"), self.snapshot.get("diarization_model"), self.snapshot.get("device"))
-        configuration = self.model_manager.configure(self.snapshot)
+        # Model loading is synchronous and can take tens of seconds on a cold
+        # cache; run it off the event loop so other users' requests (health
+        # checks, job polling, login) are not stalled while it runs.
+        loop = asyncio.get_running_loop()
+        configuration = await loop.run_in_executor(self.executor, self.model_manager.configure, self.snapshot)
         self.asr_backend = configuration.asr_backend
         self.gigaam_model = configuration.asr_backend.model
 
@@ -473,15 +477,19 @@ class AudioProcessor:
             if progress_callback:
                 progress_callback(0.2, f"Обработка {filename}: конвертация в WAV...")
 
-            if not self.convert_to_wav(file_path, wav_path):
+            # ffmpeg/ffprobe calls below are blocking subprocess + disk I/O;
+            # run them off the event loop so they don't stall unrelated
+            # requests from other users while this job is processing.
+            loop = asyncio.get_running_loop()
+            if not await loop.run_in_executor(self.executor, self.convert_to_wav, file_path, wav_path):
                 raise ValueError("Ошибка конвертации файла")
 
             if artifacts_dir:
                 os.makedirs(artifacts_dir, exist_ok=True)
-                shutil.copy2(wav_path, os.path.join(artifacts_dir, "normalized.wav"))
+                await loop.run_in_executor(self.executor, shutil.copy2, wav_path, os.path.join(artifacts_dir, "normalized.wav"))
 
             # Получаем длительность
-            duration = self.get_audio_duration(wav_path)
+            duration = await loop.run_in_executor(self.executor, self.get_audio_duration, wav_path)
             if duration > MAX_FILE_DURATION:
                 raise ValueError(f"Файл слишком длинный: {duration / 3600:.1f} часов (максимум 2 часа)")
 
@@ -501,7 +509,7 @@ class AudioProcessor:
             full_text_parts = []
 
             source_intervals = [{'start': 0.0, 'end': duration, 'duration': duration, 'speaker': 'Спикер 1'}]
-            prepared = self.prepare_asr_segments(wav_path, temp_dir, source_intervals)
+            prepared = await loop.run_in_executor(self.executor, self.prepare_asr_segments, wav_path, temp_dir, source_intervals)
             transcriptions = await self.transcribe_audio_batch([item['path'] for item in prepared], prepared)
             raw_asr_segments = []
             for seg_info, text in zip(prepared, transcriptions):
