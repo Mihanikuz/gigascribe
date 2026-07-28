@@ -27,7 +27,6 @@ from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, JSONResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from passlib.context import CryptContext
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -69,7 +68,6 @@ class SafeBcryptContext:
         except Exception:
             return False
 pwd_context = SafeBcryptContext()
-security = HTTPBasic()
 logger = logging.getLogger(__name__)
 app = FastAPI(title="GigaScribe Local Server")
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site=os.getenv("GIGASCRIBE_SESSION_SAMESITE", "lax"), https_only=os.getenv("GIGASCRIBE_SESSION_SECURE", "0") == "1")
@@ -334,20 +332,26 @@ async def run_job(job_id: str) -> None:
     finally: scheduled_jobs.discard(job_id)
 
 
+def can_control_job(job: dict[str, Any], username: str) -> bool:
+    return job["username"] == username or is_admin(username)
+
+
 @app.get("/api/jobs")
 async def list_jobs(username: str = Depends(current_user)):
-    return [serialize_job(j) for j in job_store.list(username)]
+    # Transcription history is shared across all users of this deployment.
+    return [serialize_job(j) for j in job_store.list()]
 
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str, username: str = Depends(current_user)):
     job=job_store.get(job_id)
-    if not job or job["username"] != username: raise HTTPException(404)
+    if not job: raise HTTPException(404)
     return serialize_job(job)
 
 @app.post("/api/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str, username: str = Depends(current_user)):
     job=job_store.get(job_id)
-    if not job or job["username"] != username: raise HTTPException(404)
+    if not job: raise HTTPException(404)
+    if not can_control_job(job, username): raise HTTPException(403, detail="Only the job owner or an administrator can cancel it")
     if job["status"] in {"completed","failed","cancelled"}: raise HTTPException(409, detail="Job is already terminal")
     job_store.request_cancel(job_id)
     if job["status"] == "queued": job_store.update(job_id,status="cancelled",finished_at=time.time())
@@ -356,7 +360,8 @@ async def cancel_job(job_id: str, username: str = Depends(current_user)):
 @app.post("/api/jobs/{job_id}/retry")
 async def retry_job(job_id: str, username: str = Depends(current_user)):
     job=job_store.get(job_id)
-    if not job or job["username"] != username: raise HTTPException(404)
+    if not job: raise HTTPException(404)
+    if not can_control_job(job, username): raise HTTPException(403, detail="Only the job owner or an administrator can retry it")
     if job["status"] not in {"failed","cancelled"}: raise HTTPException(409, detail="Only failed or cancelled jobs can be retried")
     try: job_store.retry(job_id)
     except ValueError as exc: raise HTTPException(409, detail=str(exc))
@@ -374,28 +379,75 @@ async def retry_job(job_id: str, username: str = Depends(current_user)):
     return serialize_job(job_store.get(job_id))
 
 def serialize_job(job: dict[str, Any]) -> dict[str, Any]:
-    return {"id":job["id"],"filename":job["filename"],"status":job["status"],"progress":job["progress"],"message":job["message"],"error":job["error"],"settings":job["settings_snapshot"],"requested_models":job["requested_models"],"requested_device":job["requested_device"],"actual_device":job["actual_device"],"actual_models":job["actual_models"],"attempts":job["attempts"],"correlation_id":job["correlation_id"],"downloads":{k:bool(job[f"{k}_path"]) for k in ("transcript","log","original","wav")}}
+    return {"id":job["id"],"owner":job["username"],"filename":job["filename"],"status":job["status"],"progress":job["progress"],"message":job["message"],"error":job["error"],"settings":job["settings_snapshot"],"requested_models":job["requested_models"],"requested_device":job["requested_device"],"actual_device":job["actual_device"],"actual_models":job["actual_models"],"attempts":job["attempts"],"correlation_id":job["correlation_id"],"downloads":{k:bool(job[f"{k}_path"]) for k in ("transcript","log","original","wav")}}
 
 @app.get("/api/jobs/{job_id}/download/{kind}")
 def download(job_id: str, kind: str, username: str = Depends(current_user)):
+    # Transcription history (including downloads) is shared across users.
     job=job_store.get(job_id)
-    if not job or job["username"] != username: raise HTTPException(404)
+    if not job: raise HTTPException(404)
     path=job.get(f"{kind}_path")
     if not path or not Path(path).exists(): raise HTTPException(404)
     return FileResponse(path, filename=Path(path).name)
 
 
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page(request: Request):
+    username = request.session.get("user")
+    if not username:
+        return RedirectResponse("/login")
+    if not is_admin(username):
+        return HTMLResponse(ADMIN_DENIED_HTML, status_code=403)
+    return HTMLResponse(ADMIN_HTML)
+
+
+@app.get("/admin/users")
+def list_local_users(admin: str = Depends(require_admin)):
+    users = _load_users()
+    return {"users": [
+        {"username": name, "disabled": bool(info.get("disabled")), "is_admin": name == "admin"}
+        for name, info in sorted(users.items())
+    ]}
+
+
 @app.post("/admin/users")
-def create_local_user(credentials: HTTPBasicCredentials = Depends(security), username: str = Form(...), password: str = Form(...)):
-    if not _verify_local(credentials.username, credentials.password) or not is_admin(credentials.username):
-        raise HTTPException(403)
+def create_local_user(admin: str = Depends(require_admin), username: str = Form(...), password: str = Form(...)):
     if not username or len(username) > 128:
         raise HTTPException(400, detail="Invalid username")
-    _validate_password(password)
     users = _load_users()
+    if username in users:
+        raise HTTPException(409, detail="User already exists")
+    _validate_password(password)
     users[username] = {"password_hash": pwd_context.hash(password), "disabled": False, "storage_id": safe_user_id(username)}
     USER_DB.write_text(json.dumps(users, indent=2, ensure_ascii=False), encoding="utf-8")
     return {"ok": True}
+
+
+def _set_user_disabled(target: str, disabled: bool) -> None:
+    if target == "admin":
+        raise HTTPException(400, detail="Cannot disable the built-in admin account")
+    users = _load_users()
+    if target not in users:
+        raise HTTPException(404, detail="Unknown user")
+    users[target]["disabled"] = disabled
+    USER_DB.write_text(json.dumps(users, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+@app.post("/admin/users/{target}/disable")
+def disable_local_user(target: str, admin: str = Depends(require_admin)):
+    _set_user_disabled(target, True)
+    return {"ok": True}
+
+
+@app.post("/admin/users/{target}/enable")
+def enable_local_user(target: str, admin: str = Depends(require_admin)):
+    _set_user_disabled(target, False)
+    return {"ok": True}
+
+
+@app.get("/api/whoami")
+def whoami(username: str = Depends(current_user)):
+    return {"username": username, "is_admin": is_admin(username)}
 
 
 @app.get("/api/models")
@@ -483,9 +535,269 @@ def api_system_gpu(username: str = Depends(current_user)):
     from system_info import gpu_info
     return gpu_info(real_test=True)
 
-LOGIN_HTML = """<!doctype html><meta charset='utf-8'><title>GigaScribe login</title><style>body{font-family:sans-serif;max-width:420px;margin:10vh auto}.err{color:#b00}input,button{width:100%;padding:10px;margin:6px 0}</style><h1>GigaScribe</h1><!--ERROR--><form method='post'><input name='username' placeholder='Пользователь'><input name='password' type='password' placeholder='Пароль'><button>Войти</button></form>"""
-INDEX_HTML = """<!doctype html><meta charset='utf-8'><title>GigaScribe</title><style>body{font-family:sans-serif;max-width:900px;margin:30px auto}.job{border:1px solid #ddd;padding:12px;margin:10px 0}progress{width:100%}label,select{margin:4px}</style><h1>Локальная транскрибация</h1><form id='up'><input type='file' name='file' required><button>Запустить</button></form><form id='model-settings'><p>ASR: GigaAM v3 E2E RNNT</p><p>Устройство: NVIDIA CUDA</p><label>Диаризация <select id='diarization-model'></select></label><button>Сохранить</button><span id='model-message'></span></form><form method='post' action='/logout'><button>Выйти</button></form><div id='jobs'></div><script>
-async function refresh(){let r=await fetch('/api/jobs');let js=await r.json();jobs.innerHTML=js.reverse().map(j=>`<div class='job'><b>${j.filename}</b> — ${j.status}<br><progress value='${j.progress}' max='1'></progress> ${Math.round(j.progress*100)}%<br>${j.message}<br>${['transcript','log','original','wav'].filter(k=>j.downloads[k]).map(k=>`<a href='/api/jobs/${j.id}/download/${k}'>скачать ${k}</a>`).join(' | ')}</div>`).join('')}
-async function loadModels(){let r=await fetch('/api/models'), m=await r.json(); for(let [target,values,current] of [['diarization-model',m.diarization,m.settings.diarization_model]]){let s=document.getElementById(target);s.innerHTML=Object.entries(values).map(([id,v])=>`<option value='${id}'>${v.label}</option>`).join('');s.value=current}}
-modelSettings=document.getElementById('model-settings'); modelSettings.onsubmit=async(e)=>{e.preventDefault();let r=await fetch('/api/models/select',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({diarization_model:diarizationModel.value})});document.getElementById('model-message').textContent=r.ok?'Сохранено':'Ошибка сохранения'};
-let diarizationModel=document.getElementById('diarization-model');let poll=3000;async function tick(){await refresh();setTimeout(tick,document.hidden?10000:poll)};up.onsubmit=async(e)=>{e.preventDefault();let fd=new FormData(up);await fetch('/api/jobs',{method:'POST',body:fd});up.reset();refresh()};loadModels();tick();</script>"""
+BASE_CSS = """
+:root{color-scheme:light dark}
+body{font-family:system-ui,-apple-system,sans-serif;max-width:960px;margin:24px auto;padding:0 16px;line-height:1.45}
+header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:18px;border-bottom:1px solid #8884;padding-bottom:12px}
+header h1{font-size:1.25rem;margin:0}
+nav{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.card{border:1px solid #8884;border-radius:10px;padding:16px;margin:14px 0}
+.muted{color:#888;font-size:.9em}
+progress{width:100%;height:10px}
+input,select,button{padding:8px 10px;margin:4px 0;font-size:1em;box-sizing:border-box}
+input,select{width:100%}
+button{cursor:pointer;width:auto}
+form label{display:block;margin:8px 0 2px;font-size:.9em}
+table{border-collapse:collapse;width:100%}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #8883;vertical-align:middle}
+.badge{display:inline-block;padding:2px 9px;border-radius:10px;font-size:.8em;white-space:nowrap}
+.badge.queued{background:#dbe4ff;color:#1d3a8a}
+.badge.running{background:#ffe6a8;color:#6b4a00}
+.badge.completed{background:#d3f3d8;color:#12572a}
+.badge.failed{background:#fbd6d6;color:#7a1414}
+.badge.cancelled{background:#e5e5e5;color:#444}
+.err{color:#b00020}
+.actions{display:flex;gap:6px;flex-wrap:wrap}
+.actions button{width:auto}
+.job .row{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center}
+"""
+
+LOGIN_HTML = ("<!doctype html><meta charset='utf-8'><title>GigaScribe — вход</title><style>" + BASE_CSS +
+              "body{max-width:380px;margin-top:12vh}header{border:none;justify-content:center}</style>"
+              "<header><h1>🎙️ GigaScribe</h1></header>"
+              "<!--ERROR-->"
+              "<form method='post' class='card'>"
+              "<label>Пользователь<input name='username' placeholder='Логин' autofocus required></label>"
+              "<label>Пароль<input name='password' type='password' placeholder='Пароль' required></label>"
+              "<button type='submit'>Войти</button>"
+              "</form>")
+
+INDEX_HTML = ("<!doctype html><meta charset='utf-8'><title>GigaScribe</title><style>" + BASE_CSS + """
+.upload-progress{display:none;margin-top:8px}
+</style>
+<header>
+  <h1>🎙️ GigaScribe</h1>
+  <nav>
+    <span id='whoami' class='muted'></span>
+    <a id='admin-link' href='/admin' style='display:none'>⚙ Администрирование</a>
+    <form method='post' action='/logout' style='display:inline'><button>Выйти</button></form>
+  </nav>
+</header>
+
+<section class='card'>
+  <h2>Новая транскрипция</h2>
+  <form id='up'>
+    <input type='file' name='file' id='file-input' required>
+    <button type='submit' id='up-btn'>🚀 Запустить</button>
+  </form>
+  <div id='upload-progress-wrap' class='upload-progress'>
+    <progress id='upload-progress' value='0' max='100'></progress>
+    <span id='upload-progress-text' class='muted'></span>
+  </div>
+  <p id='diarization-info' class='muted'></p>
+</section>
+
+<h2>История транскрипций <span class='muted'>(общая для всех пользователей)</span></h2>
+<div id='jobs'></div>
+
+<script>
+function escapeHtml(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+const STATUS_LABELS={queued:'В очереди',running:'Обрабатывается',completed:'Готово',failed:'Ошибка',cancelled:'Отменено'};
+const DOWNLOAD_LABELS={transcript:'транскрипт',log:'лог',original:'оригинал',wav:'wav'};
+let ME={username:null,is_admin:false};
+
+async function loadWhoAmI(){
+  let r=await fetch('/api/whoami'); if(!r.ok) return;
+  ME=await r.json();
+  document.getElementById('whoami').textContent='Вы вошли как: '+ME.username;
+  if(ME.is_admin) document.getElementById('admin-link').style.display='';
+}
+
+async function loadModelsInfo(){
+  let r=await fetch('/api/models'); if(!r.ok) return;
+  let m=await r.json();
+  let diar=m.diarization[m.settings.diarization_model];
+  let text='Диаризация: '+escapeHtml(diar?diar.label:m.settings.diarization_model);
+  if(ME.is_admin) text+=' — изменить можно в администрировании';
+  document.getElementById('diarization-info').textContent=text;
+}
+
+function renderJob(j){
+  let canControl=(j.owner===ME.username)||ME.is_admin;
+  let statusLabel=STATUS_LABELS[j.status]||j.status;
+  let downloads=Object.keys(DOWNLOAD_LABELS).filter(k=>j.downloads[k]).map(k=>`<a href='/api/jobs/${j.id}/download/${k}'>${DOWNLOAD_LABELS[k]}</a>`).join(' · ');
+  let actions='';
+  if(canControl&&(j.status==='queued'||j.status==='running')) actions+=`<button onclick="cancelJob('${j.id}')">Отменить</button>`;
+  if(canControl&&(j.status==='failed'||j.status==='cancelled')) actions+=`<button onclick="retryJob('${j.id}')">Повторить</button>`;
+  return `<div class='job card'>
+    <div class='row'><b>${escapeHtml(j.filename)}</b><span class='badge ${j.status}'>${statusLabel}</span></div>
+    <div class='muted'>Загрузил(а): ${escapeHtml(j.owner)}</div>
+    <progress value='${j.progress}' max='1'></progress> ${Math.round(j.progress*100)}%
+    <div class='muted'>${escapeHtml(j.message)}</div>
+    ${j.error?`<div class='err'>${escapeHtml(j.error)}</div>`:''}
+    <div class='row'><span>${downloads}</span><span class='actions'>${actions}</span></div>
+  </div>`;
+}
+
+async function refresh(){
+  let r=await fetch('/api/jobs'); if(!r.ok) return;
+  let js=await r.json();
+  document.getElementById('jobs').innerHTML=js.reverse().map(renderJob).join('')||"<p class='muted'>Пока нет ни одной транскрипции.</p>";
+}
+
+async function cancelJob(id){await fetch(`/api/jobs/${id}/cancel`,{method:'POST'});refresh()}
+async function retryJob(id){await fetch(`/api/jobs/${id}/retry`,{method:'POST'});refresh()}
+
+let poll=3000;
+async function tick(){await refresh();setTimeout(tick,document.hidden?10000:poll)}
+
+document.getElementById('up').onsubmit=function(e){
+  e.preventDefault();
+  let fileInput=document.getElementById('file-input');
+  if(!fileInput.files.length) return;
+  let fd=new FormData(); fd.append('file', fileInput.files[0]);
+  let wrap=document.getElementById('upload-progress-wrap');
+  let bar=document.getElementById('upload-progress');
+  let text=document.getElementById('upload-progress-text');
+  let btn=document.getElementById('up-btn');
+  wrap.style.display='block'; btn.disabled=true; bar.value=0; text.textContent='Загрузка файла: 0%';
+  let xhr=new XMLHttpRequest();
+  xhr.upload.onprogress=function(ev){
+    if(ev.lengthComputable){
+      let pct=Math.round(ev.loaded/ev.total*100);
+      bar.value=pct; text.textContent='Загрузка файла: '+pct+'%';
+    }
+  };
+  xhr.onload=function(){
+    btn.disabled=false;
+    if(xhr.status>=200&&xhr.status<300){
+      text.textContent='Загрузка завершена, обработка начата';
+      document.getElementById('up').reset();
+      refresh();
+    } else {
+      let msg='Ошибка загрузки';
+      try{ msg=JSON.parse(xhr.responseText).detail||msg }catch(e){}
+      text.textContent=msg;
+    }
+    setTimeout(()=>{wrap.style.display='none'},4000);
+  };
+  xhr.onerror=function(){btn.disabled=false;text.textContent='Ошибка сети при загрузке'};
+  xhr.open('POST','/api/jobs');
+  xhr.send(fd);
+};
+
+loadWhoAmI().then(loadModelsInfo);
+tick();
+</script>""")
+
+ADMIN_DENIED_HTML = ("<!doctype html><meta charset='utf-8'><title>GigaScribe — доступ запрещён</title><style>" + BASE_CSS +
+                      "body{max-width:420px;margin-top:15vh;text-align:center}</style>"
+                      "<h1>⛔ Доступ запрещён</h1>"
+                      "<p>Эта страница доступна только администратору.</p>"
+                      "<p><a href='/'>На главную</a></p>")
+
+ADMIN_HTML = ("<!doctype html><meta charset='utf-8'><title>GigaScribe — администрирование</title><style>" + BASE_CSS + """
+</style>
+<header>
+  <h1>⚙ GigaScribe — Администрирование</h1>
+  <nav><a href='/'>← К транскрибации</a><form method='post' action='/logout' style='display:inline'><button>Выйти</button></form></nav>
+</header>
+
+<section class='card'>
+  <h2>Пользователи</h2>
+  <table><thead><tr><th>Логин</th><th>Статус</th><th></th></tr></thead><tbody id='users-body'></tbody></table>
+  <h3>Добавить пользователя</h3>
+  <form id='new-user-form'>
+    <label>Логин<input name='username' required></label>
+    <label>Пароль<input name='password' type='password' minlength='6' required placeholder='Минимум 6 символов'></label>
+    <button type='submit'>Создать</button>
+  </form>
+  <p id='user-message' class='muted'></p>
+</section>
+
+<section class='card'>
+  <h2>Модели</h2>
+  <table><thead><tr><th>Модель</th><th>Тип</th><th>Статус</th><th>Активна</th><th>Размер</th><th></th></tr></thead><tbody id='models-body'></tbody></table>
+  <p id='model-message' class='muted'></p>
+</section>
+
+<script>
+function escapeHtml(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function escapeAttr(s){return escapeHtml(s).replace(/`/g,'&#96;')}
+function fmtSize(bytes){if(!bytes) return '—';let units=['Б','КБ','МБ','ГБ'];let i=0;while(bytes>=1024&&i<units.length-1){bytes/=1024;i++}return bytes.toFixed(1)+' '+units[i]}
+
+async function loadUsers(){
+  let body=document.getElementById('users-body');
+  let r=await fetch('/admin/users');
+  if(!r.ok){ body.innerHTML="<tr><td colspan='3'>Ошибка загрузки списка пользователей</td></tr>"; return; }
+  let data=await r.json();
+  body.innerHTML=data.users.map(u=>`<tr>
+    <td>${escapeHtml(u.username)}${u.is_admin?" <span class='badge completed'>админ</span>":''}</td>
+    <td>${u.disabled?"<span class='badge cancelled'>отключён</span>":"<span class='badge completed'>активен</span>"}</td>
+    <td>${u.is_admin?'':`<button data-user="${escapeAttr(u.username)}" data-disable="${u.disabled?'0':'1'}" class='toggle-user'>${u.disabled?'Включить':'Отключить'}</button>`}</td>
+  </tr>`).join('');
+  body.querySelectorAll('.toggle-user').forEach(btn=>btn.onclick=()=>toggleUser(btn.dataset.user, btn.dataset.disable==='1'));
+}
+
+async function toggleUser(username, disable){
+  await fetch(`/admin/users/${encodeURIComponent(username)}/${disable?'disable':'enable'}`, {method:'POST'});
+  loadUsers();
+}
+
+document.getElementById('new-user-form').onsubmit=async function(e){
+  e.preventDefault();
+  let msg=document.getElementById('user-message');
+  let r=await fetch('/admin/users', {method:'POST', body:new FormData(e.target)});
+  if(r.ok){ msg.textContent='Пользователь создан'; e.target.reset(); loadUsers(); }
+  else { let d=await r.json().catch(()=>({})); msg.textContent='Ошибка: '+(d.detail||r.status); }
+};
+
+async function loadModels(){
+  let body=document.getElementById('models-body');
+  let r=await fetch('/api/models/status'); if(!r.ok) return;
+  let data=await r.json();
+  body.innerHTML=data.models.map(m=>{
+    let activeCell=m.active?'✅':(m.kind==='diarization'?`<button data-select="${escapeAttr(m.id)}" ${m.installed?'':'disabled'} class='select-model'>Выбрать</button>`:'—');
+    let actionCell='';
+    if(m.installed && (m.kind==='asr' || m.id!=='none')) actionCell+=`<button data-test="${escapeAttr(m.id)}" class='test-model'>Тест</button> `;
+    if(m.installed && m.kind==='diarization' && m.id!=='none') actionCell+=`<button data-delete="${escapeAttr(m.id)}" class='delete-model'>Удалить</button>`;
+    return `<tr>
+      <td>${escapeHtml(m.label)}</td>
+      <td>${m.kind==='asr'?'ASR':'Диаризация'}</td>
+      <td>${m.installed?"<span class='badge completed'>установлена</span>":"<span class='badge failed'>не установлена</span>"}</td>
+      <td>${activeCell}</td>
+      <td>${fmtSize(m.size)}</td>
+      <td class='actions'>${actionCell}</td>
+    </tr>`;
+  }).join('');
+  body.querySelectorAll('.select-model').forEach(btn=>btn.onclick=()=>selectDiarization(btn.dataset.select));
+  body.querySelectorAll('.test-model').forEach(btn=>btn.onclick=()=>testModel(btn.dataset.test));
+  body.querySelectorAll('.delete-model').forEach(btn=>btn.onclick=()=>deleteModel(btn.dataset.delete));
+}
+
+async function selectDiarization(id){
+  let msg=document.getElementById('model-message');
+  let r=await fetch('/api/models/select', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({diarization_model:id})});
+  let d=await r.json().catch(()=>({}));
+  msg.textContent=r.ok?'Сохранено, применится к следующему заданию':('Ошибка: '+(d.error||d.detail||r.status));
+  loadModels();
+}
+async function testModel(id){
+  let msg=document.getElementById('model-message');
+  msg.textContent='Тестируем '+id+'…';
+  let r=await fetch(`/api/models/${id}/test`, {method:'POST'});
+  let d=await r.json().catch(()=>({}));
+  msg.textContent=(r.ok&&d.ok)?('Модель '+id+': тест пройден'):('Модель '+id+': тест не пройден — '+(d.error||r.status));
+}
+async function deleteModel(id){
+  if(!confirm('Удалить модель '+id+' с диска?')) return;
+  let msg=document.getElementById('model-message');
+  let r=await fetch(`/api/models/${id}`, {method:'DELETE'});
+  let d=await r.json().catch(()=>({}));
+  msg.textContent=r.ok?'Модель удалена':('Ошибка: '+(d.detail||r.status));
+  loadModels();
+}
+
+loadUsers();
+loadModels();
+</script>""")
