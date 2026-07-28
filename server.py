@@ -360,11 +360,16 @@ async def retry_job(job_id: str, username: str = Depends(current_user)):
     if job["status"] not in {"failed","cancelled"}: raise HTTPException(409, detail="Only failed or cancelled jobs can be retried")
     try: job_store.retry(job_id)
     except ValueError as exc: raise HTTPException(409, detail=str(exc))
-    # Preserve upload but retire result artefacts: stale downloads cannot become
-    # the result of the next attempt.
+    # Preserve upload and log but retire other result artefacts: stale
+    # downloads cannot become the result of the next attempt. The log is kept
+    # (run_job appends to it) so earlier attempts stay visible after a retry.
     result_dir = Path(job["log_path"]).parent
+    log_path = Path(job["log_path"])
     for artifact in result_dir.iterdir() if result_dir.exists() else ():
-        if artifact.is_file(): artifact.unlink(missing_ok=True)
+        if artifact.is_file() and artifact != log_path: artifact.unlink(missing_ok=True)
+    if log_path.exists():
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} ==== Retry requested (previous status: {job['status']}) ====\n")
     schedule_job(job_id)
     return serialize_job(job_store.get(job_id))
 
