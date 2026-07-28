@@ -99,11 +99,16 @@ def _validate_password(password: str) -> None:
     if byte_len > 4096:
         raise HTTPException(400, detail="Пароль слишком длинный")
 
+FORBIDDEN_ADMIN_PASSWORDS = {
+    "admin", "password", "change-me", "changeme",
+    "replace-with-a-strong-password",
+}
+
 def _load_users() -> dict[str, Any]:
     if not USER_DB.exists():
         admin_password = os.getenv("GIGASCRIBE_ADMIN_PASSWORD")
-        if not admin_password or admin_password == "admin":
-            raise RuntimeError("GIGASCRIBE_ADMIN_PASSWORD must be set and must not be the default 'admin'")
+        if not admin_password or admin_password.lower() in FORBIDDEN_ADMIN_PASSWORDS:
+            raise RuntimeError("GIGASCRIBE_ADMIN_PASSWORD must be set to a real password, not a placeholder like 'admin' or 'change-me'")
         _validate_password(admin_password)
         USER_DB.write_text(
             json.dumps({"admin": {"password_hash": pwd_context.hash(admin_password), "disabled": False}}, indent=2),
