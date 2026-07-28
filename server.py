@@ -17,17 +17,15 @@ import os
 import secrets
 import hashlib
 import shutil
-import subprocess
 import time
 import uuid
 import logging
 import importlib
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, JSONResponse
-from passlib.context import CryptContext
 from starlette.middleware.sessions import SessionMiddleware
 
 APP_MODULE_PATH = Path(__file__).with_name("app.py")
@@ -74,6 +72,11 @@ app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site=os.getenv
 
 @app.on_event("startup")
 async def resume_persistent_queue() -> None:
+    # Validate GIGASCRIBE_ADMIN_PASSWORD (and create the admin account) at
+    # startup instead of lazily on the first login attempt, so a missing or
+    # placeholder password fails loudly in the container logs rather than as
+    # an unexplained 500 the first time someone tries to log in.
+    _load_users()
     for row in job_store.list(active_only=True):
         if row["status"] == "queued": schedule_job(row["id"])
 
@@ -686,8 +689,7 @@ document.getElementById('up').onsubmit=function(e){
   xhr.send(fd);
 };
 
-loadWhoAmI().then(loadModelsInfo);
-tick();
+(async()=>{ await loadWhoAmI(); await loadModelsInfo(); tick(); })();
 </script>""")
 
 ADMIN_DENIED_HTML = ("<!doctype html><meta charset='utf-8'><title>GigaScribe — доступ запрещён</title><style>" + BASE_CSS +
