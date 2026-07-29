@@ -1,2 +1,5 @@
-# Official GigaAM release with load_model("v3_e2e_rnnt").
-git+https://github.com/salute-developers/GigaAM.git@v0.3.0#egg=gigaam
+# Pinned to a commit, not a tag: the v0.3.0 tag this used to point to was
+# deleted upstream (salute-developers/GigaAM currently has no tags at all),
+# which broke every build. Verified this commit still exposes
+# load_model("v3_e2e_rnnt") with the same signature and model registry entry.
+git+https://github.com/salute-developers/GigaAM.git@559d88d6b72541412743929f633a6ae7c9950b85#egg=gigaam

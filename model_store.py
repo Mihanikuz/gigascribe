@@ -14,7 +14,10 @@ PYANNOTE_MARKER_NAME = ".pyannote-ready.json"
 MIN_CHECKPOINT_BYTES = 1024
 MIN_TOKENIZER_BYTES = 128
 GIGAAM_SOURCE = "https://github.com/salute-developers/GigaAM.git"
-GIGAAM_BACKEND_REF = "v0.3.0"
+# Must match the ref pinned in requirements-gigaam.txt: a mismatch here
+# forces model re-verification, which is the point -- it means the backend
+# actually installed differs from what the on-disk readiness marker claims.
+GIGAAM_BACKEND_REF = "559d88d6b72541412743929f633a6ae7c9950b85"
 SUPPORTED_DEVICES = ("cuda",)
 SUPPORTED_GIGAAM_MODELS: dict[str, dict[str, Any]] = {
     ASR_MODEL_ID: {"kind":"asr","id":ASR_MODEL_ID,"label":"GigaAM v3 E2E RNNT","model_name":ASR_MODEL_NAME,"official_model_name":ASR_MODEL_NAME,"family":"v3","architecture":"rnnt","e2e":True,"devices":[DEVICE],"checkpoint":"v3_e2e_rnnt.ckpt","tokenizer":"v3_e2e_rnnt_tokenizer.model","expected_files":["v3_e2e_rnnt.ckpt","v3_e2e_rnnt_tokenizer.model"],"download_method":"gigaam.load_model","safe_segment_seconds":24.0,"punctuation":True,"normalization":True,"vram_gb_min":8}

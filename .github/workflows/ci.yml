@@ -18,13 +18,19 @@ jobs:
         run: python -m compileall app.py server.py model_store.py scripts tests
       - name: Pytest
         run: pytest -q
+      - name: Prepare .env for compose
+        run: cp .env.example .env
       - name: Docker compose config
         run: docker compose config
       - name: Build Docker image
         run: docker compose build
       - name: Container import smoke
-        run: docker compose run --rm --entrypoint python gigascribe -c "import gradio, requests, torch, torchaudio; import app; import server"
+        # Plain `docker run`, not `docker compose run`: the compose service
+        # declares `gpus: all`, which this hosted runner (no GPU) can't
+        # satisfy. These steps already override --entrypoint, so they never
+        # exercised GPU behavior anyway -- just imports and permissions.
+        run: docker run --rm --entrypoint python gigascribe:gpu-local -c "import gradio, requests, torch, torchaudio; import app; import server"
       - name: Volume permission smoke
         run: |
           mkdir -p data models
-          docker compose run --rm --entrypoint sh gigascribe -c 'touch /opt/gigascribe/data/users.json /opt/gigascribe/models/.write-test'
+          docker run --rm --entrypoint sh -v "$PWD/data:/opt/gigascribe/data" -v "$PWD/models:/opt/gigascribe/models" gigascribe:gpu-local -c 'touch /opt/gigascribe/data/users.json /opt/gigascribe/models/.write-test'

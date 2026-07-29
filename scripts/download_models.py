@@ -5,11 +5,20 @@ import argparse, os
 from pathlib import Path
 from model_store import ASR_MODEL_ID, ASR_MODEL_NAME, DIARIZATION_MODEL_ID, SUPPORTED_GIGAAM_MODELS, SUPPORTED_DIARIZATION_MODELS, gigaam_cache_dir, gigaam_checkpoint_path, gigaam_tokenizer_path, is_gigaam_ready, is_pyannote_ready, pyannote_target_for, write_gigaam_marker, write_pyannote_marker
 
+def _allow_online_downloads() -> None:
+    # The serving container always sets HF_HUB_OFFLINE=1/TRANSFORMERS_OFFLINE=1
+    # (see compose.yaml), so os.environ.setdefault() here would be a no-op
+    # when this script runs inside that same environment -- which is the
+    # normal way to invoke it (``docker compose run ... download_models.py``).
+    # Force both off unconditionally for the duration of the download.
+    os.environ["HF_HUB_OFFLINE"] = "0"
+    os.environ["TRANSFORMERS_OFFLINE"] = "0"
+
 def warm_up_gigaam(models_dir: Path, model_name: str = ASR_MODEL_NAME, *, force: bool=False) -> Path:
     if model_name != ASR_MODEL_NAME: raise RuntimeError("Only GigaAM v3 E2E RNNT is supported")
     if is_gigaam_ready(models_dir, model_name) and not force: return gigaam_cache_dir(models_dir)
+    _allow_online_downloads()
     import gigaam
-    os.environ.setdefault("HF_HUB_OFFLINE", "0")
     model = gigaam.load_model(ASR_MODEL_NAME, device="cuda", download_root=str(gigaam_cache_dir(models_dir)))
     if model is None or not hasattr(model, "transcribe"): raise RuntimeError("GigaAM RNNT load verification failed")
     ckpt, tok = gigaam_checkpoint_path(models_dir), gigaam_tokenizer_path(models_dir)
@@ -22,6 +31,7 @@ def download_pyannote(models_dir: Path, token: str|None, *, model_id: str = DIAR
     if model_id != DIARIZATION_MODEL_ID: raise RuntimeError("Only pyannote Community-1 is supported")
     target=pyannote_target_for(models_dir, model_id)
     if is_pyannote_ready(models_dir, model_id) and not force: return target
+    _allow_online_downloads()
     from huggingface_hub import snapshot_download
     snapshot_download(SUPPORTED_DIARIZATION_MODELS[model_id]["repo_id"], local_dir=target, token=token, local_dir_use_symlinks=False)
     from pyannote.audio import Pipeline
