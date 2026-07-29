@@ -22,10 +22,15 @@ def smoke_test(require_cuda: bool = False) -> dict:
     result["device_name"] = torch.cuda.get_device_name(0)
     result["capability"] = torch.cuda.get_device_capability(0)
     is_blackwell = result["capability"] == (12, 0)
+    # Check actual capabilities (compiled arch list, CUDA runtime version),
+    # not one exact torch version string: that broke every time the pinned
+    # torch version changed even though newer compatible builds work fine.
     if is_blackwell and "sm_120" not in result["arch_list"]:
-        raise RuntimeError("RTX 50xx (sm_120) requires torch 2.7.0+cu128; installed wheel does not contain sm_120.")
-    if is_blackwell and (torch.__version__ != "2.7.0+cu128" or torch.version.cuda != "12.8"):
-        raise RuntimeError(f"RTX 50xx requires torch 2.7.0+cu128 / CUDA 12.8, got {torch.__version__} / {torch.version.cuda}.")
+        raise RuntimeError(f"RTX 50xx (sm_120) needs a torch build with sm_120 support; installed torch {torch.__version__} (CUDA {torch.version.cuda}) does not include it.")
+    if is_blackwell and torch.version.cuda:
+        cuda_major_minor = tuple(int(p) for p in torch.version.cuda.split(".")[:2])
+        if cuda_major_minor < (12, 8):
+            raise RuntimeError(f"RTX 50xx (sm_120) needs CUDA 12.8 or newer; installed torch {torch.__version__} reports CUDA {torch.version.cuda}.")
     x = torch.ones((32, 32), device="cuda")
     torch.cuda.synchronize()
     result["smoke"] = float((x @ x).sum().item())

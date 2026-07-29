@@ -1,1 +1,13 @@
 bcrypt>=4.0,<5.0
+# Keep torch/torchaudio pinned to the CUDA build across every pip layer.
+# Without this, installing requirements-models.txt (pyannote.audio, which
+# requires torch>=2.8.0) has no reason to prefer the already-installed
+# +cu128 wheel and can silently replace it with a CPU-only build from
+# plain PyPI. Must match requirements-cu128.txt.
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128
+# pyannote.audio pulls in torchcodec transitively; pin to the version
+# verified compatible with the cu128/CUDA 12.8 runtime above (an
+# unconstrained resolve picked a CUDA-13-targeted build that failed with
+# "OSError: libnvrtc.so.13: cannot open shared object file").
+torchcodec==0.7.0
