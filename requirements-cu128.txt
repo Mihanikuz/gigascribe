@@ -1,5 +1,10 @@
 --extra-index-url https://download.pytorch.org/whl/cu128
 # Do not remove the local version suffix: it prevents pip selecting a CPU or
-# older CUDA wheel from PyPI when another package is installed later.
-torch==2.7.0+cu128
-torchaudio==2.7.0+cu128
+# older CUDA wheel from PyPI when another package is installed later -- but
+# that protection only works if constraints.txt also pins these exact
+# versions, since requirements-models.txt is installed in a later, separate
+# pip invocation. pyannote.audio 4.x (every release) requires torch>=2.8.0,
+# so anything older than 2.8.0 here gets silently replaced with a CPU wheel
+# when that layer installs. Keep this in sync with constraints.txt.
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128

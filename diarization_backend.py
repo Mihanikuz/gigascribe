@@ -68,11 +68,17 @@ class DiarizationBackend:
             moved = self.pipeline.to(torch.device("cuda"))
             if moved is not None:
                 self.pipeline = moved
-            # Smoke a real device check where possible.
+            # Smoke a real device check where possible. Only look at
+            # parameters that actually expose a `.device` -- pyannote's
+            # Pipeline.parameters() can yield objects without one, and
+            # treating "no device attribute" as "not on cuda" both crashes
+            # (None has no .type) and produces false failures even right
+            # after a successful pipeline.to("cuda").
             params=[]
             if hasattr(self.pipeline, "parameters"):
                 params=list(self.pipeline.parameters())
-            if params and any(getattr(p, "device", None).type != "cuda" for p in params):
+            params_with_device = [p for p in params if getattr(p, "device", None) is not None]
+            if params_with_device and any(p.device.type != "cuda" for p in params_with_device):
                 raise RuntimeError("not all pyannote parameters are on cuda")
             self.actual_device = "cuda"
             for name in ("device", "_device"):

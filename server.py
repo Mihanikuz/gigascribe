@@ -210,7 +210,12 @@ def _model_checks(load: bool = False) -> dict[str, Any]:
 
 @app.get("/health/ready")
 def health_ready():
-    status = MODEL_MANAGER.health_status(deep=False)
+    # Deep: actually load ASR/diarization once (cheap on later polls, since
+    # ModelManager reuses already-loaded models) rather than only checking
+    # that files exist. A broken import (e.g. torchcodec) or GPU placement
+    # failure should make the container not-ready, not surface as the first
+    # user's job failing at 1%.
+    status = MODEL_MANAGER.health_status(deep=True)
     checks = {"data_writable": _writable_dir(BASE_DIR), "models_writable": _writable_dir(MODELS_DIR), "secret_key_configured": SECRET_KEY_CONFIGURED, "ffmpeg": shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None}
     ready = status["status"] == "ready" and all(checks.values())
     status["checks"] = checks
@@ -634,7 +639,7 @@ function renderJob(j){
   if(canControl&&(j.status==='failed'||j.status==='cancelled')) actions+=`<button onclick="retryJob('${j.id}')">Повторить</button>`;
   return `<div class='job card'>
     <div class='row'><b>${escapeHtml(j.filename)}</b><span class='badge ${j.status}'>${statusLabel}</span></div>
-    <div class='muted'>Загрузил(а): ${escapeHtml(j.owner)}</div>
+    <div class='muted'>Загрузил(а): ${escapeHtml(j.owner)}${j.attempts>1?` · попытка ${j.attempts}`:''}</div>
     <progress value='${j.progress}' max='1'></progress> ${Math.round(j.progress*100)}%
     <div class='muted'>${escapeHtml(j.message)}</div>
     ${j.error?`<div class='err'>${escapeHtml(j.error)}</div>`:''}

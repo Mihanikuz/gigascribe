@@ -40,6 +40,8 @@ models/
    ```
    Pass `--skip-pyannote` to skip diarization if you don't have an `HF_TOKEN`. Re-run with `--check` at any time to verify what's installed without downloading anything.
 
+   If the build machine can only reach GitHub through a proxy, `export http_proxy=... https_proxy=...` (and `no_proxy` if needed) in the shell before `docker compose build` — Docker forwards those automatically as build args, which both `apt-get` and the `pip install git+https://...` step (for the ASR backend) respect. Don't edit the Dockerfile for this.
+
 3. Start the service and confirm it's healthy:
    ```bash
    docker compose up -d

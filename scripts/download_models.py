@@ -3,7 +3,7 @@
 from __future__ import annotations
 import argparse, os
 from pathlib import Path
-from model_store import ASR_MODEL_ID, ASR_MODEL_NAME, DIARIZATION_MODEL_ID, SUPPORTED_GIGAAM_MODELS, SUPPORTED_DIARIZATION_MODELS, gigaam_cache_dir, gigaam_checkpoint_path, gigaam_tokenizer_path, is_gigaam_ready, is_pyannote_ready, pyannote_target_for, write_gigaam_marker, write_pyannote_marker
+from model_store import ASR_MODEL_ID, ASR_MODEL_NAME, DIARIZATION_MODEL_ID, SUPPORTED_GIGAAM_MODELS, SUPPORTED_DIARIZATION_MODELS, gigaam_cache_dir, gigaam_checkpoint_path, gigaam_tokenizer_path, is_gigaam_ready, is_pyannote_ready, models_dir as default_models_dir, pyannote_target_for, write_gigaam_marker, write_pyannote_marker
 
 def _allow_online_downloads() -> None:
     # The serving container always sets HF_HUB_OFFLINE=1/TRANSFORMERS_OFFLINE=1
@@ -41,14 +41,34 @@ def download_pyannote(models_dir: Path, token: str|None, *, model_id: str = DIAR
     return target
 
 def main() -> None:
-    ap=argparse.ArgumentParser(); ap.add_argument("--models-dir", type=Path, default=Path("./models")); ap.add_argument("--skip-gigaam", action="store_true"); ap.add_argument("--skip-pyannote", action="store_true"); ap.add_argument("--check", action="store_true"); ap.add_argument("--force", action="store_true"); ap.add_argument("--repair", action="store_true"); ap.add_argument("--list", action="store_true")
+    ap=argparse.ArgumentParser()
+    # Default to GIGASCRIBE_MODELS_DIR, same as every other component --
+    # "./models" alone resolves relative to the container's WORKDIR (/app),
+    # not the /opt/gigascribe/models the rest of the app actually uses.
+    ap.add_argument("--models-dir", type=Path, default=default_models_dir())
+    ap.add_argument("--skip-gigaam", action="store_true"); ap.add_argument("--skip-pyannote", action="store_true"); ap.add_argument("--check", action="store_true"); ap.add_argument("--force", action="store_true"); ap.add_argument("--repair", action="store_true"); ap.add_argument("--list", action="store_true")
     args=ap.parse_args(); models=args.models_dir.resolve(); models.mkdir(parents=True, exist_ok=True)
     if args.list:
         print(f"asr {ASR_MODEL_ID}: {SUPPORTED_GIGAAM_MODELS[ASR_MODEL_ID]['model_name']}"); print(f"diarization {DIARIZATION_MODEL_ID}"); return
+    print(f"Models directory: {models}")
     if args.check:
-        if not args.skip_gigaam and not is_gigaam_ready(models): raise RuntimeError("GigaAM RNNT offline verification failed")
-        if not args.skip_pyannote and not is_pyannote_ready(models, DIARIZATION_MODEL_ID): raise RuntimeError("Pyannote Community-1 offline verification failed")
+        gigaam_ok = args.skip_gigaam or is_gigaam_ready(models)
+        pyannote_ok = args.skip_pyannote or is_pyannote_ready(models, DIARIZATION_MODEL_ID)
+        print(f"GigaAM: {'SKIPPED' if args.skip_gigaam else ('READY' if gigaam_ok else 'MISSING')}")
+        print(f"Pyannote: {'SKIPPED' if args.skip_pyannote else ('READY' if pyannote_ok else 'MISSING')}")
+        if not gigaam_ok: raise RuntimeError("GigaAM RNNT offline verification failed")
+        if not pyannote_ok: raise RuntimeError("Pyannote Community-1 offline verification failed")
         return
-    if not args.skip_gigaam: warm_up_gigaam(models, force=args.force or args.repair)
-    if not args.skip_pyannote: download_pyannote(models, os.getenv("HF_TOKEN") or None, force=args.force or args.repair)
+    if not args.skip_gigaam:
+        print("Downloading GigaAM v3 E2E RNNT...")
+        warm_up_gigaam(models, force=args.force or args.repair)
+        print(f"GigaAM: READY ({gigaam_cache_dir(models)})")
+    if not args.skip_pyannote:
+        print("Downloading pyannote Community-1...")
+        target = download_pyannote(models, os.getenv("HF_TOKEN") or None, force=args.force or args.repair)
+        print(f"Pyannote: READY ({target})")
+    print("Verifying files...")
+    if not args.skip_gigaam and not is_gigaam_ready(models): raise RuntimeError("GigaAM RNNT offline verification failed after download")
+    if not args.skip_pyannote and not is_pyannote_ready(models, DIARIZATION_MODEL_ID): raise RuntimeError("Pyannote Community-1 offline verification failed after download")
+    print("All requested models are ready.")
 if __name__ == "__main__": main()
