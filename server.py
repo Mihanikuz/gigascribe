@@ -4,7 +4,7 @@ Features:
 - local username/password authentication with optional LDAP/AD bind;
 - per-user asynchronous transcription jobs;
 - live progress polling from the browser;
-- downloads for transcript, job log, original audio, and normalized WAV;
+- downloads for transcript, job log, original audio, and M4A/FLAC exports;
 - local-only model loading configured by environment variables.
 """
 
@@ -50,6 +50,12 @@ USER_DB = Path(os.getenv("GIGASCRIBE_USERS_FILE", BASE_DIR / "users.json"))
 SECRET_KEY = os.getenv("GIGASCRIBE_SECRET_KEY", secrets.token_urlsafe(32))
 SECRET_KEY_CONFIGURED = bool(os.getenv("GIGASCRIBE_SECRET_KEY"))
 MAX_UPLOAD_BYTES = int(os.getenv("GIGASCRIBE_MAX_UPLOAD_BYTES", str(1024 * 1024 * 1024)))
+ORIGINAL_RETENTION_DAYS = int(os.getenv("GIGASCRIBE_ORIGINAL_RETENTION_DAYS", "14"))
+# Explicit allowlist of downloadable artefacts: WAV is deliberately not
+# exposed here (it's only an internal intermediate for ASR), and the
+# download endpoint below rejects anything not in this mapping outright
+# rather than building a column name from the requested `kind`.
+DOWNLOAD_KINDS = {"transcript": "transcript_path", "log": "log_path", "original": "original_path", "m4a": "m4a_path", "flac": "flac_path"}
 for directory in (UPLOAD_DIR, RESULT_DIR, USER_DB.parent):
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -77,6 +83,8 @@ async def resume_persistent_queue() -> None:
     # placeholder password fails loudly in the container logs rather than as
     # an unexplained 500 the first time someone tries to log in.
     _load_users()
+    await asyncio.get_running_loop().run_in_executor(None, cleanup_expired_originals)
+    asyncio.create_task(periodic_original_cleanup())
     for row in job_store.list(active_only=True):
         if row["status"] == "queued": schedule_job(row["id"])
 
@@ -166,6 +174,38 @@ def ensure_inside_base(path: Path) -> Path:
     if not resolved.is_relative_to(BASE_DIR):
         raise HTTPException(status_code=400, detail="Invalid storage path")
     return resolved
+
+
+def cleanup_expired_originals() -> int:
+    """Delete uploaded originals older than ORIGINAL_RETENTION_DAYS.
+
+    Only the original upload is removed; transcript/log/M4A/FLAC and the job
+    row itself are untouched. Queued/running jobs are never touched.
+    """
+    if ORIGINAL_RETENTION_DAYS <= 0:
+        return 0
+    cutoff = time.time() - ORIGINAL_RETENTION_DAYS * 86400
+    deleted = 0
+    for job in job_store.list_deletable_originals(cutoff):
+        path = Path(job["original_path"])
+        try:
+            resolved = ensure_inside_base(path)
+        except HTTPException:
+            logger.warning("Refusing to delete original outside data dir job_id=%s path=%s", job["id"], path)
+            continue
+        resolved.unlink(missing_ok=True)
+        job_store.update(job["id"], original_path=None)
+        deleted += 1
+    if deleted:
+        logger.info("Deleted %d expired original upload(s) older than %d day(s)", deleted, ORIGINAL_RETENTION_DAYS)
+    return deleted
+
+
+async def periodic_original_cleanup() -> None:
+    loop = asyncio.get_running_loop()
+    while True:
+        await asyncio.sleep(24 * 3600)
+        await loop.run_in_executor(None, cleanup_expired_originals)
 
 
 def is_admin(username: str) -> bool:
@@ -330,8 +370,9 @@ async def run_job(job_id: str) -> None:
         if job_store.get(job_id)["cancel_requested"]:
             job_store.update(job_id,status="cancelled",finished_at=time.time(),message="Отменено"); return
         transcript = result_dir / f"{Path(job['filename']).stem}.txt"; transcript.write_text(result.full_text, encoding="utf-8")
-        wav=result_dir/"normalized.wav"
-        job_store.update(job_id,status="completed",finished_at=time.time(),progress=1,message="Готово",transcript_path=str(transcript),wav_path=str(wav) if wav.exists() else None,actual_device=str(processor.device),actual_models={"asr_model":snapshot.get("asr_model"),"diarization_model":snapshot.get("diarization_model")})
+        stem = Path(job['filename']).stem
+        wav=result_dir/"normalized.wav"; m4a=result_dir/f"{stem}.m4a"; flac=result_dir/f"{stem}.flac"
+        job_store.update(job_id,status="completed",finished_at=time.time(),progress=1,message="Готово",transcript_path=str(transcript),wav_path=str(wav) if wav.exists() else None,m4a_path=str(m4a) if m4a.exists() else None,flac_path=str(flac) if flac.exists() else None,actual_device=str(processor.device),actual_models={"asr_model":snapshot.get("asr_model"),"diarization_model":snapshot.get("diarization_model")})
     except asyncio.TimeoutError:
         job_store.update(job_id,status="failed",finished_at=time.time(),error="Job timed out",message="Превышено время выполнения")
     except Exception as exc:
@@ -371,6 +412,8 @@ async def retry_job(job_id: str, username: str = Depends(current_user)):
     if not job: raise HTTPException(404)
     if not can_control_job(job, username): raise HTTPException(403, detail="Only the job owner or an administrator can retry it")
     if job["status"] not in {"failed","cancelled"}: raise HTTPException(409, detail="Only failed or cancelled jobs can be retried")
+    if not job["original_path"] or not Path(job["original_path"]).exists():
+        raise HTTPException(410, detail="Исходный файл удалён по сроку хранения")
     try: job_store.retry(job_id)
     except ValueError as exc: raise HTTPException(409, detail=str(exc))
     # Preserve upload and log but retire other result artefacts: stale
@@ -387,16 +430,23 @@ async def retry_job(job_id: str, username: str = Depends(current_user)):
     return serialize_job(job_store.get(job_id))
 
 def serialize_job(job: dict[str, Any]) -> dict[str, Any]:
-    return {"id":job["id"],"owner":job["username"],"filename":job["filename"],"status":job["status"],"progress":job["progress"],"message":job["message"],"error":job["error"],"settings":job["settings_snapshot"],"requested_models":job["requested_models"],"requested_device":job["requested_device"],"actual_device":job["actual_device"],"actual_models":job["actual_models"],"attempts":job["attempts"],"correlation_id":job["correlation_id"],"downloads":{k:bool(job[f"{k}_path"]) for k in ("transcript","log","original","wav")}}
+    return {"id":job["id"],"owner":job["username"],"filename":job["filename"],"status":job["status"],"progress":job["progress"],"message":job["message"],"error":job["error"],"settings":job["settings_snapshot"],"requested_models":job["requested_models"],"requested_device":job["requested_device"],"actual_device":job["actual_device"],"actual_models":job["actual_models"],"attempts":job["attempts"],"correlation_id":job["correlation_id"],"downloads":{k:bool(job.get(col)) for k,col in DOWNLOAD_KINDS.items()}}
 
 @app.get("/api/jobs/{job_id}/download/{kind}")
 def download(job_id: str, kind: str, username: str = Depends(current_user)):
     # Transcription history (including downloads) is shared across users.
+    column = DOWNLOAD_KINDS.get(kind)
+    if not column: raise HTTPException(404)
     job=job_store.get(job_id)
     if not job: raise HTTPException(404)
-    path=job.get(f"{kind}_path")
-    if not path or not Path(path).exists(): raise HTTPException(404)
-    return FileResponse(path, filename=Path(path).name)
+    path=job.get(column)
+    if not path: raise HTTPException(404)
+    try:
+        resolved = ensure_inside_base(Path(path))
+    except HTTPException:
+        raise HTTPException(404)
+    if not resolved.exists(): raise HTTPException(404)
+    return FileResponse(resolved, filename=resolved.name)
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -611,7 +661,7 @@ INDEX_HTML = ("<!doctype html><meta charset='utf-8'><title>GigaScribe</title><st
 <script>
 function escapeHtml(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 const STATUS_LABELS={queued:'В очереди',running:'Обрабатывается',completed:'Готово',failed:'Ошибка',cancelled:'Отменено'};
-const DOWNLOAD_LABELS={transcript:'транскрипт',log:'лог',original:'оригинал',wav:'wav'};
+const DOWNLOAD_LABELS={transcript:'транскрипт',log:'лог',original:'оригинал',m4a:'M4A',flac:'FLAC'};
 let ME={username:null,is_admin:false};
 
 async function loadWhoAmI(){
@@ -650,7 +700,7 @@ function renderJob(j){
 async function refresh(){
   let r=await fetch('/api/jobs'); if(!r.ok) return;
   let js=await r.json();
-  document.getElementById('jobs').innerHTML=js.reverse().map(renderJob).join('')||"<p class='muted'>Пока нет ни одной транскрипции.</p>";
+  document.getElementById('jobs').innerHTML=js.map(renderJob).join('')||"<p class='muted'>Пока нет ни одной транскрипции.</p>";
 }
 
 async function cancelJob(id){await fetch(`/api/jobs/${id}/cancel`,{method:'POST'});refresh()}
