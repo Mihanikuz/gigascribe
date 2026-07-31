@@ -163,10 +163,11 @@ class JobStore:
         with self._connect() as db: return [dict(r) for r in db.execute("SELECT * FROM job_attempts WHERE job_id=? ORDER BY attempt", (job_id,))]
 
     def list_deletable_originals(self, cutoff: float) -> list[dict[str, Any]]:
-        """Jobs whose original upload is old enough to delete and not queued/running."""
+        """Jobs with a raw-audio artefact (original upload and/or the internal
+        normalized WAV) old enough to delete, that are not queued/running."""
         with self._connect() as db:
             rows = db.execute(
-                "SELECT * FROM jobs WHERE original_path IS NOT NULL AND created_at < ? AND status NOT IN ('queued','running')",
+                "SELECT * FROM jobs WHERE (original_path IS NOT NULL OR wav_path IS NOT NULL) AND created_at < ? AND status NOT IN ('queued','running')",
                 (cutoff,),
             )
             return [self._row(r) for r in rows]

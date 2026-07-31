@@ -87,6 +87,12 @@ async def resume_persistent_queue() -> None:
     asyncio.create_task(periodic_original_cleanup())
     for row in job_store.list(active_only=True):
         if row["status"] == "queued": schedule_job(row["id"])
+    if PROTOCOL_SERVICE is not None:
+        # Never leave a protocol job claiming to hold the GPU after a
+        # restart; the user must explicitly retry it.
+        resumed = await asyncio.get_running_loop().run_in_executor(None, PROTOCOL_SERVICE.resume_after_restart)
+        if resumed:
+            logger.info("Marked %d interrupted protocol job(s) as failed after restart", resumed)
 
 
 from job_store import JobStore
@@ -97,6 +103,27 @@ gpu_worker = giga_app.GPU_JOB_LOCK
 scheduled_jobs: set[str] = set()
 model_download_locks: dict[str, asyncio.Lock] = {}
 MODEL_MANAGER = giga_app.MODEL_MANAGER
+
+# --- Protocol (meeting-minutes LLM) module: fully optional and isolated.
+# The env var is checked with a plain string compare *before* importing
+# anything from protocol/, so protocol/ is genuinely never imported when
+# disabled -- a missing or broken protocol/ package cannot stop GigaScribe
+# from starting in that case. When enabled but broken, we log and degrade
+# to disabled rather than take down transcription with it.
+PROTOCOL_ENABLED = os.getenv("GIGASCRIBE_PROTOCOL_ENABLED", "0") == "1"
+PROTOCOL_SERVICE = None
+if PROTOCOL_ENABLED:
+    try:
+        from protocol import ProtocolConfig, ProtocolService
+        from protocol.store import ProtocolStore
+        _protocol_config = ProtocolConfig.from_env(data_dir=BASE_DIR, models_dir=MODELS_DIR)
+        _protocol_store = ProtocolStore(BASE_DIR / "jobs.sqlite3")
+        PROTOCOL_SERVICE = ProtocolService(config=_protocol_config, store=_protocol_store,
+                                            gpu_lock=gpu_worker, unload_asr=MODEL_MANAGER.unload_all)
+    except Exception:
+        logger.exception("Protocol module failed to initialize; continuing with it disabled")
+        PROTOCOL_ENABLED = False
+        PROTOCOL_SERVICE = None
 
 
 def _validate_password(password: str) -> None:
@@ -169,35 +196,47 @@ def safe_user_id(username: str) -> str:
     return f"user-{digest}"
 
 
-def ensure_inside_base(path: Path) -> Path:
+def ensure_inside(path: Path, base: Path) -> Path:
     resolved = path.resolve()
-    if not resolved.is_relative_to(BASE_DIR):
+    if not resolved.is_relative_to(base):
         raise HTTPException(status_code=400, detail="Invalid storage path")
     return resolved
 
 
-def cleanup_expired_originals() -> int:
-    """Delete uploaded originals older than ORIGINAL_RETENTION_DAYS.
+def ensure_inside_base(path: Path) -> Path:
+    return ensure_inside(path, BASE_DIR)
 
-    Only the original upload is removed; transcript/log/M4A/FLAC and the job
-    row itself are untouched. Queued/running jobs are never touched.
+
+def cleanup_expired_originals() -> int:
+    """Delete raw audio (uploaded original and the internal normalized WAV)
+    older than ORIGINAL_RETENTION_DAYS.
+
+    Only original_path/wav_path are removed; transcript/log/M4A/FLAC and the
+    job row itself are untouched. Queued/running jobs are never touched.
     """
     if ORIGINAL_RETENTION_DAYS <= 0:
         return 0
     cutoff = time.time() - ORIGINAL_RETENTION_DAYS * 86400
     deleted = 0
     for job in job_store.list_deletable_originals(cutoff):
-        path = Path(job["original_path"])
-        try:
-            resolved = ensure_inside_base(path)
-        except HTTPException:
-            logger.warning("Refusing to delete original outside data dir job_id=%s path=%s", job["id"], path)
+        changes: dict[str, Any] = {}
+        for column in ("original_path", "wav_path"):
+            raw = job.get(column)
+            if not raw:
+                continue
+            try:
+                resolved = ensure_inside_base(Path(raw))
+            except HTTPException:
+                logger.warning("Refusing to delete %s outside data dir job_id=%s path=%s", column, job["id"], raw)
+                continue
+            resolved.unlink(missing_ok=True)
+            changes[column] = None
+        if not changes:
             continue
-        resolved.unlink(missing_ok=True)
-        job_store.update(job["id"], original_path=None)
+        job_store.update(job["id"], **changes)
         deleted += 1
     if deleted:
-        logger.info("Deleted %d expired original upload(s) older than %d day(s)", deleted, ORIGINAL_RETENTION_DAYS)
+        logger.info("Cleaned raw audio for %d expired job(s) (original/normalized WAV) older than %d day(s)", deleted, ORIGINAL_RETENTION_DAYS)
     return deleted
 
 
@@ -429,8 +468,30 @@ async def retry_job(job_id: str, username: str = Depends(current_user)):
     schedule_job(job_id)
     return serialize_job(job_store.get(job_id))
 
+def _protocol_summary(job: dict[str, Any]) -> dict[str, Any]:
+    if not PROTOCOL_ENABLED or PROTOCOL_SERVICE is None:
+        return {"enabled": False}
+    latest = None
+    existing = PROTOCOL_SERVICE.store.list_protocol_jobs_for_job(job["id"])
+    if existing:
+        latest = existing[0]
+    return {
+        "enabled": True,
+        "can_create": job["status"] == "completed" and bool(job.get("transcript_path")),
+        "protocol_job_id": latest["id"] if latest else None,
+        "status": latest["status"] if latest else None,
+        "progress": latest["progress"] if latest else None,
+        "message": latest["message"] if latest else None,
+        "model_id": latest["model_id"] if latest else None,
+        "chunk_current": latest["chunk_current"] if latest else None,
+        "chunk_total": latest["chunk_total"] if latest else None,
+        "ready": bool(latest and latest["status"] == "completed"),
+        "failed": bool(latest and latest["status"] in ("failed", "cancelled")),
+    }
+
+
 def serialize_job(job: dict[str, Any]) -> dict[str, Any]:
-    return {"id":job["id"],"owner":job["username"],"filename":job["filename"],"status":job["status"],"progress":job["progress"],"message":job["message"],"error":job["error"],"settings":job["settings_snapshot"],"requested_models":job["requested_models"],"requested_device":job["requested_device"],"actual_device":job["actual_device"],"actual_models":job["actual_models"],"attempts":job["attempts"],"correlation_id":job["correlation_id"],"downloads":{k:bool(job.get(col)) for k,col in DOWNLOAD_KINDS.items()}}
+    return {"id":job["id"],"owner":job["username"],"filename":job["filename"],"status":job["status"],"progress":job["progress"],"message":job["message"],"error":job["error"],"settings":job["settings_snapshot"],"requested_models":job["requested_models"],"requested_device":job["requested_device"],"actual_device":job["actual_device"],"actual_models":job["actual_models"],"attempts":job["attempts"],"correlation_id":job["correlation_id"],"downloads":{k:bool(job.get(col)) for k,col in DOWNLOAD_KINDS.items()},"protocol":_protocol_summary(job)}
 
 @app.get("/api/jobs/{job_id}/download/{kind}")
 def download(job_id: str, kind: str, username: str = Depends(current_user)):
@@ -447,6 +508,132 @@ def download(job_id: str, kind: str, username: str = Depends(current_user)):
         raise HTTPException(404)
     if not resolved.exists(): raise HTTPException(404)
     return FileResponse(resolved, filename=resolved.name)
+
+
+def _require_protocol_enabled() -> None:
+    if not PROTOCOL_ENABLED or PROTOCOL_SERVICE is None:
+        raise HTTPException(404, detail="Protocol module is disabled")
+
+
+def _latest_completed_protocol(job_id: str) -> dict[str, Any] | None:
+    for p in PROTOCOL_SERVICE.store.list_protocol_jobs_for_job(job_id):
+        if p["status"] == "completed":
+            return p
+    return None
+
+
+def _resolved_protocol_path(path_str: str) -> Path:
+    try:
+        resolved = ensure_inside_base(Path(path_str))
+    except HTTPException:
+        raise HTTPException(404)
+    if not resolved.exists():
+        raise HTTPException(404)
+    return resolved
+
+
+@app.get("/api/protocol/status")
+def api_protocol_status(username: str = Depends(current_user)):
+    if not PROTOCOL_ENABLED or PROTOCOL_SERVICE is None:
+        return {"enabled": False, "has_installed_model": False, "active_model_id": None}
+    models = PROTOCOL_SERVICE.store.list_model_states()
+    return {
+        "enabled": True,
+        "has_installed_model": any(m["installed"] for m in models),
+        "active_model_id": PROTOCOL_SERVICE.store.active_model_id(),
+    }
+
+
+@app.post("/api/jobs/{job_id}/protocol")
+async def create_protocol(job_id: str, username: str = Depends(current_user)):
+    _require_protocol_enabled()
+    job = job_store.get(job_id)
+    if not job: raise HTTPException(404)
+    if not can_control_job(job, username): raise HTTPException(403, detail="Only the job owner or an administrator can create a protocol")
+    if job["status"] != "completed" or not job.get("transcript_path"):
+        raise HTTPException(409, detail="Transcript is not ready yet")
+    from protocol.schemas import ProtocolOptions
+    try:
+        result = await PROTOCOL_SERVICE.create_protocol(transcript_path=Path(job["transcript_path"]), job_id=job_id,
+                                                          username=username, options=ProtocolOptions())
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    except FileNotFoundError:
+        raise HTTPException(404, detail="Transcript file not found")
+    return {"protocol_job_id": result.protocol_job_id, "status": result.status}
+
+
+@app.post("/api/jobs/{job_id}/protocol/retry")
+async def retry_protocol(job_id: str, username: str = Depends(current_user)):
+    _require_protocol_enabled()
+    job = job_store.get(job_id)
+    if not job: raise HTTPException(404)
+    if not can_control_job(job, username): raise HTTPException(403, detail="Only the job owner or an administrator can retry it")
+    if not job.get("transcript_path"):
+        raise HTTPException(409, detail="Transcript is not ready yet")
+    existing = PROTOCOL_SERVICE.store.list_protocol_jobs_for_job(job_id)
+    if not existing: raise HTTPException(404, detail="No protocol job to retry")
+    try:
+        result = await PROTOCOL_SERVICE.retry(existing[0]["id"], Path(job["transcript_path"]), job_id)
+    except ValueError as exc:
+        raise HTTPException(409, detail=str(exc))
+    return {"protocol_job_id": result.protocol_job_id, "status": result.status}
+
+
+@app.post("/api/jobs/{job_id}/protocol/cancel")
+def cancel_protocol(job_id: str, username: str = Depends(current_user)):
+    _require_protocol_enabled()
+    job = job_store.get(job_id)
+    if not job: raise HTTPException(404)
+    if not can_control_job(job, username): raise HTTPException(403)
+    existing = PROTOCOL_SERVICE.store.list_protocol_jobs_for_job(job_id)
+    if not existing: raise HTTPException(404)
+    PROTOCOL_SERVICE.request_cancel(existing[0]["id"])
+    return {"ok": True}
+
+
+@app.get("/api/jobs/{job_id}/protocol/status")
+def protocol_job_status(job_id: str, username: str = Depends(current_user)):
+    _require_protocol_enabled()
+    job = job_store.get(job_id)
+    if not job: raise HTTPException(404)
+    return _protocol_summary(job)
+
+
+@app.get("/api/jobs/{job_id}/protocol", response_class=HTMLResponse)
+def view_protocol(job_id: str, username: str = Depends(current_user)):
+    _require_protocol_enabled()
+    job = job_store.get(job_id)
+    if not job: raise HTTPException(404)
+    completed = _latest_completed_protocol(job_id)
+    if not completed or not completed.get("html_path"):
+        raise HTTPException(404, detail="Protocol is not ready")
+    resolved = _resolved_protocol_path(completed["html_path"])
+    return HTMLResponse(resolved.read_text(encoding="utf-8"))
+
+
+@app.get("/api/jobs/{job_id}/protocol.json")
+def download_protocol_json(job_id: str, username: str = Depends(current_user)):
+    _require_protocol_enabled()
+    job = job_store.get(job_id)
+    if not job: raise HTTPException(404)
+    completed = _latest_completed_protocol(job_id)
+    if not completed or not completed.get("json_path"):
+        raise HTTPException(404)
+    resolved = _resolved_protocol_path(completed["json_path"])
+    return FileResponse(resolved, filename=resolved.name, media_type="application/json")
+
+
+@app.get("/api/jobs/{job_id}/protocol.html")
+def download_protocol_html(job_id: str, username: str = Depends(current_user)):
+    _require_protocol_enabled()
+    job = job_store.get(job_id)
+    if not job: raise HTTPException(404)
+    completed = _latest_completed_protocol(job_id)
+    if not completed or not completed.get("html_path"):
+        raise HTTPException(404)
+    resolved = _resolved_protocol_path(completed["html_path"])
+    return FileResponse(resolved, filename=resolved.name, media_type="text/html")
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -593,6 +780,262 @@ def api_system_gpu(username: str = Depends(current_user)):
     from system_info import gpu_info
     return gpu_info(real_test=True)
 
+
+# ---------------------------------------------------------------------
+# Protocol admin API (models, prompts, glossary, settings, history).
+# Every handler starts with _require_protocol_enabled(); none of this is
+# reachable, and none of it is registered against real protocol state,
+# when the module is disabled.
+# ---------------------------------------------------------------------
+
+@app.get("/api/protocol/models")
+def api_protocol_models(admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    return {"models": PROTOCOL_SERVICE.store.list_model_states(), "active_model_id": PROTOCOL_SERVICE.store.active_model_id()}
+
+
+@app.post("/api/protocol/models/{model_id}/select")
+def api_protocol_select_model(model_id: str, admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    state = PROTOCOL_SERVICE.store.get_model_state(model_id)
+    if not state: raise HTTPException(404, detail="Unknown protocol model")
+    if not state.get("installed"): raise HTTPException(422, detail="Model is not installed")
+    PROTOCOL_SERVICE.store.set_active_model_id(model_id)
+    return {"ok": True, "active_model_id": model_id}
+
+
+@app.post("/api/protocol/models/{model_id}/params")
+def api_protocol_model_params(model_id: str, payload: dict[str, Any], admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    if not PROTOCOL_SERVICE.store.get_model_state(model_id): raise HTTPException(404)
+    allowed = {"repo_id", "filename", "context_length", "temperature", "max_output_tokens", "system_prompt_override"}
+    changes = {k: v for k, v in payload.items() if k in allowed}
+    if not changes: raise HTTPException(400, detail="No recognized parameters in payload")
+    return PROTOCOL_SERVICE.store.update_model_state(model_id, **changes)
+
+
+@app.post("/api/protocol/models/{model_id}/test")
+async def api_protocol_test_model(model_id: str, admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    state = PROTOCOL_SERVICE.store.get_model_state(model_id)
+    if not state: raise HTTPException(404)
+    if not state.get("installed"): raise HTTPException(422, detail="Model is not installed")
+    from protocol.providers import create_provider
+    provider = create_provider(engine=state["engine"], model_path=state["local_path"], context_length=state["context_length"])
+    try:
+        async with gpu_worker:
+            MODEL_MANAGER.unload_all()
+            await provider.load()
+            text = await provider.generate("Ответь одним словом: тест.", temperature=0.1, max_tokens=16)
+        ok = bool(text and text.strip())
+        PROTOCOL_SERVICE.store.update_model_state(model_id, last_check_status="ok" if ok else "empty_response", last_check_at=time.time())
+        return {"ok": ok, "sample": text[:200] if text else None}
+    except Exception as exc:
+        logger.exception("protocol model test failed model_id=%s", model_id)
+        PROTOCOL_SERVICE.store.update_model_state(model_id, last_check_status="failed", last_check_at=time.time())
+        return JSONResponse({"ok": False, "error": "Model test failed"}, status_code=422)
+    finally:
+        try: await provider.unload()
+        except Exception: pass
+
+
+@app.delete("/api/protocol/models/{model_id}")
+def api_protocol_delete_model(model_id: str, admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    state = PROTOCOL_SERVICE.store.get_model_state(model_id)
+    if not state: raise HTTPException(404)
+    if state.get("local_path"):
+        path = Path(state["local_path"])
+        try:
+            resolved = ensure_inside(path, PROTOCOL_SERVICE.config.models_dir)
+            if resolved.is_file(): resolved.unlink(missing_ok=True)
+            elif resolved.is_dir(): shutil.rmtree(resolved, ignore_errors=True)
+        except Exception:
+            logger.exception("failed to delete protocol model file model_id=%s", model_id)
+    PROTOCOL_SERVICE.store.update_model_state(model_id, local_path=None, installed=0, size_bytes=0,
+                                               last_check_status=None, last_check_at=None)
+    if PROTOCOL_SERVICE.store.active_model_id() == model_id:
+        PROTOCOL_SERVICE.store.set_setting("active_model_id", "")
+    return {"ok": True}
+
+
+@app.get("/api/protocol/prompts/{kind}")
+def api_protocol_get_prompt(kind: str, model_id: str | None = None, admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    from protocol.prompts import DEFAULT_PROMPTS
+    if kind not in DEFAULT_PROMPTS: raise HTTPException(404, detail="Unknown prompt kind")
+    active = PROTOCOL_SERVICE.store.get_active_prompt(kind, model_id)
+    history = PROTOCOL_SERVICE.store.list_prompt_history(kind, model_id)
+    return {"active": active.__dict__, "history": [h.__dict__ for h in history]}
+
+
+@app.post("/api/protocol/prompts/{kind}")
+def api_protocol_save_prompt(kind: str, payload: dict[str, Any], model_id: str | None = None, admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    from protocol.prompts import DEFAULT_PROMPTS, validate_prompt_content
+    if kind not in DEFAULT_PROMPTS: raise HTTPException(404, detail="Unknown prompt kind")
+    content = payload.get("content", "")
+    try:
+        validate_prompt_content(kind, content)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    spec = PROTOCOL_SERVICE.store.save_prompt_version(kind, content, model_id=model_id, updated_by=admin)
+    return spec.__dict__
+
+
+@app.post("/api/protocol/prompts/{kind}/restore-default")
+def api_protocol_restore_prompt(kind: str, model_id: str | None = None, admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    from protocol.prompts import DEFAULT_PROMPTS
+    if kind not in DEFAULT_PROMPTS: raise HTTPException(404, detail="Unknown prompt kind")
+    spec = PROTOCOL_SERVICE.store.restore_default_prompt(kind, model_id=model_id, updated_by=admin)
+    return spec.__dict__
+
+
+@app.post("/api/protocol/prompts/{kind}/preview")
+def api_protocol_preview_prompt(kind: str, payload: dict[str, Any], admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    from protocol.prompts import DEFAULT_PROMPTS, validate_prompt_content
+    if kind not in DEFAULT_PROMPTS: raise HTTPException(404, detail="Unknown prompt kind")
+    content = payload.get("content", "")
+    try:
+        validate_prompt_content(kind, content)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    if kind == "html_template":
+        from protocol.renderer import render_html
+        from protocol.schemas import ProtocolDocument
+        sample = ProtocolDocument(
+            meeting_title="Пример: синхрон команды", processed_at=time.strftime("%Y-%m-%d %H:%M"),
+            source_filename="example.mp3", duration_seconds=930, participants=("Спикер 1", "Спикер 2"),
+            summary="Пример резюме встречи для предпросмотра шаблона.", topics=("Пример темы",),
+            decisions=(), tasks=(), owners=(), deadlines=(), open_questions=(), risks=(),
+            disagreements=(), next_steps=(), unverified_items=(), timestamp_refs=(),
+            model_id="preview", prompt_versions={},
+        )
+        return {"preview_html": render_html(sample, template=content)}
+    return {"preview_text": content}
+
+
+@app.get("/api/protocol/glossary/terms")
+def api_glossary_list(scope: str | None = None, status: str | None = None, admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    terms = PROTOCOL_SERVICE.store.list_terms(scope=scope, status=status)
+    return {"terms": [t.__dict__ for t in terms]}
+
+
+@app.post("/api/protocol/glossary/terms")
+def api_glossary_add(payload: dict[str, Any], admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    from protocol.schemas import GlossaryTerm
+    if not payload.get("canonical"): raise HTTPException(400, detail="canonical is required")
+    term = PROTOCOL_SERVICE.store.add_term(GlossaryTerm(
+        id=None, canonical=payload["canonical"], aliases=tuple(payload.get("aliases") or ()),
+        category=payload.get("category", ""), context=payload.get("context", ""),
+        scope=payload.get("scope", "global"), project=payload.get("project"),
+        status=payload.get("status", "confirmed"),
+    ))
+    return term.__dict__
+
+
+@app.post("/api/protocol/glossary/terms/{term_id}/disable")
+def api_glossary_disable(term_id: int, admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    PROTOCOL_SERVICE.store.disable_term(term_id)
+    return {"ok": True}
+
+
+@app.post("/api/protocol/glossary/terms/merge")
+def api_glossary_merge(payload: dict[str, Any], admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    keep_id, remove_id = payload.get("keep_id"), payload.get("remove_id")
+    if not keep_id or not remove_id: raise HTTPException(400, detail="keep_id and remove_id are required")
+    PROTOCOL_SERVICE.store.merge_terms(keep_id, remove_id)
+    return {"ok": True}
+
+
+@app.get("/api/protocol/glossary/export")
+def api_glossary_export(format: str = "json", admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    from protocol import glossary as glossary_mod
+    terms = PROTOCOL_SERVICE.store.list_terms()
+    if format == "csv":
+        return JSONResponse({"content": glossary_mod.export_terms_csv(terms), "format": "csv"})
+    return JSONResponse({"content": glossary_mod.export_terms_json(terms), "format": "json"})
+
+
+@app.post("/api/protocol/glossary/import")
+def api_glossary_import(payload: dict[str, Any], admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    from protocol import glossary as glossary_mod
+    fmt, content = payload.get("format", "json"), payload.get("content", "")
+    try:
+        n = glossary_mod.import_terms_csv(PROTOCOL_SERVICE.store, content) if fmt == "csv" \
+            else glossary_mod.import_terms_json(PROTOCOL_SERVICE.store, content)
+    except Exception as exc:
+        raise HTTPException(400, detail=f"Import failed: {exc}")
+    return {"ok": True, "imported": n}
+
+
+@app.get("/api/protocol/glossary/suggestions")
+def api_glossary_suggestions(status: str = "proposed", admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    return {"suggestions": [s.__dict__ for s in PROTOCOL_SERVICE.store.list_suggestions(status)]}
+
+
+@app.post("/api/protocol/glossary/suggestions/{suggestion_id}/resolve")
+def api_glossary_resolve(suggestion_id: int, payload: dict[str, Any], admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    from protocol import glossary as glossary_mod
+    action = payload.get("action")
+    if action == "confirm":
+        suggestion = PROTOCOL_SERVICE.store.get_suggestion(suggestion_id)
+        if not suggestion: raise HTTPException(404)
+        term = glossary_mod.confirm_suggestion_as_term(
+            PROTOCOL_SERVICE.store, suggestion, resolved_by=admin,
+            scope=payload.get("scope", "global"), project=payload.get("project"),
+        )
+        return {"ok": True, "term": term.__dict__}
+    if action == "reject":
+        PROTOCOL_SERVICE.store.resolve_suggestion(suggestion_id, status="rejected", resolved_by=admin)
+        return {"ok": True}
+    raise HTTPException(400, detail="action must be 'confirm' or 'reject'")
+
+
+@app.get("/api/protocol/jobs")
+def api_protocol_job_history(admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    return {"jobs": PROTOCOL_SERVICE.store.list_all_protocol_jobs()}
+
+
+@app.get("/api/protocol/settings")
+def api_protocol_settings(admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    cfg = PROTOCOL_SERVICE.config
+    stored = PROTOCOL_SERVICE.store.all_settings()
+    defaults = {
+        "chunk_minutes": cfg.default_chunk_minutes, "chunk_overlap_seconds": cfg.chunk_overlap_seconds,
+        "topic_split_enabled": cfg.topic_split_enabled, "temperature": cfg.default_temperature,
+        "max_output_tokens": cfg.default_max_output_tokens, "max_retries": cfg.max_retries,
+        "glossary_suggestions_enabled": cfg.glossary_suggestions_enabled,
+        "default_glossary_scope": cfg.default_glossary_scope,
+    }
+    return {**defaults, **stored, "active_model_id": PROTOCOL_SERVICE.store.active_model_id()}
+
+
+@app.post("/api/protocol/settings")
+def api_protocol_save_settings(payload: dict[str, Any], admin: str = Depends(require_admin)):
+    _require_protocol_enabled()
+    allowed = {
+        "chunk_minutes", "chunk_overlap_seconds", "topic_split_enabled", "temperature",
+        "max_output_tokens", "max_retries", "glossary_suggestions_enabled", "default_glossary_scope", "engine",
+    }
+    for key, value in payload.items():
+        if key in allowed:
+            PROTOCOL_SERVICE.store.set_setting(key, str(value))
+    return {"ok": True}
+
+
 BASE_CSS = """
 :root{color-scheme:light dark}
 body{font-family:system-ui,-apple-system,sans-serif;max-width:960px;margin:24px auto;padding:0 16px;line-height:1.45}
@@ -662,13 +1105,20 @@ INDEX_HTML = ("<!doctype html><meta charset='utf-8'><title>GigaScribe</title><st
 function escapeHtml(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 const STATUS_LABELS={queued:'В очереди',running:'Обрабатывается',completed:'Готово',failed:'Ошибка',cancelled:'Отменено'};
 const DOWNLOAD_LABELS={transcript:'транскрипт',log:'лог',original:'оригинал',m4a:'M4A',flac:'FLAC'};
+const PROTOCOL_STATUS_LABELS={queued:'в очереди',waiting_for_gpu:'ожидание GPU',unloading_asr:'выгрузка ASR/диаризации',loading_llm:'загрузка модели',splitting:'разбиение на блоки',processing_chunks:'обработка блоков',merging:'сведение протокола',rendering:'формирование HTML',completed:'готово',failed:'ошибка',cancelled:'отменено'};
 let ME={username:null,is_admin:false};
+let PROTOCOL_STATUS={enabled:false,has_installed_model:false};
 
 async function loadWhoAmI(){
   let r=await fetch('/api/whoami'); if(!r.ok) return;
   ME=await r.json();
   document.getElementById('whoami').textContent='Вы вошли как: '+ME.username;
   if(ME.is_admin) document.getElementById('admin-link').style.display='';
+}
+
+async function loadProtocolStatus(){
+  let r=await fetch('/api/protocol/status'); if(!r.ok) return;
+  PROTOCOL_STATUS=await r.json();
 }
 
 async function loadModelsInfo(){
@@ -678,6 +1128,27 @@ async function loadModelsInfo(){
   let text='Диаризация: '+escapeHtml(diar?diar.label:m.settings.diarization_model);
   if(ME.is_admin) text+=' — изменить можно в администрировании';
   document.getElementById('diarization-info').textContent=text;
+}
+
+function renderProtocolSection(j, canControl){
+  let p=j.protocol;
+  if(!p||!p.enabled) return '';
+  if(p.ready){
+    return `<div class='row protocol-row'><a href='/api/jobs/${j.id}/protocol' target='_blank'>📄 Протокол</a></div>`;
+  }
+  if(p.status && !['completed','failed','cancelled'].includes(p.status)){
+    let label=PROTOCOL_STATUS_LABELS[p.status]||p.status;
+    let chunkInfo=(p.chunk_total)?` (блок ${p.chunk_current||0}/${p.chunk_total})`:'';
+    let pct=p.progress!=null?Math.round(p.progress*100)+'%':'';
+    return `<div class='muted protocol-row'>Протокол (${escapeHtml(p.model_id||'')}): ${label}${chunkInfo} ${pct}</div>`;
+  }
+  if(p.failed && canControl){
+    return `<div class='row protocol-row'><span class='err'>Протокол: ошибка</span><button onclick="retryProtocol('${j.id}')">Повторить протокол</button></div>`;
+  }
+  if(p.can_create && canControl && PROTOCOL_STATUS.has_installed_model){
+    return `<div class='row protocol-row'><button onclick="createProtocol('${j.id}')">Создать протокол</button></div>`;
+  }
+  return '';
 }
 
 function renderJob(j){
@@ -694,6 +1165,7 @@ function renderJob(j){
     <div class='muted'>${escapeHtml(j.message)}</div>
     ${j.error?`<div class='err'>${escapeHtml(j.error)}</div>`:''}
     <div class='row'><span>${downloads}</span><span class='actions'>${actions}</span></div>
+    ${renderProtocolSection(j, canControl)}
   </div>`;
 }
 
@@ -705,6 +1177,8 @@ async function refresh(){
 
 async function cancelJob(id){await fetch(`/api/jobs/${id}/cancel`,{method:'POST'});refresh()}
 async function retryJob(id){await fetch(`/api/jobs/${id}/retry`,{method:'POST'});refresh()}
+async function createProtocol(id){await fetch(`/api/jobs/${id}/protocol`,{method:'POST'});refresh()}
+async function retryProtocol(id){await fetch(`/api/jobs/${id}/protocol/retry`,{method:'POST'});refresh()}
 
 let poll=3000;
 async function tick(){await refresh();setTimeout(tick,document.hidden?10000:poll)}
@@ -744,7 +1218,7 @@ document.getElementById('up').onsubmit=function(e){
   xhr.send(fd);
 };
 
-(async()=>{ await loadWhoAmI(); await loadModelsInfo(); tick(); })();
+(async()=>{ await loadWhoAmI(); await loadModelsInfo(); await loadProtocolStatus(); tick(); })();
 </script>""")
 
 ADMIN_DENIED_HTML = ("<!doctype html><meta charset='utf-8'><title>GigaScribe — доступ запрещён</title><style>" + BASE_CSS +
@@ -753,7 +1227,275 @@ ADMIN_DENIED_HTML = ("<!doctype html><meta charset='utf-8'><title>GigaScribe —
                       "<p>Эта страница доступна только администратору.</p>"
                       "<p><a href='/'>На главную</a></p>")
 
+if PROTOCOL_ENABLED:
+    PROTOCOL_ADMIN_SECTION = """
+<section class='card' id='protocol-section'>
+  <h2>Протоколирование</h2>
+  <nav class='protocol-tabs'>
+    <button data-tab='p-models' class='tab-btn'>Модели</button>
+    <button data-tab='p-prompts' class='tab-btn'>Промпты</button>
+    <button data-tab='p-glossary' class='tab-btn'>Словарь</button>
+    <button data-tab='p-suggestions' class='tab-btn'>Предложения</button>
+    <button data-tab='p-history' class='tab-btn'>История</button>
+    <button data-tab='p-settings' class='tab-btn'>Настройки</button>
+  </nav>
+
+  <div id='p-models' class='tab-panel'>
+    <table><thead><tr><th>Модель</th><th>Движок</th><th>Статус</th><th>Активна</th><th>Размер</th><th></th></tr></thead><tbody id='protocol-models-body'></tbody></table>
+    <p class='muted'>Установка выполняется скриптом <code>scripts/download_protocol_model.py</code> (см. README) — здесь можно выбрать активную модель, проверить загрузку или удалить файлы.</p>
+    <p id='protocol-model-message' class='muted'></p>
+  </div>
+
+  <div id='p-prompts' class='tab-panel' style='display:none'>
+    <label>Промпт<select id='prompt-kind-select'>
+      <option value='chunk_analysis'>Анализ блока</option>
+      <option value='topic_split'>Тематическое разбиение</option>
+      <option value='merge'>Итоговое сведение</option>
+      <option value='fact_check'>Проверка фактов</option>
+      <option value='html_template'>Шаблон HTML-протокола</option>
+    </select></label>
+    <textarea id='prompt-content' rows='14' style='width:100%;font-family:monospace;font-size:.85em'></textarea>
+    <div class='actions'>
+      <button id='prompt-save' type='button'>Сохранить</button>
+      <button id='prompt-restore' type='button'>Вернуть значение по умолчанию</button>
+      <button id='prompt-preview' type='button'>Предпросмотр</button>
+    </div>
+    <p id='prompt-message' class='muted'></p>
+    <div id='prompt-preview-box'></div>
+  </div>
+
+  <div id='p-glossary' class='tab-panel' style='display:none'>
+    <table><thead><tr><th>Термин</th><th>Синонимы</th><th>Область</th><th>Статус</th><th></th></tr></thead><tbody id='glossary-body'></tbody></table>
+    <h3>Добавить термин</h3>
+    <form id='glossary-form'>
+      <label>Канонический термин<input name='canonical' required></label>
+      <label>Синонимы (через запятую)<input name='aliases' placeholder='постгрес, постгресс'></label>
+      <label>Область<select name='scope'><option value='global'>Общий словарь</option><option value='department'>Подразделение</option><option value='project'>Проект</option><option value='job'>Задание</option></select></label>
+      <button type='submit'>Добавить</button>
+    </form>
+    <div class='actions'>
+      <button id='glossary-export-json' type='button'>Экспорт JSON</button>
+      <button id='glossary-export-csv' type='button'>Экспорт CSV</button>
+    </div>
+    <form id='glossary-import-form'>
+      <label>Импорт (JSON или CSV, как при экспорте)<textarea name='content' rows='4' style='width:100%'></textarea></label>
+      <label><input type='radio' name='format' value='json' checked> JSON</label>
+      <label><input type='radio' name='format' value='csv'> CSV</label>
+      <button type='submit'>Импортировать</button>
+    </form>
+    <p id='glossary-message' class='muted'></p>
+  </div>
+
+  <div id='p-suggestions' class='tab-panel' style='display:none'>
+    <p class='muted'>Предложения из пользовательских исправлений и от модели. Ничего не применяется глобально без подтверждения.</p>
+    <table><thead><tr><th>Источник</th><th>Было</th><th>Стало</th><th>Уверенность</th><th></th></tr></thead><tbody id='suggestions-body'></tbody></table>
+  </div>
+
+  <div id='p-history' class='tab-panel' style='display:none'>
+    <table><thead><tr><th>ID задания</th><th>Статус</th><th>Модель</th><th>Блок</th><th>Создано</th></tr></thead><tbody id='protocol-history-body'></tbody></table>
+  </div>
+
+  <div id='p-settings' class='tab-panel' style='display:none'>
+    <form id='protocol-settings-form'>
+      <label>Размер блока, минут (10–15)<input type='number' name='chunk_minutes' min='10' max='15' step='1'></label>
+      <label>Перекрытие блоков, секунд<input type='number' name='chunk_overlap_seconds' min='0'></label>
+      <label><input type='checkbox' name='topic_split_enabled'> Сначала пробовать тематическое разбиение</label>
+      <label>Температура<input type='number' name='temperature' min='0' max='2' step='0.1'></label>
+      <label>Максимум выходных токенов<input type='number' name='max_output_tokens' min='256'></label>
+      <label>Повторов при невалидном JSON<input type='number' name='max_retries' min='0' max='5'></label>
+      <label><input type='checkbox' name='glossary_suggestions_enabled'> Принимать предложения терминов от модели</label>
+      <label>Область словаря по умолчанию<select name='default_glossary_scope'><option value='global'>Общий</option><option value='department'>Подразделение</option><option value='project'>Проект</option></select></label>
+      <button type='submit'>Сохранить настройки</button>
+    </form>
+    <p id='protocol-settings-message' class='muted'></p>
+  </div>
+</section>
+"""
+    PROTOCOL_ADMIN_SCRIPT = """
+function showProtocolTab(name){
+  document.querySelectorAll('.tab-panel').forEach(el=>el.style.display=(el.id===name?'':'none'));
+  document.querySelectorAll('.tab-btn').forEach(el=>el.classList.toggle('active', el.dataset.tab===name));
+}
+document.querySelectorAll('.tab-btn').forEach(btn=>btn.onclick=()=>showProtocolTab(btn.dataset.tab));
+showProtocolTab('p-models');
+
+async function loadProtocolModels(){
+  let body=document.getElementById('protocol-models-body');
+  let r=await fetch('/api/protocol/models'); if(!r.ok) return;
+  let data=await r.json();
+  let selectEl=document.getElementById('setting-active-model');
+  body.innerHTML=data.models.map(m=>{
+    let active=m.id===data.active_model_id;
+    return `<tr>
+      <td>${escapeHtml(m.label)}</td>
+      <td>${escapeHtml(m.engine)}</td>
+      <td>${m.installed?"<span class='badge completed'>установлена</span>":"<span class='badge failed'>не установлена</span>"}${m.last_check_status?` <span class='muted'>(${escapeHtml(m.last_check_status)})</span>`:''}</td>
+      <td>${active?'✅':(m.installed?`<button data-select-protocol="${escapeAttr(m.id)}" class='select-protocol-model'>Выбрать</button>`:'—')}</td>
+      <td>${fmtSize(m.size_bytes)}</td>
+      <td class='actions'>${m.installed?`<button data-test-protocol="${escapeAttr(m.id)}" class='test-protocol-model'>Тест</button> <button data-delete-protocol="${escapeAttr(m.id)}" class='delete-protocol-model'>Удалить</button>`:''}</td>
+    </tr>`;
+  }).join('');
+  body.querySelectorAll('.select-protocol-model').forEach(b=>b.onclick=()=>selectProtocolModel(b.dataset.selectProtocol));
+  body.querySelectorAll('.test-protocol-model').forEach(b=>b.onclick=()=>testProtocolModel(b.dataset.testProtocol));
+  body.querySelectorAll('.delete-protocol-model').forEach(b=>b.onclick=()=>deleteProtocolModel(b.dataset.deleteProtocol));
+}
+async function selectProtocolModel(id){
+  let msg=document.getElementById('protocol-model-message');
+  let r=await fetch(`/api/protocol/models/${id}/select`, {method:'POST'});
+  let d=await r.json().catch(()=>({}));
+  msg.textContent=r.ok?'Активная модель сохранена':('Ошибка: '+(d.detail||r.status));
+  loadProtocolModels();
+}
+async function testProtocolModel(id){
+  let msg=document.getElementById('protocol-model-message');
+  msg.textContent='Тестируем '+id+'… (модели транскрибации будут временно выгружены)';
+  let r=await fetch(`/api/protocol/models/${id}/test`, {method:'POST'});
+  let d=await r.json().catch(()=>({}));
+  msg.textContent=(r.ok&&d.ok)?('Модель '+id+': тест пройден. Ответ: '+(d.sample||'')):('Модель '+id+': тест не пройден');
+  loadProtocolModels();
+}
+async function deleteProtocolModel(id){
+  if(!confirm('Удалить файлы модели '+id+'?')) return;
+  await fetch(`/api/protocol/models/${id}`, {method:'DELETE'});
+  loadProtocolModels();
+}
+
+const PROMPT_KIND_VARS={chunk_analysis:'{transcript_chunk}',topic_split:'{transcript}',merge:'{chunk_analyses}',fact_check:'{document} и {transcript}',html_template:'$body (можно также $title)'};
+async function loadPrompt(){
+  let kind=document.getElementById('prompt-kind-select').value;
+  let r=await fetch(`/api/protocol/prompts/${kind}`); if(!r.ok) return;
+  let d=await r.json();
+  document.getElementById('prompt-content').value=d.active.content;
+  document.getElementById('prompt-message').textContent=`Версия ${d.active.version}${d.active.is_default?' (по умолчанию)':''}. Обязательная переменная: ${PROMPT_KIND_VARS[kind]}`;
+  document.getElementById('prompt-preview-box').innerHTML='';
+}
+document.getElementById('prompt-kind-select').onchange=loadPrompt;
+document.getElementById('prompt-save').onclick=async()=>{
+  let kind=document.getElementById('prompt-kind-select').value;
+  let content=document.getElementById('prompt-content').value;
+  let r=await fetch(`/api/protocol/prompts/${kind}`, {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({content})});
+  let d=await r.json().catch(()=>({}));
+  document.getElementById('prompt-message').textContent=r.ok?`Сохранено как версия ${d.version}`:('Ошибка: '+(d.detail||r.status));
+};
+document.getElementById('prompt-restore').onclick=async()=>{
+  let kind=document.getElementById('prompt-kind-select').value;
+  await fetch(`/api/protocol/prompts/${kind}/restore-default`, {method:'POST'});
+  loadPrompt();
+};
+document.getElementById('prompt-preview').onclick=async()=>{
+  let kind=document.getElementById('prompt-kind-select').value;
+  let content=document.getElementById('prompt-content').value;
+  let r=await fetch(`/api/protocol/prompts/${kind}/preview`, {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({content})});
+  let d=await r.json().catch(()=>({}));
+  if(!r.ok){ document.getElementById('prompt-message').textContent='Ошибка: '+(d.detail||r.status); return; }
+  document.getElementById('prompt-preview-box').innerHTML = d.preview_html
+    ? `<iframe style='width:100%;height:400px;border:1px solid #8884' srcdoc="${escapeAttr(d.preview_html)}"></iframe>`
+    : `<pre style='white-space:pre-wrap'>${escapeHtml(d.preview_text||'')}</pre>`;
+};
+
+async function loadGlossary(){
+  let body=document.getElementById('glossary-body');
+  let r=await fetch('/api/protocol/glossary/terms'); if(!r.ok) return;
+  let d=await r.json();
+  body.innerHTML=d.terms.map(t=>`<tr>
+    <td>${escapeHtml(t.canonical)}</td>
+    <td>${escapeHtml(t.aliases.join(', '))}</td>
+    <td>${escapeHtml(t.scope)}</td>
+    <td>${t.status==='confirmed'?"<span class='badge completed'>подтверждён</span>":"<span class='badge cancelled'>отключён</span>"}</td>
+    <td>${t.status==='confirmed'?`<button data-disable-term="${t.id}" class='disable-term'>Отключить</button>`:''}</td>
+  </tr>`).join('');
+  body.querySelectorAll('.disable-term').forEach(b=>b.onclick=async()=>{await fetch(`/api/protocol/glossary/terms/${b.dataset.disableTerm}/disable`,{method:'POST'});loadGlossary();});
+}
+document.getElementById('glossary-form').onsubmit=async(e)=>{
+  e.preventDefault();
+  let fd=new FormData(e.target);
+  let payload={canonical:fd.get('canonical'), aliases:(fd.get('aliases')||'').split(',').map(s=>s.trim()).filter(Boolean), scope:fd.get('scope')};
+  let r=await fetch('/api/protocol/glossary/terms', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(payload)});
+  document.getElementById('glossary-message').textContent=r.ok?'Термин добавлен':'Ошибка добавления';
+  if(r.ok){ e.target.reset(); loadGlossary(); }
+};
+document.getElementById('glossary-export-json').onclick=async()=>{
+  let r=await fetch('/api/protocol/glossary/export?format=json'); let d=await r.json();
+  navigator.clipboard?.writeText(d.content).catch(()=>{});
+  document.getElementById('glossary-message').textContent='JSON скопирован в буфер обмена ('+d.content.length+' симв.)';
+};
+document.getElementById('glossary-export-csv').onclick=async()=>{
+  let r=await fetch('/api/protocol/glossary/export?format=csv'); let d=await r.json();
+  navigator.clipboard?.writeText(d.content).catch(()=>{});
+  document.getElementById('glossary-message').textContent='CSV скопирован в буфер обмена ('+d.content.length+' симв.)';
+};
+document.getElementById('glossary-import-form').onsubmit=async(e)=>{
+  e.preventDefault();
+  let fd=new FormData(e.target);
+  let r=await fetch('/api/protocol/glossary/import', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({content:fd.get('content'), format:fd.get('format')})});
+  let d=await r.json().catch(()=>({}));
+  document.getElementById('glossary-message').textContent=r.ok?`Импортировано терминов: ${d.imported}`:('Ошибка: '+(d.detail||r.status));
+  if(r.ok) loadGlossary();
+};
+
+async function loadSuggestions(){
+  let body=document.getElementById('suggestions-body');
+  let r=await fetch('/api/protocol/glossary/suggestions?status=proposed'); if(!r.ok) return;
+  let d=await r.json();
+  body.innerHTML=d.suggestions.map(s=>`<tr>
+    <td>${escapeHtml(s.source)}</td><td>${escapeHtml(s.wrong_text)}</td><td>${escapeHtml(s.suggested_text)}</td>
+    <td>${(s.confidence*100).toFixed(0)}%</td>
+    <td class='actions'><button data-confirm="${s.id}">Подтвердить</button><button data-reject="${s.id}">Отклонить</button></td>
+  </tr>`).join('')||"<tr><td colspan='5' class='muted'>Нет новых предложений</td></tr>";
+  body.querySelectorAll('[data-confirm]').forEach(b=>b.onclick=async()=>{await fetch(`/api/protocol/glossary/suggestions/${b.dataset.confirm}/resolve`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'confirm'})});loadSuggestions();loadGlossary();});
+  body.querySelectorAll('[data-reject]').forEach(b=>b.onclick=async()=>{await fetch(`/api/protocol/glossary/suggestions/${b.dataset.reject}/resolve`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'reject'})});loadSuggestions();});
+}
+
+async function loadProtocolHistory(){
+  let body=document.getElementById('protocol-history-body');
+  let r=await fetch('/api/protocol/jobs'); if(!r.ok) return;
+  let d=await r.json();
+  body.innerHTML=d.jobs.map(j=>`<tr>
+    <td>${escapeHtml(j.job_id)}</td>
+    <td><span class='badge ${j.status==="completed"?"completed":(j.status==="failed"||j.status==="cancelled"?"failed":"running")}'>${escapeHtml(j.status)}</span></td>
+    <td>${escapeHtml(j.model_id||'')}</td>
+    <td>${j.chunk_total?`${j.chunk_current||0}/${j.chunk_total}`:'—'}</td>
+    <td>${new Date(j.created_at*1000).toLocaleString()}</td>
+  </tr>`).join('')||"<tr><td colspan='5' class='muted'>Заданий протоколирования ещё не было</td></tr>";
+}
+
+async function loadProtocolSettings(){
+  let r=await fetch('/api/protocol/settings'); if(!r.ok) return;
+  let s=await r.json();
+  let form=document.getElementById('protocol-settings-form');
+  for(let [k,v] of Object.entries(s)){
+    let el=form.elements[k]; if(!el) continue;
+    if(el.type==='checkbox') el.checked=(v===true||v==='true'); else el.value=v;
+  }
+}
+document.getElementById('protocol-settings-form').onsubmit=async(e)=>{
+  e.preventDefault();
+  let fd=new FormData(e.target);
+  let payload={};
+  for(let el of e.target.elements){
+    if(!el.name) continue;
+    payload[el.name]=el.type==='checkbox'?el.checked:el.value;
+  }
+  let r=await fetch('/api/protocol/settings', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(payload)});
+  document.getElementById('protocol-settings-message').textContent=r.ok?'Настройки сохранены':'Ошибка сохранения';
+};
+
+loadPrompt();
+loadProtocolModels();
+loadGlossary();
+loadSuggestions();
+loadProtocolHistory();
+loadProtocolSettings();
+"""
+else:
+    PROTOCOL_ADMIN_SECTION = ""
+    PROTOCOL_ADMIN_SCRIPT = ""
+
 ADMIN_HTML = ("<!doctype html><meta charset='utf-8'><title>GigaScribe — администрирование</title><style>" + BASE_CSS + """
+.protocol-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.tab-btn{padding:6px 12px;border-radius:6px;border:1px solid #8884;background:transparent;cursor:pointer;color:inherit}
+.tab-btn.active{background:#8882}
+.tab-panel textarea{font-family:monospace}
 </style>
 <header>
   <h1>⚙ GigaScribe — Администрирование</h1>
@@ -777,7 +1519,7 @@ ADMIN_HTML = ("<!doctype html><meta charset='utf-8'><title>GigaScribe — адм
   <table><thead><tr><th>Модель</th><th>Тип</th><th>Статус</th><th>Активна</th><th>Размер</th><th></th></tr></thead><tbody id='models-body'></tbody></table>
   <p id='model-message' class='muted'></p>
 </section>
-
+""" + PROTOCOL_ADMIN_SECTION + """
 <script>
 function escapeHtml(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function escapeAttr(s){return escapeHtml(s).replace(/`/g,'&#96;')}
@@ -857,4 +1599,4 @@ async function deleteModel(id){
 
 loadUsers();
 loadModels();
-</script>""")
+""" + PROTOCOL_ADMIN_SCRIPT + "</script>")
