@@ -26,9 +26,12 @@ def _login(client, username, password):
 
 
 def _make_job(job_id: str, username: str, status: str = "completed") -> None:
+    original_path = server.BASE_DIR / f"{job_id}-original.wav"
+    original_path.parent.mkdir(parents=True, exist_ok=True)
+    original_path.write_bytes(b"fake-audio")
     server.job_store.create(
         id=job_id, username=username, filename=f"{job_id}.wav",
-        original_path=f"/tmp/{job_id}.wav", log_path=f"/tmp/{job_id}.log",
+        original_path=str(original_path), log_path=f"/tmp/{job_id}.log",
         settings_snapshot={"asr_model": "gigaam-v3-e2e-rnnt", "diarization_model": "none", "device": "cuda"},
         message="Готово",
     )

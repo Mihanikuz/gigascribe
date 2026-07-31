@@ -260,6 +260,38 @@ class AudioProcessor:
             print(f"Ошибка конвертации: {e}")
             return False
 
+    def create_m4a(self, input_path: str, output_path: str) -> None:
+        """Экспорт аудиодорожки исходника в AAC/M4A (архивная копия)."""
+        if not os.path.exists(input_path):
+            raise FileNotFoundError(f"Входной файл не найден: {input_path}")
+        cmd = [
+            "ffmpeg", "-i", str(input_path),
+            "-vn", "-map", "a:0?",
+            "-c:a", "aac", "-b:a", "256k",
+            "-ar", "48000", "-ac", "1",
+            "-movflags", "+faststart",
+            "-y", str(output_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise RuntimeError(f"M4A_CREATION_FAILED: {result.stderr.strip()[-2000:]}")
+
+    def create_flac(self, input_path: str, output_path: str) -> None:
+        """Экспорт очищенной аудиодорожки исходника в FLAC (loudnorm + полосовой фильтр)."""
+        if not os.path.exists(input_path):
+            raise FileNotFoundError(f"Входной файл не найден: {input_path}")
+        cmd = [
+            "ffmpeg", "-i", str(input_path),
+            "-vn", "-map", "a:0?",
+            "-af", "loudnorm,highpass=f=80,lowpass=f=8000",
+            "-c:a", "flac", "-compression_level", "8",
+            "-ar", "16000", "-ac", "1",
+            "-y", str(output_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise RuntimeError(f"FLAC_CREATION_FAILED: {result.stderr.strip()[-2000:]}")
+
     def extract_audio_segment(self, input_path, output_path, start_time, duration):
         """Более надежное извлечение аудиосегментов"""
         try:
@@ -526,6 +558,14 @@ class AudioProcessor:
 
             if progress_callback:
                 progress_callback(0.9, f"Обработка {filename}: финализация...")
+
+            if artifacts_dir:
+                if progress_callback:
+                    progress_callback(0.95, f"Обработка {filename}: экспорт M4A/FLAC...")
+                os.makedirs(artifacts_dir, exist_ok=True)
+                stem = Path(filename).stem
+                await loop.run_in_executor(self.executor, self.create_m4a, file_path, os.path.join(artifacts_dir, f"{stem}.m4a"))
+                await loop.run_in_executor(self.executor, self.create_flac, file_path, os.path.join(artifacts_dir, f"{stem}.flac"))
 
             # Очищаем кэш после обработки файла
             self.memory_manager.clear_cache()

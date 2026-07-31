@@ -22,6 +22,7 @@ MUTABLE_COLUMNS = {
     "status", "progress", "message", "started_at", "finished_at", "error",
     "settings_snapshot", "actual_device", "actual_models", "requested_models",
     "requested_device", "transcript_path", "log_path", "original_path", "wav_path",
+    "m4a_path", "flac_path",
     "timeout_seconds", "attempts", "cancel_requested", "correlation_id",
 }
 
@@ -51,20 +52,25 @@ class JobStore:
               progress REAL NOT NULL DEFAULT 0, message TEXT, created_at REAL NOT NULL,
               started_at REAL, finished_at REAL, error TEXT, settings_snapshot TEXT NOT NULL,
               actual_device TEXT, actual_models TEXT, transcript_path TEXT, log_path TEXT,
-              original_path TEXT, wav_path TEXT, timeout_seconds INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
+              original_path TEXT, wav_path TEXT, m4a_path TEXT, flac_path TEXT,
+              timeout_seconds INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
               cancel_requested INTEGER NOT NULL DEFAULT 0, correlation_id TEXT,
               requested_models TEXT, requested_device TEXT)""")
             existing = {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
-            # Migration from the first persistent-queue release.
-            for col, typ in (("correlation_id", "TEXT"), ("requested_models", "TEXT"), ("requested_device", "TEXT")):
+            # Migration from the first persistent-queue release, plus the
+            # M4A/FLAC download columns added later.
+            for col, typ in (("correlation_id", "TEXT"), ("requested_models", "TEXT"), ("requested_device", "TEXT"), ("m4a_path", "TEXT"), ("flac_path", "TEXT")):
                 if col not in existing: db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
             db.execute("""CREATE TABLE IF NOT EXISTS job_attempts (
               id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL REFERENCES jobs(id),
               attempt INTEGER NOT NULL, status TEXT NOT NULL, started_at REAL, finished_at REAL,
-              error TEXT, transcript_path TEXT, wav_path TEXT, log_path TEXT)""")
+              error TEXT, transcript_path TEXT, wav_path TEXT, m4a_path TEXT, flac_path TEXT, log_path TEXT)""")
+            existing_attempts = {r[1] for r in db.execute("PRAGMA table_info(job_attempts)")}
+            for col, typ in (("m4a_path", "TEXT"), ("flac_path", "TEXT")):
+                if col not in existing_attempts: db.execute(f"ALTER TABLE job_attempts ADD COLUMN {col} {typ}")
             db.execute("CREATE INDEX IF NOT EXISTS jobs_user_created ON jobs(username, created_at DESC)")
             db.execute("CREATE INDEX IF NOT EXISTS jobs_claim ON jobs(status, created_at)")
-            db.execute("UPDATE schema_version SET version=2")
+            db.execute("UPDATE schema_version SET version=3")
 
     def _tx(self):
         db = self._connect(); db.execute("BEGIN IMMEDIATE"); return db
@@ -138,7 +144,7 @@ class JobStore:
             sql = ", ".join(f"{k}=?" for k in changes)
             db.execute(f"UPDATE jobs SET {sql} WHERE id=?", [*changes.values(), job_id])
             if changes.get("status") in TERMINAL:
-                db.execute("UPDATE job_attempts SET status=?, finished_at=?, error=?, transcript_path=?, wav_path=? WHERE job_id=? AND finished_at IS NULL", (changes["status"], changes.get("finished_at", time.time()), changes.get("error"), changes.get("transcript_path"), changes.get("wav_path"), job_id))
+                db.execute("UPDATE job_attempts SET status=?, finished_at=?, error=?, transcript_path=?, wav_path=?, m4a_path=?, flac_path=? WHERE job_id=? AND finished_at IS NULL", (changes["status"], changes.get("finished_at", time.time()), changes.get("error"), changes.get("transcript_path"), changes.get("wav_path"), changes.get("m4a_path"), changes.get("flac_path"), job_id))
             db.commit()
         except Exception: db.rollback(); raise
         finally: db.close()
@@ -151,10 +157,19 @@ class JobStore:
         if not job or job["status"] not in {"failed", "cancelled"}: raise ValueError("Only failed or cancelled jobs can be retried")
         # ``retry_limit`` counts retries in addition to the original attempt.
         if job["attempts"] > self.retry_limit: raise ValueError("Retry limit exceeded")
-        return self.update(job_id, status="queued", progress=0, message="В очереди", error=None, started_at=None, finished_at=None, cancel_requested=0, transcript_path=None, wav_path=None, actual_device=None, actual_models={})
+        return self.update(job_id, status="queued", progress=0, message="В очереди", error=None, started_at=None, finished_at=None, cancel_requested=0, transcript_path=None, wav_path=None, m4a_path=None, flac_path=None, actual_device=None, actual_models={})
 
     def attempts(self, job_id: str):
         with self._connect() as db: return [dict(r) for r in db.execute("SELECT * FROM job_attempts WHERE job_id=? ORDER BY attempt", (job_id,))]
+
+    def list_deletable_originals(self, cutoff: float) -> list[dict[str, Any]]:
+        """Jobs whose original upload is old enough to delete and not queued/running."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM jobs WHERE original_path IS NOT NULL AND created_at < ? AND status NOT IN ('queued','running')",
+                (cutoff,),
+            )
+            return [self._row(r) for r in rows]
 
     @staticmethod
     def _row(row):
