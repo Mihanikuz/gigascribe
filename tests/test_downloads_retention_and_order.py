@@ -188,60 +188,85 @@ def test_m4a_and_flac_downloadable_once_job_completed(client):
     assert client.get("/api/jobs/m4a-flac-ready/download/flac").content == b"flac-bytes"
 
 
-# 7-11. Original retention cleanup.
-def test_recent_original_is_not_deleted():
-    job = _make_job("retain-recent", created_at=time.time())
-    deleted = server.cleanup_expired_originals()
+def _with_wav(job_id: str) -> Path:
+    wav_path = server.BASE_DIR / "results" / job_id / "normalized.wav"
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
+    wav_path.write_bytes(b"fake-wav")
+    return wav_path
+
+
+# 7-11. Original (and normalized WAV) retention cleanup.
+def test_recent_original_and_wav_are_not_deleted():
+    wav_path = _with_wav("retain-recent")
+    job = _make_job("retain-recent", created_at=time.time(), extra={"wav_path": str(wav_path)})
+    server.cleanup_expired_originals()
     assert Path(job["original_path"]).exists()
+    assert wav_path.exists()
     refreshed = server.job_store.get("retain-recent")
     assert refreshed["original_path"] == job["original_path"]
+    assert refreshed["wav_path"] == str(wav_path)
 
 
-def test_old_original_is_deleted():
+def test_old_original_and_wav_are_deleted():
     old_ts = time.time() - (server.ORIGINAL_RETENTION_DAYS + 1) * 86400
-    job = _make_job("expire-old", created_at=old_ts)
-    assert Path(job["original_path"]).exists()
+    wav_path = _with_wav("expire-old")
+    job = _make_job("expire-old", created_at=old_ts, extra={"wav_path": str(wav_path)})
+    assert Path(job["original_path"]).exists() and wav_path.exists()
     server.cleanup_expired_originals()
     assert not Path(job["original_path"]).exists()
+    assert not wav_path.exists()
 
 
 def test_active_job_older_than_retention_is_not_deleted():
     old_ts = time.time() - (server.ORIGINAL_RETENTION_DAYS + 1) * 86400
-    job = _make_job("expire-but-running", status="queued", created_at=old_ts)
+    wav_path = _with_wav("expire-but-running")
+    job = _make_job("expire-but-running", status="queued", created_at=old_ts, extra={"wav_path": str(wav_path)})
     server.cleanup_expired_originals()
     assert Path(job["original_path"]).exists()
-    assert server.job_store.get("expire-but-running")["original_path"] == job["original_path"]
+    assert wav_path.exists()
+    refreshed = server.job_store.get("expire-but-running")
+    assert refreshed["original_path"] == job["original_path"]
+    assert refreshed["wav_path"] == str(wav_path)
 
 
-def test_cleanup_keeps_transcript_log_m4a_flac():
+def test_cleanup_keeps_transcript_log_m4a_flac_but_removes_wav():
     old_ts = time.time() - (server.ORIGINAL_RETENTION_DAYS + 1) * 86400
     result_dir = server.BASE_DIR / "results" / "expire-keep-artifacts"
     result_dir.mkdir(parents=True, exist_ok=True)
     transcript, m4a, flac = result_dir / "t.txt", result_dir / "t.m4a", result_dir / "t.flac"
     for p in (transcript, m4a, flac): p.write_bytes(b"x")
+    wav_path = _with_wav("expire-keep-artifacts")
     job = _make_job("expire-keep-artifacts", created_at=old_ts,
-                     extra={"transcript_path": str(transcript), "m4a_path": str(m4a), "flac_path": str(flac)})
+                     extra={"transcript_path": str(transcript), "m4a_path": str(m4a), "flac_path": str(flac), "wav_path": str(wav_path)})
     server.cleanup_expired_originals()
     assert transcript.exists() and m4a.exists() and flac.exists()
+    assert not wav_path.exists()
     refreshed = server.job_store.get("expire-keep-artifacts")
     assert refreshed["status"] != "queued"  # job row itself untouched/still present
     assert refreshed["transcript_path"] == str(transcript)
+    assert refreshed["wav_path"] is None
 
 
-def test_original_path_becomes_null_after_cleanup():
+def test_original_and_wav_path_become_null_after_cleanup():
     old_ts = time.time() - (server.ORIGINAL_RETENTION_DAYS + 1) * 86400
-    _make_job("expire-null-path", created_at=old_ts)
+    wav_path = _with_wav("expire-null-path")
+    _make_job("expire-null-path", created_at=old_ts, extra={"wav_path": str(wav_path)})
     server.cleanup_expired_originals()
-    assert server.job_store.get("expire-null-path")["original_path"] is None
+    refreshed = server.job_store.get("expire-null-path")
+    assert refreshed["original_path"] is None
+    assert refreshed["wav_path"] is None
 
 
-def test_cleanup_ignores_already_missing_file():
+def test_cleanup_ignores_already_missing_files():
     old_ts = time.time() - (server.ORIGINAL_RETENTION_DAYS + 1) * 86400
-    job = _make_job("expire-already-gone", created_at=old_ts, original_exists=False)
+    job = _make_job("expire-already-gone", created_at=old_ts, original_exists=False,
+                     extra={"wav_path": str(server.BASE_DIR / "results" / "expire-already-gone" / "normalized.wav")})
     Path(job["original_path"]).unlink(missing_ok=True)
-    # Should not raise even though the file is already gone.
+    # Neither file exists on disk; should not raise.
     server.cleanup_expired_originals()
-    assert server.job_store.get("expire-already-gone")["original_path"] is None
+    refreshed = server.job_store.get("expire-already-gone")
+    assert refreshed["original_path"] is None
+    assert refreshed["wav_path"] is None
 
 
 # 12. Retry without an original returns a clear error.

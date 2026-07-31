@@ -177,27 +177,35 @@ def ensure_inside_base(path: Path) -> Path:
 
 
 def cleanup_expired_originals() -> int:
-    """Delete uploaded originals older than ORIGINAL_RETENTION_DAYS.
+    """Delete raw audio (uploaded original and the internal normalized WAV)
+    older than ORIGINAL_RETENTION_DAYS.
 
-    Only the original upload is removed; transcript/log/M4A/FLAC and the job
-    row itself are untouched. Queued/running jobs are never touched.
+    Only original_path/wav_path are removed; transcript/log/M4A/FLAC and the
+    job row itself are untouched. Queued/running jobs are never touched.
     """
     if ORIGINAL_RETENTION_DAYS <= 0:
         return 0
     cutoff = time.time() - ORIGINAL_RETENTION_DAYS * 86400
     deleted = 0
     for job in job_store.list_deletable_originals(cutoff):
-        path = Path(job["original_path"])
-        try:
-            resolved = ensure_inside_base(path)
-        except HTTPException:
-            logger.warning("Refusing to delete original outside data dir job_id=%s path=%s", job["id"], path)
+        changes: dict[str, Any] = {}
+        for column in ("original_path", "wav_path"):
+            raw = job.get(column)
+            if not raw:
+                continue
+            try:
+                resolved = ensure_inside_base(Path(raw))
+            except HTTPException:
+                logger.warning("Refusing to delete %s outside data dir job_id=%s path=%s", column, job["id"], raw)
+                continue
+            resolved.unlink(missing_ok=True)
+            changes[column] = None
+        if not changes:
             continue
-        resolved.unlink(missing_ok=True)
-        job_store.update(job["id"], original_path=None)
+        job_store.update(job["id"], **changes)
         deleted += 1
     if deleted:
-        logger.info("Deleted %d expired original upload(s) older than %d day(s)", deleted, ORIGINAL_RETENTION_DAYS)
+        logger.info("Cleaned raw audio for %d expired job(s) (original/normalized WAV) older than %d day(s)", deleted, ORIGINAL_RETENTION_DAYS)
     return deleted
 
 
