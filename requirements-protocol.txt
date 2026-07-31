@@ -1,0 +1,16 @@
+# Optional dependencies for the protocol (meeting-minutes LLM) module.
+# NOT installed by default and NOT part of requirements-base.txt/requirements-models.txt:
+# install this file only if you set GIGASCRIBE_PROTOCOL_ENABLED=1.
+#
+#   pip install -r requirements-protocol.txt
+#
+# huggingface_hub is already a core dependency (requirements-models.txt) and
+# is reused by scripts/download_protocol_model.py; not repeated here.
+# The Ollama provider (protocol/providers/ollama.py) talks to an external
+# Ollama daemon over plain HTTP using `requests`, already a core dependency
+# -- nothing extra to install for that engine.
+
+# llama.cpp Python bindings (GGUF inference). For CUDA GPU offload, install
+# with the CUDA build flag instead of this plain line, e.g.:
+#   CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --no-cache-dir
+llama-cpp-python>=0.3.0
