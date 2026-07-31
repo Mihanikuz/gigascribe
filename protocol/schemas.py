@@ -8,6 +8,7 @@ validation rules.
 """
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
@@ -64,6 +65,9 @@ class DecisionItem:
     speaker: str = NOT_SPECIFIED
     timestamp: str = NOT_SPECIFIED
     confidence: float = 0.0
+    anchor: Optional[str] = None
+    verified: Optional[bool] = None
+    verification_reason: str = ""
 
     @classmethod
     def from_json(cls, raw: dict[str, Any]) -> "DecisionItem":
@@ -85,6 +89,9 @@ class TaskItem:
     speaker: str = NOT_SPECIFIED
     timestamp: str = NOT_SPECIFIED
     confidence: float = 0.0
+    anchor: Optional[str] = None
+    verified: Optional[bool] = None
+    verification_reason: str = ""
 
     @classmethod
     def from_json(cls, raw: dict[str, Any]) -> "TaskItem":
@@ -96,6 +103,34 @@ class TaskItem:
             deadline=str(raw.get("deadline") or NOT_SPECIFIED),
             speaker=str(raw.get("speaker") or NOT_SPECIFIED),
             timestamp=str(raw.get("timestamp") or NOT_SPECIFIED),
+            confidence=_clamp_confidence(raw.get("confidence")),
+        )
+
+
+@dataclass(frozen=True)
+class TermSuggestion:
+    """One glossary candidate proposed by the chunk-analysis LLM call.
+
+    Never applied automatically -- service.py turns qualifying entries into
+    `glossary_suggestions` rows with status "proposed" only.
+    """
+    detected: str
+    suggested: str
+    context: str = ""
+    timestamp: str = ""
+    confidence: float = 0.0
+
+    @classmethod
+    def from_json(cls, raw: dict[str, Any]) -> Optional["TermSuggestion"]:
+        if not isinstance(raw, dict):
+            return None
+        detected = str(raw.get("detected") or "").strip()
+        suggested = str(raw.get("suggested") or "").strip()
+        if not detected or not suggested:
+            return None
+        return cls(
+            detected=detected, suggested=suggested,
+            context=str(raw.get("context") or ""), timestamp=str(raw.get("timestamp") or ""),
             confidence=_clamp_confidence(raw.get("confidence")),
         )
 
@@ -119,12 +154,16 @@ class ChunkAnalysis:
     open_questions: tuple[str, ...] = ()
     risks: tuple[str, ...] = ()
     disagreements: tuple[str, ...] = ()
-    terms: tuple[str, ...] = ()
+    terms: tuple[TermSuggestion, ...] = ()
 
     @classmethod
     def from_llm_json(cls, chunk_index: int, raw: dict[str, Any]) -> "ChunkAnalysis":
         if not isinstance(raw, dict):
             raise ProtocolValidationError("chunk analysis must be a JSON object")
+        raw_terms = raw.get("terms") or []
+        if not isinstance(raw_terms, list):
+            raw_terms = []
+        terms = tuple(t for t in (TermSuggestion.from_json(r) for r in raw_terms) if t is not None)
         return cls(
             chunk_index=chunk_index,
             topic=str(raw.get("topic") or ""),
@@ -135,7 +174,7 @@ class ChunkAnalysis:
             open_questions=tuple(_as_str_list(raw.get("open_questions"))),
             risks=tuple(_as_str_list(raw.get("risks"))),
             disagreements=tuple(_as_str_list(raw.get("disagreements"))),
-            terms=tuple(_as_str_list(raw.get("terms"))),
+            terms=terms,
         )
 
 
@@ -147,6 +186,9 @@ class TimestampRef:
     timestamp: str
     speaker: str = NOT_SPECIFIED
     chunk_index: int = -1
+    anchor: str = ""
+    source_text: str = ""
+    element_type: str = "chunk"  # "chunk" | "decision" | "task"
 
 
 @dataclass(frozen=True)
@@ -170,10 +212,54 @@ class ProtocolDocument:
     timestamp_refs: tuple[TimestampRef, ...]
     model_id: str
     prompt_versions: dict[str, int]
+    # Reproducibility snapshot (item 11): everything needed to explain how
+    # this specific protocol was produced. Never includes secrets/tokens.
+    engine: str = ""
+    model_path: str = ""
+    context_length: int = 0
+    temperature: float = 0.0
+    max_output_tokens: int = 2048
+    chunking_settings: dict[str, Any] = field(default_factory=dict)
+    app_commit: str = ""
+    generated_at: float = 0.0
 
     def to_json_dict(self) -> dict[str, Any]:
         d = asdict(self)
         return d
+
+
+# --- fact-check (Stage between merge and final document) ----------------
+
+FACT_CHECK_TYPES = ("decision", "task")
+
+
+@dataclass(frozen=True)
+class FactCheckVerdict:
+    type: str
+    index: int
+    confirmed: bool
+    reason: str = ""
+    source_timestamp: str = ""
+    source_speaker: str = ""
+
+    @classmethod
+    def from_json(cls, raw: dict[str, Any]) -> Optional["FactCheckVerdict"]:
+        if not isinstance(raw, dict):
+            return None
+        t = str(raw.get("type") or "")
+        if t not in FACT_CHECK_TYPES:
+            return None
+        try:
+            index = int(raw.get("index"))
+        except (TypeError, ValueError):
+            return None
+        if index < 0:
+            return None
+        return cls(
+            type=t, index=index, confirmed=bool(raw.get("confirmed")),
+            reason=str(raw.get("reason") or ""), source_timestamp=str(raw.get("source_timestamp") or ""),
+            source_speaker=str(raw.get("source_speaker") or ""),
+        )
 
 
 @dataclass
@@ -183,9 +269,79 @@ class ProtocolOptions:
     topic_split: Optional[bool] = None
     temperature: Optional[float] = None
     max_output_tokens: Optional[int] = None
+    max_retries: Optional[int] = None
     glossary_project: Optional[str] = None
     glossary_scope: Optional[str] = None
     requested_by: Optional[str] = None
+
+
+ENGINES = ("llama_cpp", "ollama")
+
+
+@dataclass(frozen=True)
+class SettingsSnapshot:
+    """Everything a protocol job needs, frozen at creation time.
+
+    Built once by ProtocolService.create_protocol() from (in priority
+    order) the per-request options, the admin-tunable protocol_settings
+    table, the selected model's own parameters, and finally ProtocolConfig
+    defaults. Once written to protocol_jobs.settings_snapshot, later admin
+    changes can never affect an already-created job -- _run() reads only
+    this snapshot, never the live config/settings/model row again.
+    """
+    model_id: str
+    engine: str
+    model_path: str
+    context_length: int
+    temperature: float
+    max_output_tokens: int
+    chunk_minutes: float
+    chunk_overlap_seconds: float
+    topic_split_enabled: bool
+    max_retries: int
+    glossary_suggestions_enabled: bool
+    default_glossary_scope: str
+    glossary_project: Optional[str]
+    prompt_versions: dict[str, int]
+    created_at: float
+    ollama_url: Optional[str] = None
+    ollama_keep_alive: Optional[str] = None
+    n_gpu_layers: Optional[int] = None
+    extra_launch_params: dict[str, Any] = field(default_factory=dict)
+    app_commit: str = ""
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_json_dict(cls, d: dict[str, Any]) -> "SettingsSnapshot":
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+
+def validate_settings_snapshot(s: SettingsSnapshot) -> None:
+    """Raise ProtocolValidationError listing every violated bound at once."""
+    errors: list[str] = []
+    if not (10 <= s.chunk_minutes <= 15):
+        errors.append("chunk_minutes must be between 10 and 15")
+    if s.chunk_overlap_seconds < 0:
+        errors.append("chunk_overlap_seconds must be non-negative")
+    if not (0 <= s.temperature <= 2):
+        errors.append("temperature must be between 0 and 2")
+    if not (0 <= s.max_retries <= 5):
+        errors.append("max_retries must be between 0 and 5")
+    if not (isinstance(s.context_length, int) and s.context_length > 0):
+        errors.append("context_length must be a positive integer")
+    if not (isinstance(s.max_output_tokens, int) and s.max_output_tokens > 0):
+        errors.append("max_output_tokens must be a positive integer")
+    if s.default_glossary_scope not in GLOSSARY_SCOPES:
+        errors.append(f"default_glossary_scope must be one of {GLOSSARY_SCOPES}")
+    if s.engine not in ENGINES:
+        errors.append(f"engine must be one of {ENGINES}")
+    if not s.model_path:
+        errors.append("model is not configured (missing path/tag)")
+    if errors:
+        raise ProtocolValidationError("; ".join(errors))
 
 
 @dataclass
@@ -218,6 +374,16 @@ class ModelSpec:
     last_check_status: Optional[str] = None
     last_check_at: Optional[float] = None
     updated_at: Optional[float] = None
+    # Engine config (item 4): llama_cpp uses n_gpu_layers/extra_launch_params,
+    # ollama uses ollama_url/ollama_keep_alive. Both sets of fields exist on
+    # every model row; only the ones matching `engine` are actually used.
+    n_gpu_layers: int = -1
+    extra_launch_params: dict[str, Any] = field(default_factory=dict)
+    ollama_url: Optional[str] = None
+    ollama_keep_alive: Optional[str] = None
+    # Qwen3 GGUF builds emit <think>...</think> reasoning by default; item 5
+    # requires the final JSON/protocol never contain it.
+    no_think: bool = False
 
 
 PROMPT_KINDS = ("chunk_analysis", "topic_split", "merge", "fact_check", "html_template")
@@ -268,6 +434,8 @@ class GlossarySuggestion:
     job_id: Optional[str] = None
     status: str = "proposed"
     created_at: Optional[float] = None
+    chunk_index: Optional[int] = None
+    model_id: Optional[str] = None
 
 
 @dataclass

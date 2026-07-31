@@ -55,7 +55,7 @@ class ScriptedProvider(LLMProvider):
         self.load_calls += 1
         self.loaded = True
 
-    async def generate(self, prompt, *, temperature, max_tokens):
+    async def generate(self, prompt, *, temperature, max_tokens, system_prompt=None):
         self.generate_calls += 1
         if self._on_generate:
             self._on_generate(prompt)
@@ -65,6 +65,8 @@ class ScriptedProvider(LLMProvider):
             return '{"topics": []}'
         if "Результаты анализа фрагментов" in prompt:
             return self._merge_response
+        if "Проверь каждое решение" in prompt:
+            return '{"verified": [], "unverified_items": []}'
         return self._chunk_response
 
     async def unload(self):
@@ -86,15 +88,19 @@ def env(tmp_path, monkeypatch):
     # need the model installed before constructing the service under test.
     for spec in SUPPORTED_PROTOCOL_MODELS.values():
         store.seed_model(spec)
-    return {"data_dir": data_dir, "job_store": js, "config": config, "store": store}
+    return {"data_dir": data_dir, "models_dir": models_dir, "job_store": js, "config": config, "store": store}
 
 
-def _install_model(store: ProtocolStore, model_id: str = "qwen3-8b") -> None:
-    store.update_model_state(model_id, local_path="/fake/model.gguf", installed=1)
+def _install_model(store: ProtocolStore, models_dir: Path, model_id: str = "qwen3-8b") -> None:
+    # validate_engine_config() checks the GGUF path actually exists (item 4),
+    # so tests need a real (if empty) file rather than a made-up path.
+    gguf_path = models_dir / f"{model_id}.gguf"
+    gguf_path.write_bytes(b"fake-gguf")
+    store.update_model_state(model_id, local_path=str(gguf_path), installed=1)
     store.set_active_model_id(model_id)
 
 
-async def _wait_terminal(store: ProtocolStore, protocol_job_id: str, timeout: float = 5.0):
+async def _wait_terminal(store: ProtocolStore, protocol_job_id: str, timeout: float = 15.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
         job = store.get_protocol_job(protocol_job_id)
@@ -110,7 +116,7 @@ def test_create_protocol_requires_completed_transcript(env, monkeypatch, tmp_pat
     the service level by requiring a real, existing transcript file."""
     from protocol.service import ProtocolService
     monkeypatch.setattr(service_mod, "create_provider", lambda **k: ScriptedProvider())
-    _install_model(env["store"])
+    _install_model(env["store"], env["models_dir"])
     svc = ProtocolService(config=env["config"], store=env["store"], gpu_lock=asyncio.Lock(), unload_asr=lambda: None)
 
     async def run():
@@ -125,7 +131,7 @@ def test_asr_unloaded_before_llm_loaded_and_llm_unloaded_on_success(env, monkeyp
     from protocol.service import ProtocolService
     env["job_store"].create(id="job-1", username="alice", filename="m.wav", settings_snapshot={})
     transcript = env["data_dir"] / "t.txt"; _write_transcript(transcript)
-    _install_model(env["store"])
+    _install_model(env["store"], env["models_dir"])
 
     call_order = []
     provider = ScriptedProvider()
@@ -142,7 +148,7 @@ def test_asr_unloaded_before_llm_loaded_and_llm_unloaded_on_success(env, monkeyp
 
     async def run():
         result = await svc.create_protocol(transcript_path=transcript, job_id="job-1", username="alice",
-                                            options=ProtocolOptions(chunk_minutes=5))
+                                            options=ProtocolOptions(chunk_minutes=10))
         job = await _wait_terminal(env["store"], result.protocol_job_id)
         return job
 
@@ -159,7 +165,7 @@ def test_llm_unloaded_after_failure_and_transcription_job_untouched(env, monkeyp
     from protocol.service import ProtocolService
     env["job_store"].create(id="job-2", username="alice", filename="m.wav", settings_snapshot={})
     transcript = env["data_dir"] / "t.txt"; _write_transcript(transcript)
-    _install_model(env["store"])
+    _install_model(env["store"], env["models_dir"])
 
     provider = ScriptedProvider(always_bad=True)
     monkeypatch.setattr(service_mod, "create_provider", lambda **k: provider)
@@ -184,7 +190,7 @@ def test_gpu_mutual_exclusion_between_transcription_and_protocol(env, monkeypatc
     from protocol.service import ProtocolService
     env["job_store"].create(id="job-3", username="alice", filename="m.wav", settings_snapshot={})
     transcript = env["data_dir"] / "t.txt"; _write_transcript(transcript)
-    _install_model(env["store"])
+    _install_model(env["store"], env["models_dir"])
 
     gpu_lock = asyncio.Lock()
     active = {"n": 0}
@@ -208,7 +214,7 @@ def test_gpu_mutual_exclusion_between_transcription_and_protocol(env, monkeypatc
 
     async def run():
         result = await svc.create_protocol(transcript_path=transcript, job_id="job-3", username="alice",
-                                            options=ProtocolOptions(chunk_minutes=5))
+                                            options=ProtocolOptions(chunk_minutes=10))
         await asyncio.gather(fake_transcription(), fake_transcription())
         return await _wait_terminal(env["store"], result.protocol_job_id)
 
@@ -222,7 +228,7 @@ def test_duplicate_create_returns_existing_active_job(env, monkeypatch):
     from protocol.service import ProtocolService
     env["job_store"].create(id="job-4", username="alice", filename="m.wav", settings_snapshot={})
     transcript = env["data_dir"] / "t.txt"; _write_transcript(transcript)
-    _install_model(env["store"])
+    _install_model(env["store"], env["models_dir"])
     monkeypatch.setattr(service_mod, "create_provider", lambda **k: ScriptedProvider())
     svc = ProtocolService(config=env["config"], store=env["store"], gpu_lock=asyncio.Lock(), unload_asr=lambda: None)
 
@@ -240,7 +246,7 @@ def test_retry_after_failure_produces_a_completed_result(env, monkeypatch):
     from protocol.service import ProtocolService
     env["job_store"].create(id="job-5", username="alice", filename="m.wav", settings_snapshot={})
     transcript = env["data_dir"] / "t.txt"; _write_transcript(transcript)
-    _install_model(env["store"])
+    _install_model(env["store"], env["models_dir"])
 
     bad_provider = ScriptedProvider(always_bad=True)
     monkeypatch.setattr(service_mod, "create_provider", lambda **k: bad_provider)
@@ -269,7 +275,7 @@ def test_no_fabricated_owner_or_deadline_when_not_stated(env, monkeypatch):
     from protocol.service import ProtocolService
     env["job_store"].create(id="job-6", username="alice", filename="m.wav", settings_snapshot={})
     transcript = env["data_dir"] / "t.txt"; _write_transcript(transcript)
-    _install_model(env["store"])
+    _install_model(env["store"], env["models_dir"])
 
     merge_response = (
         '{"summary": "s", "topics": [], "decisions": [], '
@@ -284,7 +290,7 @@ def test_no_fabricated_owner_or_deadline_when_not_stated(env, monkeypatch):
 
     async def run():
         result = await svc.create_protocol(transcript_path=transcript, job_id="job-6", username="alice",
-                                            options=ProtocolOptions(chunk_minutes=5))
+                                            options=ProtocolOptions(chunk_minutes=10))
         return await _wait_terminal(env["store"], result.protocol_job_id)
 
     job = asyncio.run(run())
@@ -299,23 +305,33 @@ def test_no_fabricated_owner_or_deadline_when_not_stated(env, monkeypatch):
 
 
 def test_final_document_has_timestamp_refs_linking_to_source_chunks(env, monkeypatch):
-    """Item 15."""
+    """Item 15 / item 16: a decision with a timestamp that lands near a real
+    transcript segment gets a resolved anchor and an appendix entry."""
     from protocol.service import ProtocolService
     env["job_store"].create(id="job-7", username="alice", filename="m.wav", settings_snapshot={})
     transcript = env["data_dir"] / "t.txt"; _write_transcript(transcript, n_segments=200)
-    _install_model(env["store"])
-    monkeypatch.setattr(service_mod, "create_provider", lambda **k: ScriptedProvider())
+    _install_model(env["store"], env["models_dir"])
+    merge_response = (
+        '{"summary": "s", "topics": [], '
+        '"decisions": [{"text": "Перейти на новую версию", "speaker": "Спикер 1", "timestamp": "00:01", "confidence": 0.8}], '
+        '"tasks": [], "open_questions": [], "risks": [], "disagreements": [], "next_steps": [], "unverified_items": []}'
+    )
+    monkeypatch.setattr(service_mod, "create_provider", lambda **k: ScriptedProvider(merge_response=merge_response))
     svc = ProtocolService(config=env["config"], store=env["store"], gpu_lock=asyncio.Lock(), unload_asr=lambda: None)
 
     async def run():
         result = await svc.create_protocol(transcript_path=transcript, job_id="job-7", username="alice",
-                                            options=ProtocolOptions(chunk_minutes=5))
+                                            options=ProtocolOptions(chunk_minutes=10))
         return await _wait_terminal(env["store"], result.protocol_job_id)
 
     job = asyncio.run(run())
     assert job["status"] == "completed"
     res = env["store"].get_result(job["id"])
     assert res["document_json"]["timestamp_refs"], "final document must reference source timestamps"
+    ref = res["document_json"]["timestamp_refs"][0]
+    assert ref["anchor"]
+    decision = res["document_json"]["decisions"][0]
+    assert decision["anchor"] == ref["anchor"]
 
 
 def test_resume_after_restart_fails_stuck_jobs_without_relaunching(env):

@@ -33,7 +33,7 @@ class _RecordingProvider(LLMProvider):
     async def load(self):
         self.loaded = True
 
-    async def generate(self, prompt, *, temperature, max_tokens):
+    async def generate(self, prompt, *, temperature, max_tokens, system_prompt=None):
         self.calls += 1
         return self._responses[min(self.calls - 1, len(self._responses) - 1)]
 

@@ -16,12 +16,12 @@ SUPPORTED_PROTOCOL_MODELS: dict[str, ModelSpec] = {
     "qwen3-14b": ModelSpec(
         id="qwen3-14b", label="Qwen3-14B (Q4_K_M)", engine="llama_cpp",
         format="gguf", quantization="Q4_K_M", context_length=32768,
-        temperature=0.2, max_output_tokens=2048,
+        temperature=0.2, max_output_tokens=2048, no_think=True,
     ),
     "qwen3-8b": ModelSpec(
         id="qwen3-8b", label="Qwen3-8B (Q4_K_M)", engine="llama_cpp",
         format="gguf", quantization="Q4_K_M", context_length=32768,
-        temperature=0.2, max_output_tokens=2048,
+        temperature=0.2, max_output_tokens=2048, no_think=True,
     ),
     "gemma3-12b-it": ModelSpec(
         id="gemma3-12b-it", label="Gemma 3 12B IT (Q4_K_M)", engine="llama_cpp",

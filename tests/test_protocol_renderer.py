@@ -45,13 +45,26 @@ def test_unspecified_fields_render_as_not_specified_marker():
 
 
 def test_timestamp_appendix_links_match_decision_anchors():
+    """Item 8: a decision/task only links when it carries a real, resolved
+    anchor (produced by service.py's nearest-segment matching) -- the
+    renderer itself just has to make sure that link and that appendix row
+    always agree on the same anchor id."""
     doc = _doc(
-        decisions=(DecisionItem(text="X", speaker="И", timestamp="00:05:12", confidence=0.9),),
-        timestamp_refs=(TimestampRef(label="блок 1", timestamp="00:05:12", speaker="И", chunk_index=0),),
+        decisions=(DecisionItem(text="X", speaker="И", timestamp="00:05:12", confidence=0.9, anchor="timestamp-312-1"),),
+        timestamp_refs=(TimestampRef(label="X", timestamp="00:05:12", speaker="И", chunk_index=0,
+                                      anchor="timestamp-312-1", source_text="реплика", element_type="decision"),),
     )
     html_out = render_html(doc, template=TEMPLATE)
-    assert "id='t-00:05:12'" in html_out
-    assert "href='#t-00:05:12'" in html_out
+    assert "id='timestamp-312-1'" in html_out
+    assert "href='#timestamp-312-1'" in html_out
+
+
+def test_unresolved_timestamp_renders_as_plain_text_not_a_dead_link():
+    """Item 8/17: no anchor -> no link, just the raw timestamp text."""
+    doc = _doc(decisions=(DecisionItem(text="X", speaker="И", timestamp="99:59:59", confidence=0.9, anchor=None),))
+    html_out = render_html(doc, template=TEMPLATE)
+    assert "<a class='timestamp-link'" not in html_out
+    assert "99:59:59" in html_out
 
 
 def test_render_html_requires_body_placeholder():

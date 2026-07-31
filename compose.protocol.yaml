@@ -1,0 +1,16 @@
+---
+# Optional override: build/run GigaScribe with the protocol (meeting-minutes
+# LLM) module compiled in. Base compose.yaml is unaffected and stays usable
+# on its own -- this file only adds the extra build arg and env var:
+#
+#   docker compose -f compose.yaml -f compose.protocol.yaml build
+#   docker compose -f compose.yaml -f compose.protocol.yaml up -d
+#
+# No proxy settings here, same as compose.yaml.
+services:
+  gigascribe-gpu:
+    build:
+      args:
+        INSTALL_PROTOCOL: "1"
+    environment:
+      GIGASCRIBE_PROTOCOL_ENABLED: "1"

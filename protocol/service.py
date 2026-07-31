@@ -1,31 +1,35 @@
 """ProtocolService: the one stable entry point the main app calls.
 
-Owns the whole create-protocol pipeline (GPU handover, chunking, per-chunk
-analysis, merge, render) and never touches the main `jobs` table or raises
-in a way that could fail the caller's transcription job -- every error is
-caught, logged to protocol.log, and recorded on the protocol_jobs row only.
+Owns the whole create-protocol pipeline (settings snapshot, GPU handover,
+chunking, per-chunk analysis, merge, fact-check, render) and never touches
+the main `jobs` table or raises in a way that could fail the caller's
+transcription job -- every error is caught, logged to protocol.log, and
+recorded on the protocol_jobs row only.
 """
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import gc
 import json
 import logging
+import subprocess
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from . import glossary as glossary_mod
-from .chunking import choose_chunks, normalize_segments, parse_timestamp, parse_transcript
+from .chunking import choose_chunks, enforce_context_budget, normalize_segments, parse_timestamp, parse_transcript, split_by_time_windows
 from .config import ProtocolConfig
 from .models import SUPPORTED_PROTOCOL_MODELS
-from .providers import create_provider
+from .providers import create_provider, validate_engine_config
 from .providers.base import LLMProvider
 from .renderer import document_to_json_text, render_html
 from .schemas import (
-    ChunkAnalysis, DecisionItem, ProtocolDocument, ProtocolOptions, ProtocolResult,
-    ProtocolValidationError, TaskItem, TimestampRef, format_seconds,
+    PROMPT_KINDS, ChunkAnalysis, DecisionItem, FactCheckVerdict, NOT_SPECIFIED, ProtocolDocument, ProtocolOptions,
+    ProtocolResult, ProtocolValidationError, SettingsSnapshot, TaskItem, TimestampRef, TranscriptSegment,
+    format_seconds, validate_settings_snapshot,
 )
 from .store import ProtocolStore
 
@@ -34,9 +38,26 @@ logger = logging.getLogger(__name__)
 # unload_asr may be sync (ModelManager.unload_all) or async; both supported.
 UnloadCallable = Callable[[], Any]
 
+# Nearest-segment tolerance for linking a decision/task timestamp to a real
+# transcript moment (item 8): beyond this, the timestamp is shown as plain
+# text instead of a link and the item is flagged in unverified_items.
+_TIMESTAMP_MATCH_TOLERANCE_SECONDS = 30.0
+
 
 class ProtocolDisabledError(RuntimeError):
     pass
+
+
+def _get_app_commit() -> str:
+    try:
+        repo_root = Path(__file__).resolve().parent.parent
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=repo_root,
+                              capture_output=True, text=True, timeout=5)
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except Exception:
+        pass
+    return ""
 
 
 class ProtocolService:
@@ -46,6 +67,7 @@ class ProtocolService:
         self.store = store
         self.gpu_lock = gpu_lock
         self.unload_asr = unload_asr
+        self._app_commit = _get_app_commit()
         for spec in SUPPORTED_PROTOCOL_MODELS.values():
             self.store.seed_model(spec)
 
@@ -68,13 +90,18 @@ class ProtocolService:
         if not model_state or not model_state.get("installed"):
             raise ValueError(f"Protocol model is not installed: {model_id}")
 
+        snapshot, prompt_contents = self._build_settings_snapshot(options=options, model_id=model_id, model_state=model_state)
+        validate_settings_snapshot(snapshot)
+        validate_engine_config(engine=snapshot.engine, model_path=snapshot.model_path, ollama_url=snapshot.ollama_url)
+
         protocol_job_id = uuid.uuid4().hex
         result_dir = self.config.results_dir / job_id / protocol_job_id
         result_dir.mkdir(parents=True, exist_ok=True)
         log_path = result_dir / "protocol.log"
-        self.store.create_protocol_job(id=protocol_job_id, job_id=job_id, username=username, model_id=model_id)
+        self.store.create_protocol_job(id=protocol_job_id, job_id=job_id, username=username, model_id=model_id,
+                                        settings_snapshot=snapshot.to_json_dict())
         self.store.update_protocol_job(protocol_job_id, log_path=str(log_path))
-        asyncio.create_task(self._run(protocol_job_id, transcript_path, job_id, result_dir, options))
+        asyncio.create_task(self._run(protocol_job_id, transcript_path, job_id, result_dir, snapshot, prompt_contents))
         return ProtocolResult(protocol_job_id=protocol_job_id, status="queued", document=None,
                                json_path=None, html_path=None)
 
@@ -85,10 +112,18 @@ class ProtocolService:
         if job["status"] not in ("failed", "cancelled"):
             raise ValueError("Only a failed or cancelled protocol job can be retried")
         result_dir = Path(job["log_path"]).parent if job.get("log_path") else self.config.results_dir / job_id / protocol_job_id
+        # A retry replays the *original* settings snapshot -- an admin
+        # tweaking settings after this job was created must not change what
+        # a retry of it does, same as it can't change the job's first run.
+        snapshot = SettingsSnapshot.from_json_dict(job.get("settings_snapshot") or {})
+        prompt_contents = {
+            kind: (self.store.get_prompt_by_version(kind, snapshot.model_id, snapshot.prompt_versions.get(kind, 0))
+                   or self.store.get_active_prompt(kind, snapshot.model_id)).content
+            for kind in PROMPT_KINDS
+        }
         self.store.update_protocol_job(protocol_job_id, status="queued", progress=0, message="В очереди",
                                         error=None, cancel_requested=0, attempts=job["attempts"] + 1)
-        asyncio.create_task(self._run(protocol_job_id, transcript_path, job_id, result_dir,
-                                       ProtocolOptions(model_id=job.get("model_id"))))
+        asyncio.create_task(self._run(protocol_job_id, transcript_path, job_id, result_dir, snapshot, prompt_contents))
         return ProtocolResult(protocol_job_id=protocol_job_id, status="queued", document=None, json_path=None, html_path=None)
 
     def request_cancel(self, protocol_job_id: str) -> None:
@@ -109,10 +144,77 @@ class ProtocolService:
             resumed += 1
         return resumed
 
+    # ---- settings snapshot (item 1) ---------------------------------------
+
+    def _build_settings_snapshot(self, *, options: ProtocolOptions, model_id: str,
+                                  model_state: dict[str, Any]) -> tuple[SettingsSnapshot, dict[str, str]]:
+        """Priority: request options > protocol_settings (admin) > selected
+        model's own parameters > ProtocolConfig defaults. Frozen once here;
+        _run() never re-reads live config/settings/model rows again."""
+        stored = self.store.all_settings()
+        cfg = self.config
+
+        def _f(request_val, key, model_val, default_val) -> float:
+            if request_val is not None:
+                return float(request_val)
+            if stored.get(key) not in (None, ""):
+                try:
+                    return float(stored[key])
+                except (TypeError, ValueError):
+                    pass
+            if model_val is not None:
+                return float(model_val)
+            return float(default_val)
+
+        def _i(request_val, key, model_val, default_val) -> int:
+            return int(_f(request_val, key, model_val, default_val))
+
+        def _b(request_val, key, default_val) -> bool:
+            if request_val is not None:
+                return bool(request_val)
+            if key in stored and stored[key] not in (None, ""):
+                return str(stored[key]).strip().lower() in ("1", "true", "yes", "on")
+            return bool(default_val)
+
+        def _s(request_val, key, default_val) -> str:
+            if request_val:
+                return str(request_val)
+            if stored.get(key):
+                return str(stored[key])
+            return str(default_val)
+
+        engine = _s(None, "engine", model_state.get("engine") or "llama_cpp")
+        prompt_versions: dict[str, int] = {}
+        prompt_contents: dict[str, str] = {}
+        for kind in PROMPT_KINDS:
+            spec = self.store.get_active_prompt(kind, model_id)
+            prompt_versions[kind] = spec.version
+            prompt_contents[kind] = spec.content
+
+        snapshot = SettingsSnapshot(
+            model_id=model_id, engine=engine, model_path=model_state.get("local_path") or "",
+            context_length=_i(None, "context_length", model_state.get("context_length"), 8192),
+            temperature=_f(options.temperature, "temperature", model_state.get("temperature"), cfg.default_temperature),
+            max_output_tokens=_i(options.max_output_tokens, "max_output_tokens", model_state.get("max_output_tokens"),
+                                  cfg.default_max_output_tokens),
+            chunk_minutes=_f(options.chunk_minutes, "chunk_minutes", None, cfg.default_chunk_minutes),
+            chunk_overlap_seconds=_f(None, "chunk_overlap_seconds", None, cfg.chunk_overlap_seconds),
+            topic_split_enabled=_b(options.topic_split, "topic_split_enabled", cfg.topic_split_enabled),
+            max_retries=_i(options.max_retries, "max_retries", None, cfg.max_retries),
+            glossary_suggestions_enabled=_b(None, "glossary_suggestions_enabled", cfg.glossary_suggestions_enabled),
+            default_glossary_scope=_s(options.glossary_scope, "default_glossary_scope", cfg.default_glossary_scope),
+            glossary_project=options.glossary_project,
+            prompt_versions=prompt_versions, created_at=time.time(),
+            ollama_url=model_state.get("ollama_url"), ollama_keep_alive=model_state.get("ollama_keep_alive"),
+            n_gpu_layers=model_state.get("n_gpu_layers"), extra_launch_params=model_state.get("extra_launch_params") or {},
+            app_commit=self._app_commit,
+        )
+        return snapshot, prompt_contents
+
     # ---- pipeline ---------------------------------------------------------
 
     async def _run(self, protocol_job_id: str, transcript_path: Path, job_id: str,
-                    result_dir: Path, options: ProtocolOptions) -> None:
+                    result_dir: Path, snapshot: SettingsSnapshot, prompt_contents: dict[str, str]) -> None:
         log_path = result_dir / "protocol.log"
 
         def log(line: str) -> None:
@@ -130,13 +232,13 @@ class ProtocolService:
             job = self.store.get_protocol_job(protocol_job_id)
             return bool(job and job["cancel_requested"])
 
+        model_id = snapshot.model_id
+        temperature, max_tokens = snapshot.temperature, snapshot.max_output_tokens
+        no_think = bool(SUPPORTED_PROTOCOL_MODELS.get(model_id) and SUPPORTED_PROTOCOL_MODELS[model_id].no_think)
+
         provider: Optional[LLMProvider] = None
         try:
             set_status("queued", "В очереди", progress=0.0)
-            model_id = options.model_id or self.store.active_model_id()
-            model_state = self.store.get_model_state(model_id)
-            if not model_state or not model_state.get("installed"):
-                raise ProtocolValidationError(f"Model not installed: {model_id}")
 
             raw_transcript = transcript_path.read_text(encoding="utf-8")
             segments = parse_transcript(raw_transcript)
@@ -144,7 +246,7 @@ class ProtocolService:
             if not segments:
                 raise ProtocolValidationError("Transcript is empty after parsing")
 
-            glossary_terms = self.store.resolved_terms(project=options.glossary_project)
+            glossary_terms = self.store.resolved_terms(project=snapshot.glossary_project)
             corrected_text, corrections = glossary_mod.apply_safe_replacements(
                 raw_transcript, glossary_terms, job_id=job_id, store=self.store,
             )
@@ -164,29 +266,32 @@ class ProtocolService:
                 await self._unload_asr()
 
                 set_status("loading_llm", f"Загрузка модели {model_id}", progress=0.1)
-                provider = create_provider(engine=model_state["engine"], model_path=model_state["local_path"],
-                                            context_length=model_state["context_length"])
+                provider = create_provider(
+                    engine=snapshot.engine, model_path=snapshot.model_path, context_length=snapshot.context_length,
+                    n_gpu_layers=snapshot.n_gpu_layers, no_think=no_think, extra_launch_params=snapshot.extra_launch_params,
+                    ollama_url=snapshot.ollama_url, ollama_keep_alive=snapshot.ollama_keep_alive,
+                )
                 await provider.load()
-                log(f"Loaded provider engine={model_state['engine']} model={model_id}")
-
-                temperature = options.temperature if options.temperature is not None else model_state["temperature"]
-                max_tokens = options.max_output_tokens or model_state["max_output_tokens"]
+                log(f"Loaded provider engine={snapshot.engine} model={model_id}")
 
                 if cancelled():
                     set_status("cancelled", "Отменено"); return
 
                 set_status("splitting", "Разбиение на блоки", progress=0.15)
-                chunk_minutes = options.chunk_minutes or self.config.default_chunk_minutes
-                topic_split = self.config.topic_split_enabled if options.topic_split is None else options.topic_split
-                topic_boundaries = None
-                if topic_split:
-                    topic_boundaries = await self._try_topic_split(provider, segments, temperature=temperature,
-                                                                    max_tokens=max_tokens, log=log)
+                topic_boundaries, topic_hints = (None, {})
+                if snapshot.topic_split_enabled:
+                    topic_boundaries, topic_hints = await self._two_stage_topic_split(
+                        provider, segments, prompt_content=prompt_contents["topic_split"],
+                        chunk_minutes=snapshot.chunk_minutes, temperature=temperature, max_tokens=max_tokens,
+                        context_length=snapshot.context_length, log=log,
+                    )
                 chunks = choose_chunks(
                     segments, topic_boundaries=topic_boundaries,
-                    window_seconds=chunk_minutes * 60, overlap_seconds=self.config.chunk_overlap_seconds,
-                    context_length=model_state["context_length"],
+                    window_seconds=snapshot.chunk_minutes * 60, overlap_seconds=snapshot.chunk_overlap_seconds,
+                    context_length=snapshot.context_length,
                 )
+                if topic_boundaries and topic_hints:
+                    chunks = [dataclasses.replace(c, topic_hint=_nearest_hint(c.start, topic_hints)) for c in chunks]
                 if not chunks:
                     raise ProtocolValidationError("Chunking produced no chunks")
                 self.store.update_protocol_job(protocol_job_id, chunk_total=len(chunks), chunk_current=0)
@@ -197,38 +302,58 @@ class ProtocolService:
                 for chunk in chunks:
                     if cancelled():
                         set_status("cancelled", "Отменено"); return
-                    prompt_spec = self.store.get_active_prompt("chunk_analysis", model_id)
-                    prompt = prompt_spec.content.replace("{transcript_chunk}", chunk.to_prompt_text())
+                    prompt = prompt_contents["chunk_analysis"].replace("{transcript_chunk}", chunk.to_prompt_text())
                     raw = await provider.generate_json(prompt, temperature=temperature, max_tokens=max_tokens,
-                                                         max_retries=self.config.max_retries)
+                                                         max_retries=snapshot.max_retries)
                     analysis = ChunkAnalysis.from_llm_json(chunk.index, raw)
                     analyses.append(analysis)
+                    if snapshot.glossary_suggestions_enabled and analysis.terms:
+                        created = glossary_mod.propose_terms_from_chunk_analysis(
+                            self.store, terms=analysis.terms, job_id=job_id, chunk_index=chunk.index, model_id=model_id,
+                        )
+                        if created:
+                            log(f"Chunk {chunk.index}: {len(created)} glossary suggestion(s) proposed")
                     self.store.update_protocol_job(protocol_job_id, chunk_current=chunk.index + 1)
-                    progress = 0.2 + 0.5 * ((chunk.index + 1) / len(chunks))
+                    progress = 0.2 + 0.45 * ((chunk.index + 1) / len(chunks))
                     set_status("processing_chunks", f"Обработка блока {chunk.index + 1}/{len(chunks)}", progress=progress)
 
                 if cancelled():
                     set_status("cancelled", "Отменено"); return
 
-                set_status("merging", "Сведение итогового протокола", progress=0.75)
-                merge_prompt_spec = self.store.get_active_prompt("merge", model_id)
-                merge_prompt = merge_prompt_spec.content.replace(
+                set_status("merging", "Сведение итогового протокола", progress=0.68)
+                merge_prompt = prompt_contents["merge"].replace(
                     "{chunk_analyses}", json.dumps([_analysis_to_dict(a) for a in analyses], ensure_ascii=False),
                 )
                 merged_raw = await provider.generate_json(merge_prompt, temperature=temperature, max_tokens=max_tokens,
-                                                            max_retries=self.config.max_retries)
+                                                            max_retries=snapshot.max_retries)
+                if not isinstance(merged_raw, dict):
+                    raise ProtocolValidationError("merge response must be a JSON object")
+                raw_decisions = [DecisionItem.from_json(d) for d in (merged_raw.get("decisions") or []) if isinstance(d, dict)]
+                raw_tasks = [TaskItem.from_json(t) for t in (merged_raw.get("tasks") or []) if isinstance(t, dict)]
+
+                if cancelled():
+                    set_status("cancelled", "Отменено"); return
+
+                set_status("fact_checking", "Проверка фактов", progress=0.78)
+                fact_check_verdicts, fact_check_notes = await self._fact_check(
+                    provider, decisions=raw_decisions, tasks=raw_tasks, segments=segments,
+                    summary=str(merged_raw.get("summary") or ""), topics=merged_raw.get("topics") or [],
+                    prompt_content=prompt_contents["fact_check"], temperature=temperature, max_tokens=max_tokens,
+                    max_retries=snapshot.max_retries, context_length=snapshot.context_length, log=log,
+                )
+                # Any failure above (invalid JSON after every retry, provider
+                # error) propagates out of this try block: per item 2, a
+                # technical fact-check failure must fail the whole job rather
+                # than emit an unverified protocol as "ready".
 
                 document = _build_document(
                     merged_raw, segments=segments, chunks=chunks, source_filename=transcript_path.stem,
-                    model_id=model_id, prompt_versions={
-                        "chunk_analysis": self.store.get_active_prompt("chunk_analysis", model_id).version,
-                        "merge": merge_prompt_spec.version,
-                    },
+                    model_id=model_id, snapshot=snapshot, raw_decisions=raw_decisions, raw_tasks=raw_tasks,
+                    fact_check_verdicts=fact_check_verdicts, fact_check_notes=fact_check_notes,
                 )
 
                 set_status("rendering", "Формирование HTML", progress=0.9)
-                template_spec = self.store.get_active_prompt("html_template", model_id)
-                html_text = render_html(document, template=template_spec.content)
+                html_text = render_html(document, template=prompt_contents["html_template"])
                 json_text = document_to_json_text(document)
                 json_path = result_dir / "protocol.json"
                 html_path = result_dir / "protocol.html"
@@ -264,27 +389,142 @@ class ProtocolService:
         gc.collect()
         _empty_cuda_cache()
 
-    async def _try_topic_split(self, provider: LLMProvider, segments, *, temperature: float, max_tokens: int,
-                                log: Callable[[str], None]) -> Optional[list[float]]:
+    # ---- topic split (item 7): two stages so a long transcript is never
+    # sent to the model in one piece, yet the whole meeting is still
+    # considered for boundaries ----------------------------------------
+
+    async def _two_stage_topic_split(self, provider: LLMProvider, segments: list[TranscriptSegment], *,
+                                      prompt_content: str, chunk_minutes: float, temperature: float, max_tokens: int,
+                                      context_length: int, log: Callable[[str], None]
+                                      ) -> tuple[Optional[list[float]], dict[float, str]]:
+        if not segments:
+            return None, {}
         try:
-            prompt_spec = self.store.get_active_prompt("topic_split")
-            full_text = "\n".join(f"{s.speaker} [{format_seconds(s.start)}]: {s.text}" for s in segments)
-            prompt = prompt_spec.content.replace("{transcript}", full_text[:20000])
-            raw = await provider.generate_json(prompt, temperature=temperature, max_tokens=max_tokens, max_retries=1)
+            pre_blocks = split_by_time_windows(segments, window_seconds=chunk_minutes * 60, overlap_seconds=0)
+            pre_blocks = enforce_context_budget(pre_blocks, context_length=context_length)
+            hints: dict[float, str] = {}
+            for block in pre_blocks:
+                hint = ""
+                try:
+                    raw = await provider.generate_json(
+                        prompt_content.replace("{transcript}", block.to_prompt_text()),
+                        temperature=temperature, max_tokens=min(max_tokens, 512), max_retries=1,
+                    )
+                    topics = raw.get("topics") or []
+                    if topics and isinstance(topics[0], dict):
+                        hint = str(topics[0].get("title") or "")
+                except Exception:
+                    pass
+                hints[block.start] = hint
+
+            condensed = "\n".join(
+                f"{(b.segments[0].speaker if b.segments else '')} [{format_seconds(b.start)} - {format_seconds(b.end)}]: "
+                f"{hints.get(b.start) or '(тема не определена)'}"
+                for b in pre_blocks
+            )
+            raw = await provider.generate_json(prompt_content.replace("{transcript}", condensed),
+                                                temperature=temperature, max_tokens=max_tokens, max_retries=1)
             topics = raw.get("topics") or []
-            boundaries = []
+            boundaries: list[float] = []
             for t in topics:
+                if not isinstance(t, dict):
+                    continue
                 ts = t.get("start_timestamp")
-                if ts:
-                    boundaries.append(parse_timestamp(ts))
-            if len(boundaries) < 1:
+                if not ts:
+                    continue
+                try:
+                    v = parse_timestamp(str(ts))
+                except ValueError:
+                    continue
+                if v < segments[0].start or v > segments[-1].end:
+                    continue  # boundary must fall within the transcript's own range
+                boundaries.append(v)
+            boundaries = sorted(set(boundaries))
+            min_gap = max(60.0, chunk_minutes * 60 * 0.25)
+            deduped: list[float] = []
+            for b in boundaries:
+                if not deduped or b - deduped[-1] >= min_gap:
+                    deduped.append(b)
+            if not deduped:
                 log("Topic split: unreliable/empty, falling back to time windows")
-                return None
-            log(f"Topic split: {len(boundaries)} boundary(ies) found")
-            return boundaries
+                return None, {}
+            log(f"Topic split: {len(deduped)} boundary(ies) found across {len(pre_blocks)} pre-block(s)")
+            return deduped, hints
         except Exception as exc:
             log(f"Topic split failed ({exc}), falling back to time windows")
-            return None
+            return None, {}
+
+    # ---- fact-check (item 2) ------------------------------------------
+
+    async def _fact_check(self, provider: LLMProvider, *, decisions: list[DecisionItem], tasks: list[TaskItem],
+                           segments: list[TranscriptSegment], summary: str, topics: list[Any], prompt_content: str,
+                           temperature: float, max_tokens: int, max_retries: int, context_length: int,
+                           log: Callable[[str], None]) -> tuple[dict[tuple[str, int], FactCheckVerdict], list[str]]:
+        if not decisions and not tasks:
+            return {}, []
+        fact_check_doc = {
+            "summary": summary, "topics": topics,
+            "decisions": [{"index": i, **dataclasses.asdict(d)} for i, d in enumerate(decisions)],
+            "tasks": [{"index": i, **dataclasses.asdict(t)} for i, t in enumerate(tasks)],
+        }
+        transcript_text = _fit_transcript_for_fact_check(segments, decisions, tasks, context_length=context_length)
+        prompt = (prompt_content
+                  .replace("{document}", json.dumps(fact_check_doc, ensure_ascii=False))
+                  .replace("{transcript}", transcript_text))
+        # Deliberately NOT caught here: after max_retries exhausted,
+        # generate_json raises ProtocolValidationError, which must fail the
+        # whole protocol job rather than emit an unverified protocol (item 2).
+        raw = await provider.generate_json(prompt, temperature=temperature, max_tokens=max_tokens, max_retries=max_retries)
+        verified_raw = raw.get("verified") or []
+        if not isinstance(verified_raw, list):
+            verified_raw = []
+        verdicts: dict[tuple[str, int], FactCheckVerdict] = {}
+        for entry in verified_raw:
+            v = FactCheckVerdict.from_json(entry if isinstance(entry, dict) else {})
+            if v is None:
+                continue  # unknown/malformed entries are ignored, never crash the job
+            bound = len(decisions) if v.type == "decision" else len(tasks)
+            if v.index >= bound:
+                continue  # out-of-range index: ignore rather than trust a hallucinated reference
+            verdicts[(v.type, v.index)] = v
+        raw_notes = raw.get("unverified_items")
+        notes = [str(x) for x in raw_notes] if isinstance(raw_notes, list) else []
+        log(f"Fact-check: {len(verdicts)}/{len(decisions) + len(tasks)} item(s) verified")
+        return verdicts, notes
+
+
+def _nearest_hint(chunk_start: float, hints: dict[float, str]) -> Optional[str]:
+    if not hints:
+        return None
+    nearest_start = min(hints, key=lambda s: abs(s - chunk_start))
+    return hints.get(nearest_start) or None
+
+
+def _fit_transcript_for_fact_check(segments: list[TranscriptSegment], decisions: list[DecisionItem],
+                                    tasks: list[TaskItem], *, context_length: int, chars_per_token: float = 3.2,
+                                    reserved_tokens: int = 1500) -> str:
+    """Bound the transcript text sent for fact-checking to the model's own
+    context window: the full text if it fits, otherwise only the segments
+    near a referenced timestamp (plus a small margin either side)."""
+    full_text = "\n".join(f"{s.speaker} [{format_seconds(s.start)} - {format_seconds(s.end)}]: {s.text}" for s in segments)
+    budget_chars = max(2000, int(max(0, context_length - reserved_tokens) * chars_per_token))
+    if len(full_text) <= budget_chars:
+        return full_text
+    timestamps: list[float] = []
+    for item in (*decisions, *tasks):
+        try:
+            timestamps.append(parse_timestamp(item.timestamp))
+        except ValueError:
+            continue
+    if not timestamps:
+        return full_text[:budget_chars]
+    margin = 60.0
+    windows = sorted((t - margin, t + margin) for t in timestamps)
+    kept = [s for s in segments if any(lo <= s.start <= hi for lo, hi in windows)]
+    if not kept:
+        return full_text[:budget_chars]
+    text = "\n".join(f"{s.speaker} [{format_seconds(s.start)} - {format_seconds(s.end)}]: {s.text}" for s in kept)
+    return text[:budget_chars]
 
 
 def _empty_cuda_cache() -> None:
@@ -305,23 +545,69 @@ def _analysis_to_dict(a: ChunkAnalysis) -> dict[str, Any]:
         "chunk_index": a.chunk_index, "topic": a.topic, "summary": a.summary, "facts": list(a.facts),
         "decisions": [d.__dict__ for d in a.decisions], "tasks": [t.__dict__ for t in a.tasks],
         "open_questions": list(a.open_questions), "risks": list(a.risks),
-        "disagreements": list(a.disagreements), "terms": list(a.terms),
+        "disagreements": list(a.disagreements),
     }
 
 
-def _build_document(merged_raw: dict[str, Any], *, segments, chunks, source_filename: str, model_id: str,
-                     prompt_versions: dict[str, int]) -> ProtocolDocument:
-    if not isinstance(merged_raw, dict):
-        raise ProtocolValidationError("merge response must be a JSON object")
+def _resolve_anchor(timestamp: str, segments: list[TranscriptSegment], counters: dict[int, int]
+                     ) -> tuple[Optional[str], Optional[TranscriptSegment]]:
+    """Item 8: link a decision/task timestamp to the nearest real transcript
+    segment (within tolerance) and mint a unique, stable anchor id for it --
+    never the raw timestamp text itself, which is not guaranteed unique and
+    is not guaranteed to correspond to any real moment in the transcript."""
+    if not timestamp or timestamp == NOT_SPECIFIED or not segments:
+        return None, None
+    try:
+        t = parse_timestamp(timestamp)
+    except ValueError:
+        return None, None
+    best = min(segments, key=lambda s: abs(s.start - t))
+    if abs(best.start - t) > _TIMESTAMP_MATCH_TOLERANCE_SECONDS:
+        return None, None
+    second = int(best.start)
+    n = counters.get(second, 0) + 1
+    counters[second] = n
+    return f"timestamp-{second}-{n}", best
+
+
+def _build_document(merged_raw: dict[str, Any], *, segments: list[TranscriptSegment], chunks, source_filename: str,
+                     model_id: str, snapshot: SettingsSnapshot, raw_decisions: list[DecisionItem],
+                     raw_tasks: list[TaskItem], fact_check_verdicts: dict[tuple[str, int], FactCheckVerdict],
+                     fact_check_notes: list[str]) -> ProtocolDocument:
     participants = tuple(sorted({s.speaker for s in segments}))
     duration = max((s.end for s in segments), default=0.0)
-    timestamp_refs = tuple(
-        TimestampRef(label=f"блок {c.index + 1}", timestamp=format_seconds(c.start), speaker=c.segments[0].speaker if c.segments else "",
-                      chunk_index=c.index)
-        for c in chunks
-    )
-    decisions = tuple(DecisionItem.from_json(d) if isinstance(d, dict) else d for d in (merged_raw.get("decisions") or []))
-    tasks = tuple(TaskItem.from_json(t) if isinstance(t, dict) else t for t in (merged_raw.get("tasks") or []))
+
+    seg_to_chunk: dict[TranscriptSegment, int] = {}
+    for c in chunks:
+        for seg in c.segments:
+            seg_to_chunk.setdefault(seg, c.index)
+
+    anchor_counters: dict[int, int] = {}
+    timestamp_refs: list[TimestampRef] = []
+    unverified_notes: list[str] = []
+
+    def _link(item, element_type: str, index: int):
+        anchor, seg = _resolve_anchor(item.timestamp, segments, anchor_counters)
+        verdict = fact_check_verdicts.get((element_type, index))
+        confirmed = verdict.confirmed if verdict is not None else None
+        reason = verdict.reason if verdict is not None else ""
+        label = item.text if element_type == "decision" else item.task
+        if anchor and seg is not None:
+            timestamp_refs.append(TimestampRef(
+                label=label, timestamp=format_seconds(seg.start), speaker=seg.speaker,
+                chunk_index=seg_to_chunk.get(seg, -1), anchor=anchor, source_text=seg.text,
+                element_type=element_type,
+            ))
+        elif item.timestamp and item.timestamp != NOT_SPECIFIED:
+            unverified_notes.append(f"Не удалось сопоставить таймкод '{item.timestamp}' для: {label[:120]}")
+        return dataclasses.replace(item, anchor=anchor, verified=confirmed, verification_reason=reason)
+
+    decisions = tuple(_link(d, "decision", i) for i, d in enumerate(raw_decisions))
+    tasks = tuple(_link(t, "task", i) for i, t in enumerate(raw_tasks))
+
+    unverified_items = (tuple(str(x) for x in (merged_raw.get("unverified_items") or []))
+                        + tuple(unverified_notes) + tuple(fact_check_notes))
+
     return ProtocolDocument(
         meeting_title=str(merged_raw.get("meeting_title") or source_filename),
         processed_at=time.strftime("%Y-%m-%d %H:%M"),
@@ -332,14 +618,21 @@ def _build_document(merged_raw: dict[str, Any], *, segments, chunks, source_file
         topics=tuple(str(t) for t in (merged_raw.get("topics") or [])),
         decisions=decisions,
         tasks=tasks,
-        owners=tuple(sorted({t.owner for t in tasks if t.owner and t.owner != "не указан"})),
-        deadlines=tuple(sorted({t.deadline for t in tasks if t.deadline and t.deadline != "не указан"})),
+        owners=tuple(sorted({t.owner for t in tasks if t.owner and t.owner != NOT_SPECIFIED})),
+        deadlines=tuple(sorted({t.deadline for t in tasks if t.deadline and t.deadline != NOT_SPECIFIED})),
         open_questions=tuple(str(x) for x in (merged_raw.get("open_questions") or [])),
         risks=tuple(str(x) for x in (merged_raw.get("risks") or [])),
         disagreements=tuple(str(x) for x in (merged_raw.get("disagreements") or [])),
         next_steps=tuple(str(x) for x in (merged_raw.get("next_steps") or [])),
-        unverified_items=tuple(str(x) for x in (merged_raw.get("unverified_items") or [])),
-        timestamp_refs=timestamp_refs,
+        unverified_items=unverified_items,
+        timestamp_refs=tuple(timestamp_refs),
         model_id=model_id,
-        prompt_versions=prompt_versions,
+        prompt_versions=snapshot.prompt_versions,
+        engine=snapshot.engine, model_path=snapshot.model_path, context_length=snapshot.context_length,
+        temperature=snapshot.temperature, max_output_tokens=snapshot.max_output_tokens,
+        chunking_settings={
+            "chunk_minutes": snapshot.chunk_minutes, "chunk_overlap_seconds": snapshot.chunk_overlap_seconds,
+            "topic_split_enabled": snapshot.topic_split_enabled,
+        },
+        app_commit=snapshot.app_commit, generated_at=time.time(),
     )
