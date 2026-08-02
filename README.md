@@ -145,42 +145,78 @@ network, and only for the duration of the download — normal operation stays fu
 the main app.
 
 After installing, an admin picks the active model, edits its launch parameters (temperature, max
-tokens, context, launch args), and runs a load test from Протоколирование → Модели in `/admin`.
-Setting changes only apply to protocol jobs created afterwards; jobs already in progress keep using
-the model/parameters they started with.
+tokens, context, launch args) and its **engine** — Протоколирование → Модели → "Настройка движка
+модели" lets an admin choose `llama_cpp` (GGUF, local file, GPU-layer count) or `ollama` (model
+tag + local Ollama daemon URL + `keep_alive`) per model, and runs a load test from that same tab.
+Setting changes only apply to protocol jobs created afterwards — every job freezes a full
+**settings snapshot** (model, engine, context/temperature/token limits, chunking settings, glossary
+settings, and the exact prompt versions used) at creation time in `protocol_jobs.settings_snapshot`,
+so jobs already queued or in progress are never affected by a later admin change, and a retry of a
+failed job replays that same frozen snapshot rather than picking up new settings.
+
+Only an administrator can set an Ollama URL (`/api/protocol/models/{id}/params` requires
+`require_admin`); there is no way for a regular user to point the module at an arbitrary URL.
+
+`llama.cpp` models are always called through `create_chat_completion()` with the model's own chat
+template (read from the GGUF's `tokenizer.chat_template` metadata) — never a hardcoded raw-completion
+format. A GGUF that has no embedded chat template fails to load with a clear error instead of
+silently running in an incorrect mode. Qwen3 builds are additionally told not to emit `<think>`
+reasoning, and any `<think>...</think>` block is stripped centrally before JSON parsing regardless
+of provider, so no internal reasoning can ever leak into a chunk analysis, the merge, the fact-check
+result, or the final protocol.
 
 ### Prompts and glossary
 
-- Протоколирование → Промпты lets an admin edit the chunk-analysis, topic-split, final-merge,
-  fact-check, and HTML-template prompts (with per-model overrides), preview a prompt, and restore
-  the built-in default. Prompts are versioned (`protocol_prompts` table keeps every saved version
-  with author/timestamp); they are never hardcoded in `server.py` — defaults live in
-  `protocol/prompts.py`.
+- Протоколирование → Промпты lets an admin pick "Общий промпт" or one of the four models, then edit
+  the chunk-analysis, topic-split, final-merge, fact-check, or HTML-template prompt for that scope,
+  preview it, and restore the built-in default. Resolution order when a job runs: the selected
+  model's own active prompt → the common active prompt → the built-in default. Prompts are versioned
+  (`protocol_prompts` table keeps every saved version with author/timestamp) and never hardcoded in
+  `server.py` — defaults live in `protocol/prompts.py`. The exact version of every prompt kind used
+  is pinned into the job's settings snapshot at creation and never changes mid-job.
 - Протоколирование → Словарь/Предложения manage the term glossary (canonical term + aliases +
   scope: job/project/department/global). Terms only get applied automatically once an admin marks
-  them `confirmed`; LLM proposals and user corrections always land as a `proposed` suggestion first
-  and are never applied globally without admin confirmation. Import/export supports JSON and CSV.
+  them `confirmed`. Suggestions can come from three sources, none ever applied automatically:
+  admin-added terms are `confirmed` immediately; everything else is `proposed` until an admin
+  confirms it — the chunk-analysis LLM call's own `terms` field (detected/suggested/context/
+  confidence, deduplicated and self-replacement-filtered), a document diff, or a user/owner
+  submitting `POST /api/jobs/{job_id}/glossary-suggestion` (a small form on the job card does this).
+  Import/export supports JSON and CSV.
 
 ### How it works
 
 1. User clicks "Создать протокол" on a completed job (button only appears once transcription is
    done, the module is enabled, and at least one model is installed). This creates a
-   `protocol_jobs` row; repeat clicks reuse the existing active job instead of creating a duplicate.
-2. The pipeline (`protocol/service.py`) prepares the transcript, splits it into chunks (topic-based
-   when the model can reliably detect boundaries, otherwise fixed 10-15 minute time windows with a
-   configurable overlap — a chunk never splits a reply mid-way), analyzes each chunk with the LLM
-   into strict JSON (using "не указан" for anything not stated in the transcript — the prompts
-   explicitly forbid inventing decisions, deadlines, owners, or numbers), then does a separate merge
-   call to combine chunks into one document.
-3. The result is rendered to `protocol.json` (source of truth) and `protocol.html`
-   (`protocol/renderer.py`, escapes everything, includes a table of contents, timecode links back
-   into the transcript, print/download buttons) under `data/protocols/<job_id>/`, alongside
-   `protocol.log` (full internal detail/tracebacks — never shown to the user, who only sees a short
-   status message).
-4. On any failure, the protocol job is marked `failed` with a short message, the LLM is unloaded,
+   `protocol_jobs` row with a frozen settings snapshot; repeat clicks reuse the existing active job
+   instead of creating a duplicate.
+2. The pipeline (`protocol/service.py`) prepares the transcript and splits it into chunks. Topic
+   splitting is two-stage so a long meeting is never sent to the model in one piece: rough
+   10-15-minute pre-blocks each get a one-line topic hint, then a single call over those hints (not
+   the raw transcript) proposes boundaries for the whole meeting; boundaries outside the
+   transcript's own range are dropped and near-duplicates are merged. If that's unreliable, or
+   disabled, it falls back to fixed time windows with a configurable overlap — a chunk never splits
+   a reply mid-way. Each chunk is analyzed into strict JSON (using "не указан" for anything not
+   stated in the transcript — the prompts explicitly forbid inventing decisions, deadlines, owners,
+   or numbers), then a separate merge call combines all chunks into one document.
+3. A **fact-check** stage follows the merge: every decision and task from the merged document is
+   sent back to the model alongside the transcript, and the model confirms or flags each one by
+   index (never rewriting the item's text). An item that can't be confirmed is marked unverified —
+   never removed. If the fact-check call itself fails technically (invalid JSON after every retry),
+   the whole protocol job fails rather than publishing an unverified protocol as "ready".
+4. Each decision/task's timestamp is matched to the nearest real transcript segment (within a
+   tolerance); a match gets a unique, stable HTML anchor (e.g. `timestamp-312-1`) and an appendix
+   row (timecode, speaker, source reply, block number, item type). A timestamp that can't be matched
+   is shown as plain text, never as a broken link, and the item is noted in `unverified_items`.
+5. The result is rendered to `protocol.json` (source of truth — includes the model/engine, prompt
+   versions, chunking settings, and app git commit for reproducibility) and `protocol.html`
+   (`protocol/renderer.py`, escapes everything, table of contents, print/download buttons) under
+   `data/protocols/<job_id>/`, alongside `protocol.log` (full internal detail/tracebacks — never
+   shown to the user, who only sees a short status message including a `fact_checking` stage).
+6. On any failure, the protocol job is marked `failed` with a short message, the LLM is unloaded,
    and the underlying transcription job is completely untouched — it is not marked failed and its
-   results are not deleted. The user can retry from the same button.
-5. On server restart, any protocol job caught mid-run is marked `failed` with a clear "restored
+   results are not deleted. The user can retry from the same button (replaying the original settings
+   snapshot, not any settings changed since).
+7. On server restart, any protocol job caught mid-run is marked `failed` with a clear "restored
    after restart" message rather than silently resumed, so it can never leave the GPU lock held.
 
 ### Where things are stored
@@ -195,6 +231,30 @@ data/
 models/
   protocol/<model_id>/...  # installed GGUF weights
 ```
+
+### Docker build with (or without) the protocol module
+
+The main Dockerfile stays exactly as before by default: `INSTALL_PROTOCOL` defaults to `0`, so
+`requirements-protocol.txt` and `llama-cpp-python` are never installed and the image's size/dependency
+set are unaffected.
+
+```bash
+# Without the protocol module (default, unchanged) --
+docker compose -f compose.yaml build
+docker compose -f compose.yaml up -d
+
+# With it -- compose.protocol.yaml is an override, not a replacement --
+docker compose -f compose.yaml -f compose.protocol.yaml build
+docker compose -f compose.yaml -f compose.protocol.yaml up -d
+```
+
+`compose.protocol.yaml` only adds `--build-arg INSTALL_PROTOCOL=1` (which triggers
+`CMAKE_ARGS="-DGGML_CUDA=on" pip install -r requirements-protocol.txt` inside the Dockerfile, so
+`llama-cpp-python` is built with CUDA GPU offload for CUDA 12.8-capable cards such as the RTX 5060
+Ti) and `GIGASCRIBE_PROTOCOL_ENABLED=1`. No proxy settings are added by either file. As with the
+base image, building `llama-cpp-python` from source needs a CUDA-capable toolchain available at
+build time; if your build host doesn't have one, install `requirements-protocol.txt` from a
+prebuilt wheel instead of relying on this Dockerfile step.
 
 ### Running the tests
 

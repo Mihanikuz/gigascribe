@@ -19,13 +19,20 @@ from ..schemas import ProtocolValidationError
 MAX_RESPONSE_CHARS = 200_000
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+# Reasoning models (Qwen3 in particular) can wrap chain-of-thought in <think>
+# tags even when asked not to; stripped centrally here so no internal
+# reasoning can ever reach a parsed JSON value or the final protocol,
+# regardless of which provider produced the raw text.
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
 def extract_json(raw: str) -> dict[str, Any]:
     """Best-effort extraction of a JSON object from an LLM response that may
-    be wrapped in markdown fences or have leading/trailing prose."""
+    be wrapped in markdown fences, contain a <think> block, or have
+    leading/trailing prose."""
     if len(raw) > MAX_RESPONSE_CHARS:
         raise ProtocolValidationError(f"LLM response too large ({len(raw)} chars)")
+    raw = _THINK_RE.sub("", raw)
     candidates = [raw]
     fence_match = _FENCE_RE.search(raw)
     if fence_match:
@@ -53,19 +60,22 @@ class LLMProvider(ABC):
         """Load the model into (V)RAM. Idempotent if already loaded."""
 
     @abstractmethod
-    async def generate(self, prompt: str, *, temperature: float, max_tokens: int) -> str:
-        """Return the raw text completion for prompt."""
+    async def generate(self, prompt: str, *, temperature: float, max_tokens: int,
+                        system_prompt: str | None = None) -> str:
+        """Return the raw text completion for prompt, using the model's own
+        chat template with the given system/user messages (item 5)."""
 
     @abstractmethod
     async def unload(self) -> None:
         """Release all GPU/CPU memory held by this provider. Idempotent."""
 
     async def generate_json(self, prompt: str, *, temperature: float, max_tokens: int,
-                             max_retries: int = 2) -> dict[str, Any]:
+                             max_retries: int = 2, system_prompt: str | None = None) -> dict[str, Any]:
         last_error: Exception | None = None
         attempt_prompt = prompt
         for attempt in range(max_retries + 1):
-            raw = await self.generate(attempt_prompt, temperature=temperature, max_tokens=max_tokens)
+            raw = await self.generate(attempt_prompt, temperature=temperature, max_tokens=max_tokens,
+                                       system_prompt=system_prompt)
             try:
                 return extract_json(raw)
             except ProtocolValidationError as exc:

@@ -636,6 +636,30 @@ def download_protocol_html(job_id: str, username: str = Depends(current_user)):
     return FileResponse(resolved, filename=resolved.name, media_type="text/html")
 
 
+@app.post("/api/jobs/{job_id}/glossary-suggestion")
+def create_glossary_suggestion(job_id: str, payload: dict[str, Any], username: str = Depends(current_user)):
+    """Item 10: a user (owner or admin, matching every other job-control
+    check in this file) can propose a correction seen on the transcript or
+    protocol page. This only ever creates a `status='proposed'` suggestion
+    -- an admin must confirm it before it can affect anything, exactly like
+    an LLM-proposed term (see glossary.py's module docstring)."""
+    _require_protocol_enabled()
+    job = job_store.get(job_id)
+    if not job: raise HTTPException(404)
+    if not can_control_job(job, username):
+        raise HTTPException(403, detail="Only the job owner or an administrator can suggest a correction")
+    wrong_text = str(payload.get("wrong_text") or "").strip()
+    suggested_text = str(payload.get("suggested_text") or "").strip()
+    if not wrong_text or not suggested_text:
+        raise HTTPException(400, detail="wrong_text and suggested_text are required")
+    from protocol import glossary as glossary_mod
+    suggestion = glossary_mod.propose_from_user_correction(
+        PROTOCOL_SERVICE.store, wrong_text=wrong_text, suggested_text=suggested_text,
+        job_id=job_id, context=str(payload.get("context") or ""),
+    )
+    return {"ok": True, "suggestion_id": suggestion.id, "status": suggestion.status}
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(request: Request):
     username = request.session.get("user")
@@ -806,12 +830,25 @@ def api_protocol_select_model(model_id: str, admin: str = Depends(require_admin)
 
 @app.post("/api/protocol/models/{model_id}/params")
 def api_protocol_model_params(model_id: str, payload: dict[str, Any], admin: str = Depends(require_admin)):
+    # Engine choice and its config (item 4) are admin-only, same as every
+    # other route in this block -- there is no user-facing way to reach an
+    # arbitrary ollama_url; only require_admin can set it.
     _require_protocol_enabled()
     if not PROTOCOL_SERVICE.store.get_model_state(model_id): raise HTTPException(404)
-    allowed = {"repo_id", "filename", "context_length", "temperature", "max_output_tokens", "system_prompt_override"}
+    allowed = {
+        "repo_id", "filename", "context_length", "temperature", "max_output_tokens", "system_prompt_override",
+        "engine", "n_gpu_layers", "extra_launch_params", "ollama_url", "ollama_keep_alive",
+    }
     changes = {k: v for k, v in payload.items() if k in allowed}
     if not changes: raise HTTPException(400, detail="No recognized parameters in payload")
-    return PROTOCOL_SERVICE.store.update_model_state(model_id, **changes)
+    if changes.get("engine") not in (None,) and changes.get("engine") not in ("llama_cpp", "ollama"):
+        raise HTTPException(400, detail="engine must be 'llama_cpp' or 'ollama'")
+    if changes.get("ollama_url") and not str(changes["ollama_url"]).startswith(("http://", "https://")):
+        raise HTTPException(400, detail="ollama_url must start with http:// or https://")
+    try:
+        return PROTOCOL_SERVICE.store.update_model_state(model_id, **changes)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
 
 
 @app.post("/api/protocol/models/{model_id}/test")
@@ -820,8 +857,18 @@ async def api_protocol_test_model(model_id: str, admin: str = Depends(require_ad
     state = PROTOCOL_SERVICE.store.get_model_state(model_id)
     if not state: raise HTTPException(404)
     if not state.get("installed"): raise HTTPException(422, detail="Model is not installed")
-    from protocol.providers import create_provider
-    provider = create_provider(engine=state["engine"], model_path=state["local_path"], context_length=state["context_length"])
+    from protocol.models import SUPPORTED_PROTOCOL_MODELS
+    from protocol.providers import create_provider, validate_engine_config
+    try:
+        validate_engine_config(engine=state["engine"], model_path=state["local_path"], ollama_url=state.get("ollama_url"))
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=422)
+    no_think = bool(SUPPORTED_PROTOCOL_MODELS.get(model_id) and SUPPORTED_PROTOCOL_MODELS[model_id].no_think)
+    provider = create_provider(
+        engine=state["engine"], model_path=state["local_path"], context_length=state["context_length"],
+        n_gpu_layers=state.get("n_gpu_layers"), no_think=no_think, extra_launch_params=state.get("extra_launch_params") or {},
+        ollama_url=state.get("ollama_url"), ollama_keep_alive=state.get("ollama_keep_alive"),
+    )
     try:
         async with gpu_worker:
             MODEL_MANAGER.unload_all()
@@ -1105,7 +1152,7 @@ INDEX_HTML = ("<!doctype html><meta charset='utf-8'><title>GigaScribe</title><st
 function escapeHtml(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 const STATUS_LABELS={queued:'В очереди',running:'Обрабатывается',completed:'Готово',failed:'Ошибка',cancelled:'Отменено'};
 const DOWNLOAD_LABELS={transcript:'транскрипт',log:'лог',original:'оригинал',m4a:'M4A',flac:'FLAC'};
-const PROTOCOL_STATUS_LABELS={queued:'в очереди',waiting_for_gpu:'ожидание GPU',unloading_asr:'выгрузка ASR/диаризации',loading_llm:'загрузка модели',splitting:'разбиение на блоки',processing_chunks:'обработка блоков',merging:'сведение протокола',rendering:'формирование HTML',completed:'готово',failed:'ошибка',cancelled:'отменено'};
+const PROTOCOL_STATUS_LABELS={queued:'в очереди',waiting_for_gpu:'ожидание GPU',unloading_asr:'выгрузка ASR/диаризации',loading_llm:'загрузка модели',splitting:'разбиение на блоки',processing_chunks:'обработка блоков',merging:'сведение протокола',fact_checking:'проверка фактов',rendering:'формирование HTML',completed:'готово',failed:'ошибка',cancelled:'отменено'};
 let ME={username:null,is_admin:false};
 let PROTOCOL_STATUS={enabled:false,has_installed_model:false};
 
@@ -1151,6 +1198,17 @@ function renderProtocolSection(j, canControl){
   return '';
 }
 
+async function submitCorrection(jobId, ev){
+  ev.preventDefault();
+  let fd=new FormData(ev.target);
+  let payload={wrong_text: fd.get('wrong_text'), suggested_text: fd.get('suggested_text')};
+  let r=await fetch(`/api/jobs/${jobId}/glossary-suggestion`, {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(payload)});
+  let msg=ev.target.querySelector('.correction-message');
+  if(r.ok){ ev.target.reset(); msg.textContent='Предложение отправлено администратору на подтверждение'; }
+  else { let d=await r.json().catch(()=>({})); msg.textContent='Ошибка: '+(d.detail||r.status); }
+  return false;
+}
+
 function renderJob(j){
   let canControl=(j.owner===ME.username)||ME.is_admin;
   let statusLabel=STATUS_LABELS[j.status]||j.status;
@@ -1158,6 +1216,15 @@ function renderJob(j){
   let actions='';
   if(canControl&&(j.status==='queued'||j.status==='running')) actions+=`<button onclick="cancelJob('${j.id}')">Отменить</button>`;
   if(canControl&&(j.status==='failed'||j.status==='cancelled')) actions+=`<button onclick="retryJob('${j.id}')">Повторить</button>`;
+  let correctionForm=(canControl && PROTOCOL_STATUS.enabled) ? `
+    <details class='correction-details'><summary>Предложить исправление термина</summary>
+      <form onsubmit="return submitCorrection('${j.id}', event)">
+        <input name='wrong_text' placeholder='Как распознано в тексте' required>
+        <input name='suggested_text' placeholder='Как должно быть написано' required>
+        <button type='submit'>Предложить</button>
+        <span class='muted correction-message'></span>
+      </form>
+    </details>` : '';
   return `<div class='job card'>
     <div class='row'><b>${escapeHtml(j.filename)}</b><span class='badge ${j.status}'>${statusLabel}</span></div>
     <div class='muted'>Загрузил(а): ${escapeHtml(j.owner)}${j.attempts>1?` · попытка ${j.attempts}`:''}</div>
@@ -1166,6 +1233,7 @@ function renderJob(j){
     ${j.error?`<div class='err'>${escapeHtml(j.error)}</div>`:''}
     <div class='row'><span>${downloads}</span><span class='actions'>${actions}</span></div>
     ${renderProtocolSection(j, canControl)}
+    ${correctionForm}
   </div>`;
 }
 
@@ -1244,6 +1312,16 @@ if PROTOCOL_ENABLED:
     <table><thead><tr><th>Модель</th><th>Движок</th><th>Статус</th><th>Активна</th><th>Размер</th><th></th></tr></thead><tbody id='protocol-models-body'></tbody></table>
     <p class='muted'>Установка выполняется скриптом <code>scripts/download_protocol_model.py</code> (см. README) — здесь можно выбрать активную модель, проверить загрузку или удалить файлы.</p>
     <p id='protocol-model-message' class='muted'></p>
+    <h3>Настройка движка модели</h3>
+    <form id='engine-config-form'>
+      <label>Модель<select name='model_id' id='engine-config-model'></select></label>
+      <label>Движок<select name='engine'><option value='llama_cpp'>llama.cpp (GGUF)</option><option value='ollama'>Ollama</option></select></label>
+      <label>Число GPU-слоёв (llama.cpp, -1 = все)<input type='number' name='n_gpu_layers' step='1'></label>
+      <label>URL локального Ollama (только для Ollama)<input name='ollama_url' placeholder='http://127.0.0.1:11434'></label>
+      <label>keep_alive Ollama (например, 5m)<input name='ollama_keep_alive' placeholder='5m'></label>
+      <button type='submit'>Сохранить конфигурацию движка</button>
+    </form>
+    <p id='engine-config-message' class='muted'></p>
   </div>
 
   <div id='p-prompts' class='tab-panel' style='display:none'>
@@ -1254,6 +1332,13 @@ if PROTOCOL_ENABLED:
       <option value='fact_check'>Проверка фактов</option>
       <option value='html_template'>Шаблон HTML-протокола</option>
     </select></label>
+    <label>Модель<select id='prompt-model-select'>
+      <option value=''>Общий промпт (для всех моделей)</option>
+      <option value='qwen3-14b'>Qwen3-14B</option>
+      <option value='qwen3-8b'>Qwen3-8B</option>
+      <option value='gemma3-12b-it'>Gemma 3 12B IT</option>
+      <option value='ministral3-8b-instruct'>Ministral 3 8B Instruct</option>
+    </select></label>
     <textarea id='prompt-content' rows='14' style='width:100%;font-family:monospace;font-size:.85em'></textarea>
     <div class='actions'>
       <button id='prompt-save' type='button'>Сохранить</button>
@@ -1261,6 +1346,7 @@ if PROTOCOL_ENABLED:
       <button id='prompt-preview' type='button'>Предпросмотр</button>
     </div>
     <p id='prompt-message' class='muted'></p>
+    <p class='muted'>Порядок выбора при обработке: активный промпт выбранной модели → общий активный промпт → встроенный промпт по умолчанию.</p>
     <div id='prompt-preview-box'></div>
   </div>
 
@@ -1319,11 +1405,12 @@ function showProtocolTab(name){
 document.querySelectorAll('.tab-btn').forEach(btn=>btn.onclick=()=>showProtocolTab(btn.dataset.tab));
 showProtocolTab('p-models');
 
+let PROTOCOL_MODELS_CACHE=[];
 async function loadProtocolModels(){
   let body=document.getElementById('protocol-models-body');
   let r=await fetch('/api/protocol/models'); if(!r.ok) return;
   let data=await r.json();
-  let selectEl=document.getElementById('setting-active-model');
+  PROTOCOL_MODELS_CACHE=data.models;
   body.innerHTML=data.models.map(m=>{
     let active=m.id===data.active_model_id;
     return `<tr>
@@ -1338,7 +1425,35 @@ async function loadProtocolModels(){
   body.querySelectorAll('.select-protocol-model').forEach(b=>b.onclick=()=>selectProtocolModel(b.dataset.selectProtocol));
   body.querySelectorAll('.test-protocol-model').forEach(b=>b.onclick=()=>testProtocolModel(b.dataset.testProtocol));
   body.querySelectorAll('.delete-protocol-model').forEach(b=>b.onclick=()=>deleteProtocolModel(b.dataset.deleteProtocol));
+  let sel=document.getElementById('engine-config-model');
+  let prevValue=sel.value;
+  sel.innerHTML=data.models.map(m=>`<option value="${escapeAttr(m.id)}">${escapeHtml(m.label)}</option>`).join('');
+  sel.value=prevValue||data.models[0]?.id||'';
+  loadEngineConfig();
 }
+function loadEngineConfig(){
+  let id=document.getElementById('engine-config-model').value;
+  let m=PROTOCOL_MODELS_CACHE.find(x=>x.id===id); if(!m) return;
+  let form=document.getElementById('engine-config-form');
+  form.elements['engine'].value=m.engine||'llama_cpp';
+  form.elements['n_gpu_layers'].value=(m.n_gpu_layers===null||m.n_gpu_layers===undefined)?'':m.n_gpu_layers;
+  form.elements['ollama_url'].value=m.ollama_url||'';
+  form.elements['ollama_keep_alive'].value=m.ollama_keep_alive||'';
+}
+document.getElementById('engine-config-model').onchange=loadEngineConfig;
+document.getElementById('engine-config-form').onsubmit=async(e)=>{
+  e.preventDefault();
+  let id=document.getElementById('engine-config-model').value;
+  let form=e.target;
+  let payload={engine:form.elements['engine'].value};
+  let ngl=form.elements['n_gpu_layers'].value; if(ngl!=='') payload.n_gpu_layers=parseInt(ngl,10);
+  let ourl=form.elements['ollama_url'].value; if(ourl) payload.ollama_url=ourl;
+  let oka=form.elements['ollama_keep_alive'].value; if(oka) payload.ollama_keep_alive=oka;
+  let r=await fetch(`/api/protocol/models/${id}/params`, {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(payload)});
+  let d=await r.json().catch(()=>({}));
+  document.getElementById('engine-config-message').textContent=r.ok?'Конфигурация движка сохранена':('Ошибка: '+(d.detail||r.status));
+  if(r.ok) loadProtocolModels();
+};
 async function selectProtocolModel(id){
   let msg=document.getElementById('protocol-model-message');
   let r=await fetch(`/api/protocol/models/${id}/select`, {method:'POST'});
@@ -1361,25 +1476,31 @@ async function deleteProtocolModel(id){
 }
 
 const PROMPT_KIND_VARS={chunk_analysis:'{transcript_chunk}',topic_split:'{transcript}',merge:'{chunk_analyses}',fact_check:'{document} и {transcript}',html_template:'$body (можно также $title)'};
+function promptQuery(){
+  let modelId=document.getElementById('prompt-model-select').value;
+  return modelId?`?model_id=${encodeURIComponent(modelId)}`:'';
+}
 async function loadPrompt(){
   let kind=document.getElementById('prompt-kind-select').value;
-  let r=await fetch(`/api/protocol/prompts/${kind}`); if(!r.ok) return;
+  let r=await fetch(`/api/protocol/prompts/${kind}${promptQuery()}`); if(!r.ok) return;
   let d=await r.json();
   document.getElementById('prompt-content').value=d.active.content;
-  document.getElementById('prompt-message').textContent=`Версия ${d.active.version}${d.active.is_default?' (по умолчанию)':''}. Обязательная переменная: ${PROMPT_KIND_VARS[kind]}`;
+  let scopeLabel=d.active.model_id?`модель ${d.active.model_id}`:'общий';
+  document.getElementById('prompt-message').textContent=`Версия ${d.active.version} (${scopeLabel})${d.active.is_default?' (по умолчанию)':''}. Обязательная переменная: ${PROMPT_KIND_VARS[kind]}`;
   document.getElementById('prompt-preview-box').innerHTML='';
 }
 document.getElementById('prompt-kind-select').onchange=loadPrompt;
+document.getElementById('prompt-model-select').onchange=loadPrompt;
 document.getElementById('prompt-save').onclick=async()=>{
   let kind=document.getElementById('prompt-kind-select').value;
   let content=document.getElementById('prompt-content').value;
-  let r=await fetch(`/api/protocol/prompts/${kind}`, {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({content})});
+  let r=await fetch(`/api/protocol/prompts/${kind}${promptQuery()}`, {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({content})});
   let d=await r.json().catch(()=>({}));
   document.getElementById('prompt-message').textContent=r.ok?`Сохранено как версия ${d.version}`:('Ошибка: '+(d.detail||r.status));
 };
 document.getElementById('prompt-restore').onclick=async()=>{
   let kind=document.getElementById('prompt-kind-select').value;
-  await fetch(`/api/protocol/prompts/${kind}/restore-default`, {method:'POST'});
+  await fetch(`/api/protocol/prompts/${kind}/restore-default${promptQuery()}`, {method:'POST'});
   loadPrompt();
 };
 document.getElementById('prompt-preview').onclick=async()=>{

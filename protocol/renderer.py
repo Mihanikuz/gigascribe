@@ -28,6 +28,7 @@ ul{padding-left:20px}
 table{border-collapse:collapse;width:100%;margin:8px 0}
 th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #8883;vertical-align:top}
 .badge{display:inline-block;padding:1px 8px;border-radius:9px;font-size:.78em;background:#eee;color:#333}
+.badge.unverified-badge{background:#fbe8cc;color:#7a4a00}
 .unverified{color:#a15c00}
 .timestamp-link{text-decoration:none;color:inherit;font-variant-numeric:tabular-nums;border-bottom:1px dotted}
 .actions{margin:18px 0;display:flex;gap:8px}
@@ -48,18 +49,37 @@ def _list_section(title: str, anchor: str, items: tuple, *, unverified: bool = F
     return f"<h2 id='{anchor}'>{_e(title)}</h2><ul>{lis}</ul>"
 
 
+def _ts_cell(item) -> str:
+    """Item 8: link only when a real anchor was resolved (nearest transcript
+    segment within tolerance) -- otherwise show the raw timestamp as inert
+    text so we never emit a link to an id that doesn't exist in the page."""
+    if getattr(item, "anchor", None):
+        return f"<a class='timestamp-link' href='#{_e(item.anchor)}'>{_e(item.timestamp)}</a>"
+    return _e(item.timestamp)
+
+
+def _verified_cell(item) -> str:
+    verified = getattr(item, "verified", None)
+    if verified is True:
+        return "<span class='badge completed' title='Подтверждено проверкой фактов'>подтверждено</span>"
+    if verified is False:
+        reason = getattr(item, "verification_reason", "") or ""
+        title = f" title='{_e(reason)}'" if reason else ""
+        return f"<span class='badge unverified-badge'{title}>не подтверждено</span>"
+    return "<span class='muted'>—</span>"
+
+
 def _decisions_table(decisions) -> str:
     if not decisions:
         return ""
     rows = "".join(
         f"<tr><td>{_e(d.text)}</td><td>{_e(d.speaker)}</td>"
-        f"<td><a class='timestamp-link' href='#t-{_e(d.timestamp)}'>{_e(d.timestamp)}</a></td>"
-        f"<td>{d.confidence:.2f}</td></tr>"
+        f"<td>{_ts_cell(d)}</td><td>{d.confidence:.2f}</td><td>{_verified_cell(d)}</td></tr>"
         for d in decisions
     )
     return (
         "<h2 id='decisions'>Принятые решения</h2>"
-        "<table><thead><tr><th>Решение</th><th>Говорящий</th><th>Таймкод</th><th>Уверенность</th></tr></thead>"
+        "<table><thead><tr><th>Решение</th><th>Говорящий</th><th>Таймкод</th><th>Уверенность</th><th>Проверено</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
     )
 
@@ -69,27 +89,31 @@ def _tasks_table(tasks) -> str:
         return ""
     rows = "".join(
         f"<tr><td>{_e(t.task)}</td><td>{_e(t.owner)}</td><td>{_e(t.deadline)}</td>"
-        f"<td><a class='timestamp-link' href='#t-{_e(t.timestamp)}'>{_e(t.timestamp)}</a></td></tr>"
+        f"<td>{_ts_cell(t)}</td><td>{_verified_cell(t)}</td></tr>"
         for t in tasks
     )
     return (
         "<h2 id='tasks'>Поручения</h2>"
-        "<table><thead><tr><th>Поручение</th><th>Ответственный</th><th>Срок</th><th>Таймкод</th></tr></thead>"
+        "<table><thead><tr><th>Поручение</th><th>Ответственный</th><th>Срок</th><th>Таймкод</th><th>Проверено</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
     )
+
+
+_ELEMENT_TYPE_LABELS = {"decision": "решение", "task": "поручение", "chunk": "блок"}
 
 
 def _appendix(timestamp_refs) -> str:
     if not timestamp_refs:
         return ""
     rows = "".join(
-        f"<tr id='t-{_e(r.timestamp)}'><td>{_e(r.timestamp)}</td><td>{_e(r.speaker)}</td>"
-        f"<td>{_e(r.label)}</td><td>{r.chunk_index}</td></tr>"
+        f"<tr id='{_e(r.anchor) or (_e(r.timestamp))}'><td>{_e(r.timestamp)}</td><td>{_e(r.speaker)}</td>"
+        f"<td>{_e(r.source_text or r.label)}</td><td>{r.chunk_index}</td>"
+        f"<td>{_e(_ELEMENT_TYPE_LABELS.get(r.element_type, r.element_type))}</td></tr>"
         for r in timestamp_refs
     )
     return (
         "<h2 id='appendix'>Приложение: таймкоды</h2>"
-        "<table><thead><tr><th>Таймкод</th><th>Говорящий</th><th>Фрагмent</th><th>Блок</th></tr></thead>"
+        "<table><thead><tr><th>Таймкод</th><th>Говорящий</th><th>Реплика</th><th>Блок</th><th>Тип</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
     )
 

@@ -24,8 +24,10 @@ DEFAULT_PROMPTS: dict[str, str] = {
 Фрагмент расшифровки:
 {transcript_chunk}
 
+Если встречаешь специальный термин, аббревиатуру или профессиональное название, которое расшифровка могла записать неточно (на слух), добавь его в terms: detected — как записано в тексте, suggested — как термин, вероятно, должен быть написан правильно. Не предлагай замену слова на само себя.
+
 Верни JSON строго такой структуры:
-{{"topic": "", "summary": "", "facts": [], "decisions": [{{"text": "", "speaker": "", "timestamp": "", "confidence": 0.0}}], "tasks": [{{"task": "", "owner": "", "deadline": "", "speaker": "", "timestamp": "", "confidence": 0.0}}], "open_questions": [], "risks": [], "disagreements": [], "terms": []}}""",
+{{"topic": "", "summary": "", "facts": [], "decisions": [{{"text": "", "speaker": "", "timestamp": "", "confidence": 0.0}}], "tasks": [{{"task": "", "owner": "", "deadline": "", "speaker": "", "timestamp": "", "confidence": 0.0}}], "open_questions": [], "risks": [], "disagreements": [], "terms": [{{"detected": "", "suggested": "", "context": "", "timestamp": "", "confidence": 0.0}}]}}""",
 
     "topic_split": """Проанализируй расшифровку совещания и определи, можно ли надёжно разделить её по темам обсуждения.
 Если да — верни список границ тем с таймкодами начала каждой темы.
@@ -54,17 +56,23 @@ DEFAULT_PROMPTS: dict[str, str] = {
 Верни JSON строго такой структуры:
 {{"summary": "", "topics": [], "decisions": [], "tasks": [], "open_questions": [], "risks": [], "disagreements": [], "next_steps": [], "unverified_items": []}}""",
 
-    "fact_check": """Проверь, что каждый пункт итогового протокола подтверждается текстом расшифровки.
-Если пункт не подтверждается — пометь его как неподтверждённый, не удаляй и не изменяй сам текст.
+    "fact_check": """Проверь каждое решение (decisions) и каждое поручение (tasks) итогового протокола на соответствие тексту расшифровки: ответственных, сроки, цифры, таймкоды и говорящих.
 
-Протокол:
+ПРАВИЛА:
+- Не переписывай и не сокращай текст пунктов — ты только подтверждаешь или помечаешь как неподтверждённые.
+- Если пункт не подтверждается текстом расшифровки — confirmed:false и объясни почему в reason.
+- index — это порядковый номер пункта (начиная с 0) в массиве decisions или tasks итогового протокола, ровно как он дан ниже. type — "decision" или "task".
+- Верни ровно один вердикт на каждый пункт из decisions и tasks.
+- Не выдумывай новые пункты, не добавляй решения или поручения, которых нет в протоколе.
+
+Итоговый протокол (decisions и tasks для проверки):
 {document}
 
 Расшифровка:
 {transcript}
 
 Верни JSON строго такой структуры:
-{{"unverified_items": []}}""",
+{{"verified": [{{"type": "decision", "index": 0, "confirmed": true, "reason": "", "source_timestamp": "", "source_speaker": ""}}], "unverified_items": []}}""",
 
     "html_template": """<article>
 $body

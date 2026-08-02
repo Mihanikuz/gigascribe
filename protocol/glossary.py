@@ -67,11 +67,47 @@ def propose_from_user_correction(store: ProtocolStore, *, wrong_text: str, sugge
 
 
 def propose_from_llm(store: ProtocolStore, *, wrong_text: str, suggested_text: str, context: str,
-                      timestamp: str, confidence: float, job_id: Optional[str] = None) -> GlossarySuggestion:
+                      timestamp: str, confidence: float, job_id: Optional[str] = None,
+                      chunk_index: Optional[int] = None, model_id: Optional[str] = None) -> Optional[GlossarySuggestion]:
+    """Turn one LLM-proposed term into a `glossary_suggestions` row.
+
+    Returns None (proposes nothing) for anything that isn't a genuine,
+    novel, plausible suggestion: empty/whitespace-only text, a term
+    suggesting itself, an out-of-range confidence, or an exact duplicate of
+    a suggestion already pending for this job.
+    """
+    wrong_text = (wrong_text or "").strip()
+    suggested_text = (suggested_text or "").strip()
+    if not wrong_text or not suggested_text:
+        return None
+    if wrong_text.lower() == suggested_text.lower():
+        return None
+    if not (0.0 <= confidence <= 1.0):
+        return None
+    if store.has_pending_duplicate_suggestion(wrong_text=wrong_text, suggested_text=suggested_text, job_id=job_id):
+        return None
     return store.add_suggestion(GlossarySuggestion(
         id=None, source="llm_proposal", wrong_text=wrong_text, suggested_text=suggested_text,
         context=context, timestamp=timestamp, confidence=confidence, job_id=job_id,
+        chunk_index=chunk_index, model_id=model_id,
     ))
+
+
+def propose_terms_from_chunk_analysis(store: ProtocolStore, *, terms, job_id: str, chunk_index: int,
+                                       model_id: str) -> list[GlossarySuggestion]:
+    """Item 9: turn the `terms` list a chunk-analysis LLM call returned into
+    pending glossary suggestions. `terms` is an iterable of TermSuggestion.
+    """
+    created: list[GlossarySuggestion] = []
+    for t in terms:
+        sug = propose_from_llm(
+            store, wrong_text=t.detected, suggested_text=t.suggested, context=t.context,
+            timestamp=t.timestamp, confidence=t.confidence, job_id=job_id,
+            chunk_index=chunk_index, model_id=model_id,
+        )
+        if sug is not None:
+            created.append(sug)
+    return created
 
 
 def propose_from_document_diff(store: ProtocolStore, *, original_transcript: str, corrected_transcript: str,
@@ -89,10 +125,12 @@ def propose_from_document_diff(store: ProtocolStore, *, original_transcript: str
     out = []
     for (wrong, right), count in counts.items():
         if count >= min_repeats:
-            out.append(propose_from_llm(
+            sug = propose_from_llm(
                 store, wrong_text=wrong, suggested_text=right, context="document_diff",
                 timestamp="", confidence=min(1.0, count / 5), job_id=job_id,
-            ))
+            )
+            if sug is not None:
+                out.append(sug)
     return out
 
 

@@ -88,3 +88,65 @@ def test_seed_model_is_idempotent(tmp_path):
     store.update_model_state("qwen3-8b", installed=1)
     store.seed_model(spec)  # must not overwrite the installed flag we just set
     assert store.get_model_state("qwen3-8b")["installed"] == 1
+
+
+def test_protocol_jobs_rebuild_migration_preserves_rows_and_adds_new_shape(tmp_path):
+    """Follow-up spec item 1/2: protocol_jobs predating settings_snapshot and
+    the 'fact_checking' status (as it existed right after the module's first
+    release) must upgrade in place, in a single transaction, without losing
+    any existing protocol job rows -- SQLite can't ALTER a CHECK constraint
+    or add a NOT NULL column without a default to a table that might already
+    have rows, so ProtocolStore rebuilds the table instead."""
+    db_path = tmp_path / "jobs.sqlite3"
+    job_store.JobStore(db_path)
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "INSERT INTO jobs (id,username,filename,status,created_at,settings_snapshot,transcript_path) "
+        "VALUES ('job-old','carol','m.wav','completed',?,'{}','/data/results/job-old/t.txt')",
+        (time.time(),),
+    )
+    old_status_check = "CHECK(status IN ('queued','waiting_for_gpu','unloading_asr','loading_llm',"\
+        "'splitting','processing_chunks','merging','rendering','completed','failed','cancelled'))"
+    raw.execute(f"""CREATE TABLE protocol_jobs (
+      id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), username TEXT NOT NULL,
+      status TEXT NOT NULL {old_status_check}, progress REAL NOT NULL DEFAULT 0, message TEXT,
+      model_id TEXT, chunk_total INTEGER, chunk_current INTEGER, error TEXT, created_at REAL NOT NULL,
+      started_at REAL, finished_at REAL, attempts INTEGER NOT NULL DEFAULT 0,
+      cancel_requested INTEGER NOT NULL DEFAULT 0, json_path TEXT, html_path TEXT, log_path TEXT
+    )""")
+    raw.execute(
+        "INSERT INTO protocol_jobs (id,job_id,username,status,progress,message,created_at) "
+        "VALUES ('pj-old','job-old','carol','completed',1.0,'Готово',?)", (time.time(),),
+    )
+    raw.commit()
+    raw.close()
+
+    store = ProtocolStore(db_path)  # triggers the rebuild
+
+    with sqlite3.connect(db_path) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT * FROM protocol_jobs WHERE id='pj-old'").fetchone()
+    assert row is not None, "existing protocol job row must survive the rebuild"
+    assert row["status"] == "completed"
+    assert row["username"] == "carol"
+    assert row["settings_snapshot"] == "{}", "old rows get the column's default, not NULL"
+
+    # the new shape actually accepts what the old one couldn't
+    job = store.get_protocol_job("pj-old")
+    assert job["settings_snapshot"] == {}
+    store.update_protocol_job("pj-old", status="fact_checking")
+    assert store.get_protocol_job("pj-old")["status"] == "fact_checking"
+
+    new_id = store.create_protocol_job(id="pj-new", job_id="job-old", username="carol", model_id="qwen3-8b",
+                                        settings_snapshot={"model_id": "qwen3-8b"})
+    assert new_id["settings_snapshot"] == {"model_id": "qwen3-8b"}
+
+
+def test_protocol_jobs_migration_is_idempotent_once_rebuilt(tmp_path):
+    db_path = tmp_path / "jobs.sqlite3"
+    job_store.JobStore(db_path)
+    ProtocolStore(db_path)  # fresh DB: already the new shape
+    ProtocolStore(db_path)  # second run must not attempt (or need) a rebuild
+    with sqlite3.connect(db_path) as db:
+        cols = {r[1] for r in db.execute("PRAGMA table_info(protocol_jobs)")}
+    assert "settings_snapshot" in cols

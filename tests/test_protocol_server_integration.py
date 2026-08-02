@@ -174,3 +174,50 @@ def test_create_button_conditions_and_access_control(tmp_path):
     """, env_extra=env)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "OK" in result.stdout
+
+
+def test_user_correction_creates_suggestion_and_is_owner_only(tmp_path):
+    """Items 21-22: POST /api/jobs/{id}/glossary-suggestion creates a
+    proposed, never-auto-applied suggestion for the owner/admin, and a
+    non-owner, non-admin user gets 403 trying to suggest one for someone
+    else's job."""
+    env = _base_env(tmp_path)
+    env["GIGASCRIBE_PROTOCOL_ENABLED"] = "1"
+    result = _run_script("""
+        import server
+        from fastapi.testclient import TestClient
+
+        with TestClient(server.app) as c:
+            c.post("/login", data={"username": "admin", "password": "ARealStrongPassword123"})
+            r = c.post("/admin/users", data={"username": "bob", "password": "bobpassword"})
+            assert r.status_code == 200
+
+            server.job_store.create(id="job-c1", username="admin", filename="m.wav",
+                                     original_path=None, log_path=None, settings_snapshot={})
+
+            r = c.post("/api/jobs/job-c1/glossary-suggestion",
+                       json={"wrong_text": "азуре", "suggested_text": "Azure"})
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["status"] == "proposed"
+
+            pending = server.PROTOCOL_SERVICE.store.list_suggestions("proposed")
+            match = [s for s in pending if s.wrong_text == "азуре"]
+            assert len(match) == 1
+            assert match[0].source == "user_correction"
+            assert match[0].job_id == "job-c1"
+
+            # never auto-applied
+            terms = server.PROTOCOL_SERVICE.store.resolved_terms()
+            assert not any("азуре" in t.aliases for t in terms)
+
+            bob = TestClient(server.app)
+            bob.post("/login", data={"username": "bob", "password": "bobpassword"})
+            r = bob.post("/api/jobs/job-c1/glossary-suggestion",
+                         json={"wrong_text": "x", "suggested_text": "Y"})
+            assert r.status_code == 403, "a non-owner, non-admin must not be able to suggest a correction for another user's job"
+
+        print("OK")
+    """, env_extra=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "OK" in result.stdout
