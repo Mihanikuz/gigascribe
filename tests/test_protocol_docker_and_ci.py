@@ -24,6 +24,19 @@ def test_install_protocol_1_builds_llama_cpp_python_with_cuda():
     dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "GGML_CUDA=on" in dockerfile
     assert "llama-cpp-python" in (REPO_ROOT / "requirements-protocol.txt").read_text(encoding="utf-8")
+    # CUDA build flags are baked into the Dockerfile itself (item 3) -- the
+    # user never has to set CMAKE_ARGS/FORCE_CMAKE by hand.
+    assert "FORCE_CMAKE=1" in dockerfile
+
+
+def test_install_protocol_1_verifies_llama_cpp_importable_after_install():
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    # item 3: the build itself must fail if llama_cpp isn't importable
+    # afterwards, rather than silently succeeding without it.
+    assert 'import llama_cpp' in dockerfile
+    install_pos = dockerfile.index("requirements-protocol.txt")
+    check_pos = dockerfile.index("import llama_cpp")
+    assert install_pos < check_pos
 
 
 def test_compose_protocol_override_sets_build_arg_and_env_var():
@@ -43,3 +56,19 @@ def test_ci_installs_ffmpeg_before_pytest_without_continue_on_error():
     ffmpeg_pos = ci.index("apt-get install -y ffmpeg")
     pytest_pos = ci.index("run: pytest -q")
     assert ffmpeg_pos < pytest_pos, "FFmpeg must be installed before the Pytest step"
+
+
+def test_ci_confirms_default_image_excludes_llama_cpp():
+    ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "import llama_cpp" in ci
+    assert "must NOT be importable" in ci
+
+
+def test_download_models_script_runs_before_docker_build_in_documented_order():
+    script = REPO_ROOT / "scripts" / "download-models.sh"
+    assert script.is_file()
+    assert script.stat().st_mode & 0o111, "download-models.sh must be executable"
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    download_pos = readme.index("download-models.sh")
+    build_pos = readme.index("docker compose build")
+    assert download_pos < build_pos, "README must document downloading models before building"

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import html
 import json
+import xml.etree.ElementTree as ET
 from string import Template
 from typing import Any
 
@@ -47,6 +48,18 @@ def _list_section(title: str, anchor: str, items: tuple, *, unverified: bool = F
     cls = " class='unverified'" if unverified else ""
     lis = "".join(f"<li{cls}>{_e(item)}</li>" for item in items)
     return f"<h2 id='{anchor}'>{_e(title)}</h2><ul>{lis}</ul>"
+
+
+def _topics_section(topics) -> str:
+    """Item 6: a title plus an optional short description -- never a raw
+    nested JSON object dumped as text."""
+    if not topics:
+        return ""
+    items = "".join(
+        f"<li><strong>{_e(t.title)}</strong>{f'<br>{_e(t.summary)}' if t.summary else ''}</li>"
+        for t in topics
+    )
+    return f"<h2 id='topics'>Обсуждавшиеся темы</h2><ul>{items}</ul>"
 
 
 def _ts_cell(item) -> str:
@@ -119,14 +132,6 @@ def _appendix(timestamp_refs) -> str:
 
 
 def build_body(doc: ProtocolDocument) -> str:
-    toc_items = [
-        ("summary", "Резюме"), ("topics", "Темы"), ("decisions", "Решения"),
-        ("tasks", "Поручения"), ("open_questions", "Открытые вопросы"),
-        ("risks", "Риски"), ("disagreements", "Разногласия"), ("next_steps", "Следующие шаги"),
-        ("unverified", "Неподтверждённые пункты"), ("appendix", "Таймкоды"),
-    ]
-    toc = "<nav class='toc'>" + "".join(f"<a href='#{a}'>{_e(t)}</a>" for a, t in toc_items) + "</nav>"
-
     meta = (
         f"<div class='meta'>Файл: {_e(doc.source_filename)} &middot; "
         f"Обработано: {_e(doc.processed_at)} &middot; "
@@ -135,26 +140,34 @@ def build_body(doc: ProtocolDocument) -> str:
         f"Модель: {_e(doc.model_id)}</div>"
     )
 
-    sections = [
-        f"<h2 id='summary'>Краткое резюме</h2><p>{_e(doc.summary)}</p>",
-        _list_section("Обсуждавшиеся темы", "topics", doc.topics),
-        _decisions_table(doc.decisions),
-        _tasks_table(doc.tasks),
-        _list_section("Открытые вопросы", "open_questions", doc.open_questions),
-        _list_section("Риски", "risks", doc.risks),
-        _list_section("Разногласия", "disagreements", doc.disagreements),
-        _list_section("Следующие шаги", "next_steps", doc.next_steps),
-        _list_section("Неподтверждённые пункты", "unverified", doc.unverified_items, unverified=True),
-        _appendix(doc.timestamp_refs),
+    # (anchor, TOC label, rendered section HTML) -- a section and its TOC
+    # entry are always hidden together (item 12: hide empty sections).
+    parts = [
+        ("summary", "Резюме", f"<h2 id='summary'>Краткое резюме</h2><p>{_e(doc.summary)}</p>" if doc.summary else ""),
+        ("topics", "Темы", _topics_section(doc.topics)),
+        ("decisions", "Решения", _decisions_table(doc.decisions)),
+        ("tasks", "Поручения", _tasks_table(doc.tasks)),
+        ("open_questions", "Открытые вопросы", _list_section("Открытые вопросы", "open_questions", doc.open_questions)),
+        ("risks", "Риски", _list_section("Риски", "risks", doc.risks)),
+        ("disagreements", "Разногласия", _list_section("Разногласия", "disagreements", doc.disagreements)),
+        ("next_steps", "Следующие шаги", _list_section("Следующие шаги", "next_steps", doc.next_steps)),
+        ("unverified", "Неподтверждённые пункты",
+         _list_section("Неподтверждённые пункты", "unverified", doc.unverified_items, unverified=True)),
+        ("appendix", "Таймкоды", _appendix(doc.timestamp_refs)),
     ]
+    present = [(anchor, label, section) for anchor, label, section in parts if section]
+    toc = "<nav class='toc'>" + "".join(f"<a href='#{a}'>{_e(t)}</a>" for a, t, _ in present) + "</nav>"
+    sections = "".join(section for _, _, section in present)
+
     actions = (
         "<div class='actions'>"
         "<button onclick='window.print()'>🖨 Печать</button>"
         "<a href='protocol.html' download>Скачать HTML</a>"
         "<a href='protocol.json' download>Скачать JSON</a>"
+        "<a href='protocol.xml' download>Скачать XML</a>"
         "</div>"
     )
-    return f"<h1>{_e(doc.meeting_title)}</h1>{meta}{actions}{toc}" + "".join(sections)
+    return f"<h1>{_e(doc.meeting_title)}</h1>{meta}{actions}{toc}{sections}"
 
 
 def render_html(doc: ProtocolDocument, *, template: str) -> str:
@@ -171,6 +184,93 @@ def render_html(doc: ProtocolDocument, *, template: str) -> str:
         f"<title>{_e(doc.meeting_title)}</title><style>{_PAGE_CSS}</style>"
         f"{page}"
     )
+
+
+# --- XML (item 11) -------------------------------------------------------
+#
+# xml.etree.ElementTree escapes &, <, >, ", ' automatically for both text
+# and attribute content -- built from the same validated ProtocolDocument
+# as the HTML/JSON, never independently, so all three formats always agree.
+
+def _xml_text(parent: ET.Element, tag: str, value: Any) -> ET.Element:
+    el = ET.SubElement(parent, tag)
+    el.text = "" if value is None else str(value)
+    return el
+
+
+def _xml_verified(value: bool | None) -> str:
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return ""
+
+
+def _xml_item_list(parent: ET.Element, wrapper_tag: str, items: tuple) -> None:
+    wrapper = ET.SubElement(parent, wrapper_tag)
+    for item in items:
+        _xml_text(wrapper, "item", item)
+
+
+def build_xml_tree(doc: ProtocolDocument) -> ET.Element:
+    root = ET.Element("protocol")
+
+    meta = ET.SubElement(root, "metadata")
+    _xml_text(meta, "title", doc.meeting_title)
+    _xml_text(meta, "sourceFile", doc.source_filename)
+    _xml_text(meta, "processedAt", doc.processed_at)
+    _xml_text(meta, "durationSeconds", doc.duration_seconds)
+    _xml_text(meta, "model", doc.model_id)
+
+    participants_el = ET.SubElement(root, "participants")
+    for p in doc.participants:
+        _xml_text(participants_el, "participant", p)
+
+    _xml_text(root, "summary", doc.summary)
+
+    topics_el = ET.SubElement(root, "topics")
+    for t in doc.topics:
+        topic_el = ET.SubElement(topics_el, "topic")
+        _xml_text(topic_el, "title", t.title)
+        _xml_text(topic_el, "summary", t.summary)
+
+    decisions_el = ET.SubElement(root, "decisions")
+    for d in doc.decisions:
+        d_el = ET.SubElement(decisions_el, "decision")
+        _xml_text(d_el, "text", d.text)
+        _xml_text(d_el, "speaker", d.speaker)
+        _xml_text(d_el, "timestampStart", d.timestamp_start)
+        _xml_text(d_el, "timestampEnd", d.timestamp_end)
+        _xml_text(d_el, "confidence", f"{d.confidence:.2f}")
+        _xml_text(d_el, "verified", _xml_verified(d.verified))
+        _xml_text(d_el, "verificationReason", d.verification_reason)
+
+    tasks_el = ET.SubElement(root, "tasks")
+    for t in doc.tasks:
+        t_el = ET.SubElement(tasks_el, "task")
+        _xml_text(t_el, "text", t.task)
+        _xml_text(t_el, "owner", t.owner)
+        _xml_text(t_el, "deadline", t.deadline)
+        _xml_text(t_el, "speaker", t.speaker)
+        _xml_text(t_el, "timestampStart", t.timestamp_start)
+        _xml_text(t_el, "timestampEnd", t.timestamp_end)
+        _xml_text(t_el, "confidence", f"{t.confidence:.2f}")
+        _xml_text(t_el, "verified", _xml_verified(t.verified))
+        _xml_text(t_el, "verificationReason", t.verification_reason)
+
+    _xml_item_list(root, "openQuestions", doc.open_questions)
+    _xml_item_list(root, "risks", doc.risks)
+    _xml_item_list(root, "disagreements", doc.disagreements)
+    _xml_item_list(root, "nextSteps", doc.next_steps)
+    _xml_item_list(root, "unverifiedItems", doc.unverified_items)
+    return root
+
+
+def render_xml(doc: ProtocolDocument) -> str:
+    root = build_xml_tree(doc)
+    ET.indent(root, space="  ")
+    body = ET.tostring(root, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + body + "\n"
 
 
 def document_to_json_text(doc: ProtocolDocument) -> str:

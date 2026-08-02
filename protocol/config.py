@@ -39,6 +39,10 @@ class ProtocolConfig:
     max_retries: int = 2
     glossary_suggestions_enabled: bool = True
     default_glossary_scope: str = "global"
+    # Item 13: full raw LLM responses can contain confidential meeting
+    # content and must never land in protocol.log by default. Off unless
+    # explicitly turned on for debugging.
+    debug_raw_response: bool = False
 
     @property
     def results_dir(self) -> Path:
@@ -58,4 +62,5 @@ class ProtocolConfig:
             max_retries=int(os.getenv("GIGASCRIBE_PROTOCOL_MAX_RETRIES", "2")),
             glossary_suggestions_enabled=os.getenv("GIGASCRIBE_PROTOCOL_GLOSSARY_SUGGESTIONS", "1") == "1",
             default_glossary_scope=os.getenv("GIGASCRIBE_PROTOCOL_DEFAULT_GLOSSARY_SCOPE", "global"),
+            debug_raw_response=os.getenv("GIGASCRIBE_PROTOCOL_DEBUG_RAW_RESPONSE", "0") == "1",
         )

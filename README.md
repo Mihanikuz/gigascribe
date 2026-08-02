@@ -27,23 +27,26 @@ models/
 
 ## Installation
 
+Install in this order — models are downloaded and verified *before* the application is built and
+started, never after:
+
 1. Copy the example environment file and edit it:
    ```bash
    cp .env.example .env
    ```
    At minimum set real values for `GIGASCRIBE_SECRET_KEY` and `GIGASCRIBE_ADMIN_PASSWORD` — the server refuses to start with the placeholder values shipped in `.env.example` (or with `admin`). Set `HF_TOKEN` if you need diarization.
 
-2. Build the image and download the models into `./models` (this step needs real internet access, so it explicitly overrides the container's normal offline mode):
+   If the build machine can only reach GitHub through a proxy, `export http_proxy=... https_proxy=...` (and `no_proxy` if needed) in the shell before the next step — Docker forwards those automatically as build args, which both `apt-get` and the `pip install git+https://...` step (for the ASR backend) respect. Don't edit the Dockerfile for this.
+
+2. Download and verify every model the application needs (GigaAM, and pyannote unless you skip it) — this step needs real internet access, so it explicitly overrides the offline mode the served application always runs with:
+   ```bash
+   ./scripts/download-models.sh
+   ```
+   This builds the base image (needed to run GigaAM/pyannote's own loaders for verification) and then downloads into `./models`. It's safe to re-run — nothing already downloaded and verified is re-fetched. Set `GIGASCRIBE_SKIP_PYANNOTE=1` first if you don't have an `HF_TOKEN` and want to skip diarization. To also fetch the protocol module's `qwen3-8b` model in this same step, set `GIGASCRIBE_PROTOCOL_MODEL_REPO_ID`/`GIGASCRIBE_PROTOCOL_MODEL_FILENAME` first (see [Supported models](#supported-models) below for why those aren't filled in for you); otherwise install it separately later. At any time, re-check what's installed without downloading anything: `docker compose run --rm gigascribe-gpu python scripts/download_models.py --check`.
+
+3. Build (fast — the previous step already built and cached this) and start:
    ```bash
    docker compose build
-   docker compose run --rm gigascribe-gpu python scripts/download_models.py
-   ```
-   Pass `--skip-pyannote` to skip diarization if you don't have an `HF_TOKEN`. Re-run with `--check` at any time to verify what's installed without downloading anything.
-
-   If the build machine can only reach GitHub through a proxy, `export http_proxy=... https_proxy=...` (and `no_proxy` if needed) in the shell before `docker compose build` — Docker forwards those automatically as build args, which both `apt-get` and the `pip install git+https://...` step (for the ASR backend) respect. Don't edit the Dockerfile for this.
-
-3. Start the service and confirm it's healthy:
-   ```bash
    docker compose up -d
    curl -f http://127.0.0.1:8000/health/ready
    ```
@@ -51,6 +54,20 @@ models/
 4. Open `http://<host>:8000`, log in as `admin` with the password from step 1, and create accounts for other users at `/admin`.
 
 CPU, CTC models, pyannote 3.1, compatibility profiles, and compose override profiles have been removed.
+
+## Data storage
+
+Every writable/user-created file lives outside the image, in the two directories `compose.yaml`
+bind-mounts from the host: `./data` (→ `GIGASCRIBE_DATA_DIR`, uploaded originals, transcripts,
+M4A/FLAC exports, generated protocols, `jobs.sqlite3`, logs) and `./models` (→
+`GIGASCRIBE_MODELS_DIR`, GigaAM/pyannote/protocol model weights). Rebuilding, updating, or removing
+the container never touches either directory — only `docker compose down -v` (which this project's
+compose files don't define named volumes for, so `-v` has nothing to remove here) or manually
+deleting the host paths would. To point either at a dedicated external location instead of a
+relative `./data`/`./models` next to the repo (e.g. `/opt/gigascribe-data`), set
+`GIGASCRIBE_DATA_DIR=/opt/gigascribe-data/app-data` and `GIGASCRIBE_MODELS_DIR=/opt/gigascribe-data/models`
+in `.env` and update the two bind-mount paths on the left of the `:` in `compose.yaml`'s `volumes:`
+to match; the container-side paths (right of the `:`) don't need to change.
 
 ## Users and administration
 
@@ -203,15 +220,21 @@ result, or the final protocol.
    index (never rewriting the item's text). An item that can't be confirmed is marked unverified —
    never removed. If the fact-check call itself fails technically (invalid JSON after every retry),
    the whole protocol job fails rather than publishing an unverified protocol as "ready".
-4. Each decision/task's timestamp is matched to the nearest real transcript segment (within a
-   tolerance); a match gets a unique, stable HTML anchor (e.g. `timestamp-312-1`) and an appendix
-   row (timecode, speaker, source reply, block number, item type). A timestamp that can't be matched
-   is shown as plain text, never as a broken link, and the item is noted in `unverified_items`.
-5. The result is rendered to `protocol.json` (source of truth — includes the model/engine, prompt
-   versions, chunking settings, and app git commit for reproducibility) and `protocol.html`
-   (`protocol/renderer.py`, escapes everything, table of contents, print/download buttons) under
+4. Each decision/task's timestamp — a single point or a range like `15:12 - 16:00` — is matched to
+   a *genuine* transcript segment (one whose own span actually overlaps the cited time, not merely
+   whichever segment happens to start closest) within a tolerance; a match gets a unique, stable
+   HTML anchor (e.g. `timestamp-312-1`, never the raw timecode text itself) and an appendix row
+   (timecode, speaker, source reply, block number, item type). A timestamp that can't be matched is
+   shown as plain text, never as a broken link, and the item is noted in `unverified_items`.
+5. The result is rendered from that one validated document into `protocol.json` (source of truth
+   — includes the model/engine, prompt versions, chunking settings, and app git commit for
+   reproducibility), `protocol.html` (`protocol/renderer.py`, escapes everything, table of
+   contents, hides empty sections, print/download buttons for all three formats), and
+   `protocol.xml` (same data, validates against `protocol/protocol.xsd`) under
    `data/protocols/<job_id>/`, alongside `protocol.log` (full internal detail/tracebacks — never
-   shown to the user, who only sees a short status message including a `fact_checking` stage).
+   shown to the user, who only sees a short status message including a `fact_checking` stage). Set
+   `GIGASCRIBE_PROTOCOL_DEBUG_RAW_RESPONSE=1` to also log every raw LLM response to `protocol.log`
+   for debugging — off by default, since a meeting's raw model output can be confidential.
 6. On any failure, the protocol job is marked `failed` with a short message, the LLM is unloaded,
    and the underlying transcription job is completely untouched — it is not marked failed and its
    results are not deleted. The user can retry from the same button (replaying the original settings
@@ -227,6 +250,7 @@ data/
   protocols/<job_id>/
     protocol.json        # structured result (source of truth)
     protocol.html         # rendered page served at /api/jobs/{id}/protocol
+    protocol.xml            # same document, validates against protocol/protocol.xsd
     protocol.log           # full internal log, incl. tracebacks on failure
 models/
   protocol/<model_id>/...  # installed GGUF weights

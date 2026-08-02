@@ -20,16 +20,20 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from . import glossary as glossary_mod
-from .chunking import choose_chunks, enforce_context_budget, normalize_segments, parse_timestamp, parse_transcript, split_by_time_windows
+from .chunking import (
+    choose_chunks, enforce_context_budget, normalize_segments, parse_timestamp, parse_timestamp_range,
+    parse_transcript, split_by_time_windows,
+)
 from .config import ProtocolConfig
 from .models import SUPPORTED_PROTOCOL_MODELS
 from .providers import create_provider, validate_engine_config
 from .providers.base import LLMProvider
-from .renderer import document_to_json_text, render_html
+from .renderer import document_to_json_text, render_html, render_xml
 from .schemas import (
     PROMPT_KINDS, ChunkAnalysis, DecisionItem, FactCheckVerdict, NOT_SPECIFIED, ProtocolDocument, ProtocolOptions,
-    ProtocolResult, ProtocolValidationError, SettingsSnapshot, TaskItem, TimestampRef, TranscriptSegment,
-    format_seconds, validate_settings_snapshot,
+    ProtocolResult, ProtocolValidationError, SettingsSnapshot, TaskItem, TimestampRef, Topic, TranscriptSegment,
+    as_str_list, dedup_items_preserve_order, dedup_preserve_order, format_seconds, normalize_text,
+    validate_settings_snapshot,
 )
 from .store import ProtocolStore
 
@@ -232,6 +236,14 @@ class ProtocolService:
             job = self.store.get_protocol_job(protocol_job_id)
             return bool(job and job["cancel_requested"])
 
+        def on_raw(raw: str) -> None:
+            # Item 13: opt-in only. A meeting's raw LLM output can contain
+            # confidential content and must never land in protocol.log
+            # (which is retained on disk) unless explicitly requested.
+            log(f"RAW RESPONSE: {raw}")
+
+        raw_response_hook = on_raw if self.config.debug_raw_response else None
+
         model_id = snapshot.model_id
         temperature, max_tokens = snapshot.temperature, snapshot.max_output_tokens
         no_think = bool(SUPPORTED_PROTOCOL_MODELS.get(model_id) and SUPPORTED_PROTOCOL_MODELS[model_id].no_think)
@@ -283,7 +295,7 @@ class ProtocolService:
                     topic_boundaries, topic_hints = await self._two_stage_topic_split(
                         provider, segments, prompt_content=prompt_contents["topic_split"],
                         chunk_minutes=snapshot.chunk_minutes, temperature=temperature, max_tokens=max_tokens,
-                        context_length=snapshot.context_length, log=log,
+                        context_length=snapshot.context_length, log=log, raw_response_hook=raw_response_hook,
                     )
                 chunks = choose_chunks(
                     segments, topic_boundaries=topic_boundaries,
@@ -304,7 +316,7 @@ class ProtocolService:
                         set_status("cancelled", "Отменено"); return
                     prompt = prompt_contents["chunk_analysis"].replace("{transcript_chunk}", chunk.to_prompt_text())
                     raw = await provider.generate_json(prompt, temperature=temperature, max_tokens=max_tokens,
-                                                         max_retries=snapshot.max_retries)
+                                                         max_retries=snapshot.max_retries, on_raw_response=raw_response_hook)
                     analysis = ChunkAnalysis.from_llm_json(chunk.index, raw)
                     analyses.append(analysis)
                     if snapshot.glossary_suggestions_enabled and analysis.terms:
@@ -325,7 +337,7 @@ class ProtocolService:
                     "{chunk_analyses}", json.dumps([_analysis_to_dict(a) for a in analyses], ensure_ascii=False),
                 )
                 merged_raw = await provider.generate_json(merge_prompt, temperature=temperature, max_tokens=max_tokens,
-                                                            max_retries=snapshot.max_retries)
+                                                            max_retries=snapshot.max_retries, on_raw_response=raw_response_hook)
                 if not isinstance(merged_raw, dict):
                     raise ProtocolValidationError("merge response must be a JSON object")
                 raw_decisions = [DecisionItem.from_json(d) for d in (merged_raw.get("decisions") or []) if isinstance(d, dict)]
@@ -340,6 +352,7 @@ class ProtocolService:
                     summary=str(merged_raw.get("summary") or ""), topics=merged_raw.get("topics") or [],
                     prompt_content=prompt_contents["fact_check"], temperature=temperature, max_tokens=max_tokens,
                     max_retries=snapshot.max_retries, context_length=snapshot.context_length, log=log,
+                    raw_response_hook=raw_response_hook,
                 )
                 # Any failure above (invalid JSON after every retry, provider
                 # error) propagates out of this try block: per item 2, a
@@ -353,17 +366,23 @@ class ProtocolService:
                 )
 
                 set_status("rendering", "Формирование HTML", progress=0.9)
+                # HTML, JSON, and XML are all rendered from this one
+                # `document` -- never independently -- so the three always
+                # agree (item 11).
                 html_text = render_html(document, template=prompt_contents["html_template"])
                 json_text = document_to_json_text(document)
+                xml_text = render_xml(document)
                 json_path = result_dir / "protocol.json"
                 html_path = result_dir / "protocol.html"
+                xml_path = result_dir / "protocol.xml"
                 json_path.write_text(json_text, encoding="utf-8")
                 html_path.write_text(html_text, encoding="utf-8")
+                xml_path.write_text(xml_text, encoding="utf-8")
                 self.store.save_result(protocol_job_id, document.to_json_dict(), model_id=model_id,
                                         prompt_versions=document.prompt_versions)
 
                 set_status("completed", "Готово", progress=1.0, json_path=str(json_path),
-                           html_path=str(html_path), finished_at=time.time())
+                           html_path=str(html_path), xml_path=str(xml_path), finished_at=time.time())
         except asyncio.CancelledError:
             set_status("cancelled", "Отменено", finished_at=time.time())
             raise
@@ -395,7 +414,8 @@ class ProtocolService:
 
     async def _two_stage_topic_split(self, provider: LLMProvider, segments: list[TranscriptSegment], *,
                                       prompt_content: str, chunk_minutes: float, temperature: float, max_tokens: int,
-                                      context_length: int, log: Callable[[str], None]
+                                      context_length: int, log: Callable[[str], None],
+                                      raw_response_hook: Optional[Callable[[str], None]] = None,
                                       ) -> tuple[Optional[list[float]], dict[float, str]]:
         if not segments:
             return None, {}
@@ -409,6 +429,7 @@ class ProtocolService:
                     raw = await provider.generate_json(
                         prompt_content.replace("{transcript}", block.to_prompt_text()),
                         temperature=temperature, max_tokens=min(max_tokens, 512), max_retries=1,
+                        on_raw_response=raw_response_hook,
                     )
                     topics = raw.get("topics") or []
                     if topics and isinstance(topics[0], dict):
@@ -423,7 +444,8 @@ class ProtocolService:
                 for b in pre_blocks
             )
             raw = await provider.generate_json(prompt_content.replace("{transcript}", condensed),
-                                                temperature=temperature, max_tokens=max_tokens, max_retries=1)
+                                                temperature=temperature, max_tokens=max_tokens, max_retries=1,
+                                                on_raw_response=raw_response_hook)
             topics = raw.get("topics") or []
             boundaries: list[float] = []
             for t in topics:
@@ -459,7 +481,8 @@ class ProtocolService:
     async def _fact_check(self, provider: LLMProvider, *, decisions: list[DecisionItem], tasks: list[TaskItem],
                            segments: list[TranscriptSegment], summary: str, topics: list[Any], prompt_content: str,
                            temperature: float, max_tokens: int, max_retries: int, context_length: int,
-                           log: Callable[[str], None]) -> tuple[dict[tuple[str, int], FactCheckVerdict], list[str]]:
+                           log: Callable[[str], None], raw_response_hook: Optional[Callable[[str], None]] = None,
+                           ) -> tuple[dict[tuple[str, int], FactCheckVerdict], list[str]]:
         if not decisions and not tasks:
             return {}, []
         fact_check_doc = {
@@ -474,7 +497,8 @@ class ProtocolService:
         # Deliberately NOT caught here: after max_retries exhausted,
         # generate_json raises ProtocolValidationError, which must fail the
         # whole protocol job rather than emit an unverified protocol (item 2).
-        raw = await provider.generate_json(prompt, temperature=temperature, max_tokens=max_tokens, max_retries=max_retries)
+        raw = await provider.generate_json(prompt, temperature=temperature, max_tokens=max_tokens, max_retries=max_retries,
+                                            on_raw_response=raw_response_hook)
         verified_raw = raw.get("verified") or []
         if not isinstance(verified_raw, list):
             verified_raw = []
@@ -488,7 +512,7 @@ class ProtocolService:
                 continue  # out-of-range index: ignore rather than trust a hallucinated reference
             verdicts[(v.type, v.index)] = v
         raw_notes = raw.get("unverified_items")
-        notes = [str(x) for x in raw_notes] if isinstance(raw_notes, list) else []
+        notes = [t for t in (normalize_text(x) for x in raw_notes) if t] if isinstance(raw_notes, list) else []
         log(f"Fact-check: {len(verdicts)}/{len(decisions) + len(tasks)} item(s) verified")
         return verdicts, notes
 
@@ -504,23 +528,26 @@ def _fit_transcript_for_fact_check(segments: list[TranscriptSegment], decisions:
                                     tasks: list[TaskItem], *, context_length: int, chars_per_token: float = 3.2,
                                     reserved_tokens: int = 1500) -> str:
     """Bound the transcript text sent for fact-checking to the model's own
-    context window: the full text if it fits, otherwise only the segments
-    near a referenced timestamp (plus a small margin either side)."""
+    context window: the full text if it fits, otherwise the segments around
+    each cited timecode -- using the *whole* range when one was given (item
+    7/8), not just its start, plus a margin so adjacent segments (a number
+    restated in the next line, a correction) are visible to the check."""
     full_text = "\n".join(f"{s.speaker} [{format_seconds(s.start)} - {format_seconds(s.end)}]: {s.text}" for s in segments)
     budget_chars = max(2000, int(max(0, context_length - reserved_tokens) * chars_per_token))
     if len(full_text) <= budget_chars:
         return full_text
-    timestamps: list[float] = []
+    windows: list[tuple[float, float]] = []
+    margin = 60.0
     for item in (*decisions, *tasks):
         try:
-            timestamps.append(parse_timestamp(item.timestamp))
+            lo, hi = parse_timestamp_range(item.timestamp)
         except ValueError:
             continue
-    if not timestamps:
+        windows.append((lo - margin, hi + margin))
+    if not windows:
         return full_text[:budget_chars]
-    margin = 60.0
-    windows = sorted((t - margin, t + margin) for t in timestamps)
-    kept = [s for s in segments if any(lo <= s.start <= hi for lo, hi in windows)]
+    windows.sort()
+    kept = [s for s in segments if any(lo <= s.start <= hi or lo <= s.end <= hi for lo, hi in windows)]
     if not kept:
         return full_text[:budget_chars]
     text = "\n".join(f"{s.speaker} [{format_seconds(s.start)} - {format_seconds(s.end)}]: {s.text}" for s in kept)
@@ -550,24 +577,40 @@ def _analysis_to_dict(a: ChunkAnalysis) -> dict[str, Any]:
 
 
 def _resolve_anchor(timestamp: str, segments: list[TranscriptSegment], counters: dict[int, int]
-                     ) -> tuple[Optional[str], Optional[TranscriptSegment]]:
-    """Item 8: link a decision/task timestamp to the nearest real transcript
-    segment (within tolerance) and mint a unique, stable anchor id for it --
-    never the raw timestamp text itself, which is not guaranteed unique and
-    is not guaranteed to correspond to any real moment in the transcript."""
+                     ) -> tuple[Optional[str], Optional[TranscriptSegment], str, str]:
+    """Item 7/8: link a decision/task timecode -- a single point or a range
+    -- to a real transcript segment and mint a unique, stable anchor for
+    it, never the raw timestamp text itself (not guaranteed unique, not
+    guaranteed to correspond to any real moment). The range's *start* is
+    used for the link per spec; the parsed (start, end) is returned
+    separately so callers can record it regardless of whether a link could
+    be resolved.
+
+    A match must be a genuine transcript segment, not just whatever is
+    numerically nearest: prefer a segment whose own [start, end] actually
+    overlaps the cited range, and only fall back to nearest-by-start (still
+    tolerance-checked) when nothing overlaps.
+    """
     if not timestamp or timestamp == NOT_SPECIFIED or not segments:
-        return None, None
+        return None, None, "", ""
     try:
-        t = parse_timestamp(timestamp)
+        t_start, t_end = parse_timestamp_range(timestamp)
     except ValueError:
-        return None, None
-    best = min(segments, key=lambda s: abs(s.start - t))
-    if abs(best.start - t) > _TIMESTAMP_MATCH_TOLERANCE_SECONDS:
-        return None, None
+        return None, None, "", ""
+    start_str, end_str = format_seconds(t_start), format_seconds(t_end)
+
+    overlapping = [s for s in segments if s.start <= t_end and s.end >= t_start]
+    if overlapping:
+        best = min(overlapping, key=lambda s: abs(s.start - t_start))
+    else:
+        best = min(segments, key=lambda s: abs(s.start - t_start))
+        if abs(best.start - t_start) > _TIMESTAMP_MATCH_TOLERANCE_SECONDS:
+            return None, None, start_str, end_str
+
     second = int(best.start)
     n = counters.get(second, 0) + 1
     counters[second] = n
-    return f"timestamp-{second}-{n}", best
+    return f"timestamp-{second}-{n}", best, start_str, end_str
 
 
 def _build_document(merged_raw: dict[str, Any], *, segments: list[TranscriptSegment], chunks, source_filename: str,
@@ -587,7 +630,7 @@ def _build_document(merged_raw: dict[str, Any], *, segments: list[TranscriptSegm
     unverified_notes: list[str] = []
 
     def _link(item, element_type: str, index: int):
-        anchor, seg = _resolve_anchor(item.timestamp, segments, anchor_counters)
+        anchor, seg, ts_start, ts_end = _resolve_anchor(item.timestamp, segments, anchor_counters)
         verdict = fact_check_verdicts.get((element_type, index))
         confirmed = verdict.confirmed if verdict is not None else None
         reason = verdict.reason if verdict is not None else ""
@@ -600,13 +643,35 @@ def _build_document(merged_raw: dict[str, Any], *, segments: list[TranscriptSegm
             ))
         elif item.timestamp and item.timestamp != NOT_SPECIFIED:
             unverified_notes.append(f"Не удалось сопоставить таймкод '{item.timestamp}' для: {label[:120]}")
-        return dataclasses.replace(item, anchor=anchor, verified=confirmed, verification_reason=reason)
+        return dataclasses.replace(item, anchor=anchor, verified=confirmed, verification_reason=reason,
+                                    timestamp_start=ts_start, timestamp_end=ts_end)
 
     decisions = tuple(_link(d, "decision", i) for i, d in enumerate(raw_decisions))
     tasks = tuple(_link(t, "task", i) for i, t in enumerate(raw_tasks))
+    # Item 9: dedup decisions/tasks by their own text, order preserved.
+    decisions = dedup_items_preserve_order(decisions, lambda d: d.text)
+    tasks = dedup_items_preserve_order(tasks, lambda t: t.task)
 
-    unverified_items = (tuple(str(x) for x in (merged_raw.get("unverified_items") or []))
-                        + tuple(unverified_notes) + tuple(fact_check_notes))
+    # Item 10: a merge-stage note ("Ответственный не указан", ...) must not
+    # coexist with an item the fact-check stage went on to actually
+    # confirm -- drop any merge note that's clearly about a now-confirmed
+    # decision/task before merging in the fact-check/timestamp notes.
+    confirmed_texts = [normalize_text(d.text) for d in decisions if d.verified is True]
+    confirmed_texts += [normalize_text(t.task) for t in tasks if t.verified is True]
+
+    def _conflicts_with_confirmed(note: str) -> bool:
+        n = normalize_text(note).lower()
+        return bool(n) and any(c and (c.lower() in n or n in c.lower()) for c in confirmed_texts)
+
+    merge_notes = [t for t in (normalize_text(x) for x in (merged_raw.get("unverified_items") or [])) if t]
+    merge_notes = [n for n in merge_notes if not _conflicts_with_confirmed(n)]
+
+    unverified_items = dedup_preserve_order(tuple(merge_notes) + tuple(unverified_notes) + tuple(fact_check_notes))
+
+    topics = dedup_items_preserve_order(
+        tuple(t for t in (Topic.from_json(raw) for raw in (merged_raw.get("topics") or [])) if t is not None),
+        lambda t: t.title,
+    )
 
     return ProtocolDocument(
         meeting_title=str(merged_raw.get("meeting_title") or source_filename),
@@ -615,15 +680,15 @@ def _build_document(merged_raw: dict[str, Any], *, segments: list[TranscriptSegm
         duration_seconds=duration,
         participants=participants,
         summary=str(merged_raw.get("summary") or ""),
-        topics=tuple(str(t) for t in (merged_raw.get("topics") or [])),
+        topics=topics,
         decisions=decisions,
         tasks=tasks,
         owners=tuple(sorted({t.owner for t in tasks if t.owner and t.owner != NOT_SPECIFIED})),
         deadlines=tuple(sorted({t.deadline for t in tasks if t.deadline and t.deadline != NOT_SPECIFIED})),
-        open_questions=tuple(str(x) for x in (merged_raw.get("open_questions") or [])),
-        risks=tuple(str(x) for x in (merged_raw.get("risks") or [])),
-        disagreements=tuple(str(x) for x in (merged_raw.get("disagreements") or [])),
-        next_steps=tuple(str(x) for x in (merged_raw.get("next_steps") or [])),
+        open_questions=dedup_preserve_order(tuple(as_str_list(merged_raw.get("open_questions")))),
+        risks=dedup_preserve_order(tuple(as_str_list(merged_raw.get("risks")))),
+        disagreements=dedup_preserve_order(tuple(as_str_list(merged_raw.get("disagreements")))),
+        next_steps=dedup_preserve_order(tuple(as_str_list(merged_raw.get("next_steps")))),
         unverified_items=unverified_items,
         timestamp_refs=tuple(timestamp_refs),
         model_id=model_id,

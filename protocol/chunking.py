@@ -13,6 +13,7 @@ from typing import Optional
 from .schemas import TranscriptChunk, TranscriptSegment
 
 _LINE_RE = re.compile(r"^(?P<speaker>.+?) \[(?P<start>[\d:]+) - (?P<end>[\d:]+)\]: (?P<text>.*)$")
+_RANGE_RE = re.compile(r"^\s*([\d:]+)\s*-\s*([\d:]+)\s*$")
 
 # Rough, deliberately conservative chars-per-token estimate for a safety
 # margin across model families; used only to keep a chunk within the
@@ -29,6 +30,23 @@ def parse_timestamp(value: str) -> float:
         h, m, s = parts
         return h * 3600 + m * 60 + s
     raise ValueError(f"Unrecognized timestamp: {value!r}")
+
+
+def parse_timestamp_range(value: str) -> tuple[float, float]:
+    """Parse either a single timecode ("15:12") or a range
+    ("15:12 - 16:00", "01:02:15 - 01:03:20") into (start_seconds,
+    end_seconds). A single timecode yields start == end. The model isn't
+    always careful about which side is smaller, so the range is sorted."""
+    text = value.strip()
+    m = _RANGE_RE.match(text)
+    if m:
+        start = parse_timestamp(m.group(1))
+        end = parse_timestamp(m.group(2))
+        if end < start:
+            start, end = end, start
+        return start, end
+    t = parse_timestamp(text)
+    return t, t
 
 
 def parse_transcript(text: str) -> list[TranscriptSegment]:

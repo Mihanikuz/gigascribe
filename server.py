@@ -636,6 +636,18 @@ def download_protocol_html(job_id: str, username: str = Depends(current_user)):
     return FileResponse(resolved, filename=resolved.name, media_type="text/html")
 
 
+@app.get("/api/jobs/{job_id}/protocol.xml")
+def download_protocol_xml(job_id: str, username: str = Depends(current_user)):
+    _require_protocol_enabled()
+    job = job_store.get(job_id)
+    if not job: raise HTTPException(404)
+    completed = _latest_completed_protocol(job_id)
+    if not completed or not completed.get("xml_path"):
+        raise HTTPException(404)
+    resolved = _resolved_protocol_path(completed["xml_path"])
+    return FileResponse(resolved, filename=resolved.name, media_type="application/xml")
+
+
 @app.post("/api/jobs/{job_id}/glossary-suggestion")
 def create_glossary_suggestion(job_id: str, payload: dict[str, Any], username: str = Depends(current_user)):
     """Item 10: a user (owner or admin, matching every other job-control
@@ -845,6 +857,17 @@ def api_protocol_model_params(model_id: str, payload: dict[str, Any], admin: str
         raise HTTPException(400, detail="engine must be 'llama_cpp' or 'ollama'")
     if changes.get("ollama_url") and not str(changes["ollama_url"]).startswith(("http://", "https://")):
         raise HTTPException(400, detail="ollama_url must start with http:// or https://")
+    if "context_length" in changes or "max_output_tokens" in changes:
+        # item 4: catch an invalid combination here too, not only when a
+        # job is actually created -- immediate feedback for the admin.
+        current = PROTOCOL_SERVICE.store.get_model_state(model_id)
+        context_length = changes.get("context_length", current["context_length"])
+        max_output_tokens = changes.get("max_output_tokens", current["max_output_tokens"])
+        if context_length - max_output_tokens < 512:
+            raise HTTPException(400, detail=(
+                f"context_length ({context_length}) leaves too little room for input given "
+                f"max_output_tokens ({max_output_tokens}); need at least 512 tokens free"
+            ))
     try:
         return PROTOCOL_SERVICE.store.update_model_state(model_id, **changes)
     except ValueError as exc:
@@ -1312,14 +1335,17 @@ if PROTOCOL_ENABLED:
     <table><thead><tr><th>Модель</th><th>Движок</th><th>Статус</th><th>Активна</th><th>Размер</th><th></th></tr></thead><tbody id='protocol-models-body'></tbody></table>
     <p class='muted'>Установка выполняется скриптом <code>scripts/download_protocol_model.py</code> (см. README) — здесь можно выбрать активную модель, проверить загрузку или удалить файлы.</p>
     <p id='protocol-model-message' class='muted'></p>
-    <h3>Настройка движка модели</h3>
+    <h3>Настройка модели</h3>
     <form id='engine-config-form'>
       <label>Модель<select name='model_id' id='engine-config-model'></select></label>
       <label>Движок<select name='engine'><option value='llama_cpp'>llama.cpp (GGUF)</option><option value='ollama'>Ollama</option></select></label>
+      <label>Контекст, токенов<input type='number' name='context_length' min='1' step='1'></label>
+      <label>Температура<input type='number' name='temperature' min='0' max='2' step='0.1'></label>
+      <label>Максимум выходных токенов<input type='number' name='max_output_tokens' min='1' step='1'></label>
       <label>Число GPU-слоёв (llama.cpp, -1 = все)<input type='number' name='n_gpu_layers' step='1'></label>
       <label>URL локального Ollama (только для Ollama)<input name='ollama_url' placeholder='http://127.0.0.1:11434'></label>
       <label>keep_alive Ollama (например, 5m)<input name='ollama_keep_alive' placeholder='5m'></label>
-      <button type='submit'>Сохранить конфигурацию движка</button>
+      <button type='submit'>Сохранить параметры модели</button>
     </form>
     <p id='engine-config-message' class='muted'></p>
   </div>
@@ -1436,6 +1462,9 @@ function loadEngineConfig(){
   let m=PROTOCOL_MODELS_CACHE.find(x=>x.id===id); if(!m) return;
   let form=document.getElementById('engine-config-form');
   form.elements['engine'].value=m.engine||'llama_cpp';
+  form.elements['context_length'].value=m.context_length||'';
+  form.elements['temperature'].value=m.temperature==null?'':m.temperature;
+  form.elements['max_output_tokens'].value=m.max_output_tokens||'';
   form.elements['n_gpu_layers'].value=(m.n_gpu_layers===null||m.n_gpu_layers===undefined)?'':m.n_gpu_layers;
   form.elements['ollama_url'].value=m.ollama_url||'';
   form.elements['ollama_keep_alive'].value=m.ollama_keep_alive||'';
@@ -1446,12 +1475,15 @@ document.getElementById('engine-config-form').onsubmit=async(e)=>{
   let id=document.getElementById('engine-config-model').value;
   let form=e.target;
   let payload={engine:form.elements['engine'].value};
+  let ctx=form.elements['context_length'].value; if(ctx!=='') payload.context_length=parseInt(ctx,10);
+  let temp=form.elements['temperature'].value; if(temp!=='') payload.temperature=parseFloat(temp);
+  let mot=form.elements['max_output_tokens'].value; if(mot!=='') payload.max_output_tokens=parseInt(mot,10);
   let ngl=form.elements['n_gpu_layers'].value; if(ngl!=='') payload.n_gpu_layers=parseInt(ngl,10);
   let ourl=form.elements['ollama_url'].value; if(ourl) payload.ollama_url=ourl;
   let oka=form.elements['ollama_keep_alive'].value; if(oka) payload.ollama_keep_alive=oka;
   let r=await fetch(`/api/protocol/models/${id}/params`, {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(payload)});
   let d=await r.json().catch(()=>({}));
-  document.getElementById('engine-config-message').textContent=r.ok?'Конфигурация движка сохранена':('Ошибка: '+(d.detail||r.status));
+  document.getElementById('engine-config-message').textContent=r.ok?'Параметры модели сохранены':('Ошибка: '+(d.detail||r.status));
   if(r.ok) loadProtocolModels();
 };
 async function selectProtocolModel(id){

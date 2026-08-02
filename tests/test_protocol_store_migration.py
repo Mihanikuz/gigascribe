@@ -150,3 +150,58 @@ def test_protocol_jobs_migration_is_idempotent_once_rebuilt(tmp_path):
     with sqlite3.connect(db_path) as db:
         cols = {r[1] for r in db.execute("PRAGMA table_info(protocol_jobs)")}
     assert "settings_snapshot" in cols
+
+
+def test_xml_path_column_exists_on_fresh_and_pre_existing_db(tmp_path):
+    db_path = tmp_path / "jobs.sqlite3"
+    job_store.JobStore(db_path)
+    ProtocolStore(db_path)
+    with sqlite3.connect(db_path) as db:
+        cols = {r[1] for r in db.execute("PRAGMA table_info(protocol_jobs)")}
+    assert "xml_path" in cols
+
+
+def test_qwen3_8b_max_output_tokens_migrates_from_old_default_to_12288(tmp_path):
+    """Item 4: a database seeded before the 2048 -> 12288 change picks up
+    the new default exactly once, and only because it was still at the old
+    unmodified value."""
+    db_path = tmp_path / "jobs.sqlite3"
+    job_store.JobStore(db_path)
+    raw = sqlite3.connect(db_path)
+    raw.execute("""CREATE TABLE protocol_models (
+      id TEXT PRIMARY KEY, label TEXT NOT NULL, engine TEXT NOT NULL, repo_id TEXT, filename TEXT,
+      local_path TEXT, format TEXT, quantization TEXT, size_bytes INTEGER NOT NULL DEFAULT 0,
+      context_length INTEGER NOT NULL DEFAULT 8192, temperature REAL NOT NULL DEFAULT 0.2,
+      max_output_tokens INTEGER NOT NULL DEFAULT 2048, system_prompt_override TEXT,
+      installed INTEGER NOT NULL DEFAULT 0, last_check_status TEXT, last_check_at REAL, updated_at REAL)""")
+    raw.execute("INSERT INTO protocol_models (id,label,engine,context_length,max_output_tokens,updated_at) "
+                "VALUES ('qwen3-8b','Qwen3-8B','llama_cpp',32768,2048,?)", (time.time(),))
+    raw.commit()
+    raw.close()
+
+    store = ProtocolStore(db_path)
+    assert store.get_model_state("qwen3-8b")["max_output_tokens"] == 12288
+
+
+def test_qwen3_8b_max_output_tokens_migration_never_overwrites_a_real_customization(tmp_path):
+    db_path = tmp_path / "jobs.sqlite3"
+    job_store.JobStore(db_path)
+    raw = sqlite3.connect(db_path)
+    raw.execute("""CREATE TABLE protocol_models (
+      id TEXT PRIMARY KEY, label TEXT NOT NULL, engine TEXT NOT NULL, repo_id TEXT, filename TEXT,
+      local_path TEXT, format TEXT, quantization TEXT, size_bytes INTEGER NOT NULL DEFAULT 0,
+      context_length INTEGER NOT NULL DEFAULT 8192, temperature REAL NOT NULL DEFAULT 0.2,
+      max_output_tokens INTEGER NOT NULL DEFAULT 2048, system_prompt_override TEXT,
+      installed INTEGER NOT NULL DEFAULT 0, last_check_status TEXT, last_check_at REAL, updated_at REAL)""")
+    # admin already deliberately customized this away from the old default
+    raw.execute("INSERT INTO protocol_models (id,label,engine,context_length,max_output_tokens,updated_at) "
+                "VALUES ('qwen3-8b','Qwen3-8B','llama_cpp',32768,4096,?)", (time.time(),))
+    raw.commit()
+    raw.close()
+
+    store = ProtocolStore(db_path)
+    assert store.get_model_state("qwen3-8b")["max_output_tokens"] == 4096
+
+
+def test_qwen3_8b_registry_default_is_12288_for_fresh_installs():
+    assert SUPPORTED_PROTOCOL_MODELS["qwen3-8b"].max_output_tokens == 12288

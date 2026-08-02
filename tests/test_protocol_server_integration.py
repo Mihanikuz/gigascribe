@@ -221,3 +221,29 @@ def test_user_correction_creates_suggestion_and_is_owner_only(tmp_path):
     """, env_extra=env)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "OK" in result.stdout
+
+
+def test_model_params_rejects_context_too_small_for_max_output_tokens(tmp_path):
+    """Item 4: admin gets immediate feedback, not just a failure the next
+    time someone tries to create a protocol."""
+    env = _base_env(tmp_path)
+    env["GIGASCRIBE_PROTOCOL_ENABLED"] = "1"
+    result = _run_script("""
+        import server
+        from fastapi.testclient import TestClient
+
+        with TestClient(server.app) as c:
+            c.post("/login", data={"username": "admin", "password": "ARealStrongPassword123"})
+            r = c.post("/api/protocol/models/qwen3-8b/params",
+                       json={"context_length": 2048, "max_output_tokens": 2000})
+            assert r.status_code == 400, r.text
+            assert "context_length" in r.json()["detail"]
+
+            r = c.post("/api/protocol/models/qwen3-8b/params",
+                       json={"context_length": 32768, "max_output_tokens": 12288})
+            assert r.status_code == 200, r.text
+
+        print("OK")
+    """, env_extra=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "OK" in result.stdout
