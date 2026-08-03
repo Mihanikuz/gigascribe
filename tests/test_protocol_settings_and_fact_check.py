@@ -439,3 +439,126 @@ def test_long_meeting_topic_split_covers_the_whole_duration_not_just_first_20000
     # the (truncated) first-20000-chars of raw transcript text.
     assert len(seen_topic_split_prompts) > 1, "expected multiple pre-block topic-split calls, not a single truncated one"
     assert all(len(p) < 20000 for p in seen_topic_split_prompts), "no single topic-split call should carry the raw un-chunked transcript"
+
+
+# ---- item 4: context_length vs max_output_tokens ------------------------
+
+def test_settings_snapshot_validation_rejects_too_little_room_for_input():
+    snap = SettingsSnapshot(
+        model_id="qwen3-8b", engine="llama_cpp", model_path="/x.gguf", context_length=2048,
+        temperature=0.2, max_output_tokens=2000,  # only 48 tokens left for input+system prompt
+        chunk_minutes=12, chunk_overlap_seconds=30, topic_split_enabled=True, max_retries=2,
+        glossary_suggestions_enabled=True, default_glossary_scope="global", glossary_project=None,
+        prompt_versions={}, created_at=1.0,
+    )
+    with pytest.raises(ProtocolValidationError, match="context_length"):
+        validate_settings_snapshot(snap)
+
+
+def test_settings_snapshot_validation_accepts_generous_context_for_qwen3_8b_defaults():
+    snap = SettingsSnapshot(
+        model_id="qwen3-8b", engine="llama_cpp", model_path="/x.gguf", context_length=32768,
+        temperature=0.2, max_output_tokens=12288,
+        chunk_minutes=12, chunk_overlap_seconds=30, topic_split_enabled=True, max_retries=2,
+        glossary_suggestions_enabled=True, default_glossary_scope="global", glossary_project=None,
+        prompt_versions={}, created_at=1.0,
+    )
+    validate_settings_snapshot(snap)  # must not raise
+
+
+# ---- item 13: raw-response debug gate -----------------------------------
+
+def test_raw_response_not_logged_by_default(env, monkeypatch):
+    transcript = _make_job(env)
+    _install_model(env["store"], env["models_dir"])
+    monkeypatch.setattr(service_mod, "create_provider", lambda **k: ScriptedProvider())
+    from protocol.service import ProtocolService
+    svc = ProtocolService(config=env["config"], store=env["store"], gpu_lock=asyncio.Lock(), unload_asr=lambda: None)
+    assert env["config"].debug_raw_response is False
+
+    async def run():
+        result = await svc.create_protocol(transcript_path=transcript, job_id="job-1", username="alice")
+        return await _wait_terminal(env["store"], result.protocol_job_id)
+
+    job = asyncio.run(run())
+    assert job["status"] == "completed"
+    log_text = Path(job["log_path"]).read_text(encoding="utf-8")
+    assert "RAW RESPONSE" not in log_text
+
+
+def test_raw_response_logged_only_when_debug_flag_enabled(env, monkeypatch):
+    import dataclasses as _dc
+    debug_config = _dc.replace(env["config"], debug_raw_response=True)
+    transcript = _make_job(env)
+    _install_model(env["store"], env["models_dir"])
+    monkeypatch.setattr(service_mod, "create_provider", lambda **k: ScriptedProvider())
+    from protocol.service import ProtocolService
+    svc = ProtocolService(config=debug_config, store=env["store"], gpu_lock=asyncio.Lock(), unload_asr=lambda: None)
+
+    async def run():
+        result = await svc.create_protocol(transcript_path=transcript, job_id="job-1", username="alice")
+        return await _wait_terminal(env["store"], result.protocol_job_id)
+
+    job = asyncio.run(run())
+    assert job["status"] == "completed"
+    log_text = Path(job["log_path"]).read_text(encoding="utf-8")
+    assert "RAW RESPONSE" in log_text
+
+
+# ---- items 9-10: dedup and unverified-items consistency across the full
+# pipeline (not just the pure schemas-level helpers) ----------------------
+
+def test_pipeline_dedups_decisions_and_confirmed_item_is_not_also_listed_as_unverified(env, monkeypatch):
+    transcript = _make_job(env)
+    _install_model(env["store"], env["models_dir"])
+    merge_response = (
+        '{"summary": "s", "topics": [], '
+        '"decisions": [{"text": "Утвердить бюджет.", "speaker": "Спикер 1", "timestamp": "00:01", "confidence": 0.9}, '
+        '{"text": "утвердить бюджет", "speaker": "Спикер 1", "timestamp": "00:01", "confidence": 0.8}], '
+        '"tasks": [], "open_questions": [], "risks": [], "disagreements": [], "next_steps": [], '
+        '"unverified_items": ["Утвердить бюджет — требует уточнения"]}'
+    )
+    fact_check_response = '{"verified": [{"type": "decision", "index": 0, "confirmed": true, "reason": ""}], "unverified_items": []}'
+    provider = ScriptedProvider(merge_response=merge_response, fact_check_response=fact_check_response)
+    from protocol.service import ProtocolService
+    monkeypatch.setattr(service_mod, "create_provider", lambda **k: provider)
+    svc = ProtocolService(config=env["config"], store=env["store"], gpu_lock=asyncio.Lock(), unload_asr=lambda: None)
+
+    async def run():
+        result = await svc.create_protocol(transcript_path=transcript, job_id="job-1", username="alice")
+        return await _wait_terminal(env["store"], result.protocol_job_id)
+
+    job = asyncio.run(run())
+    assert job["status"] == "completed"
+    res = env["store"].get_result(job["id"])
+    decisions = res["document_json"]["decisions"]
+    assert len(decisions) == 1, "duplicate decision (same text, different case) must be deduped"
+    assert decisions[0]["verified"] is True
+    unverified = res["document_json"]["unverified_items"]
+    assert not any("утвержд" in u.lower() for u in unverified), \
+        "a confirmed decision must not also appear in unverified_items"
+
+
+def test_pipeline_dedups_open_questions_and_next_steps(env, monkeypatch):
+    transcript = _make_job(env)
+    _install_model(env["store"], env["models_dir"])
+    merge_response = (
+        '{"summary": "s", "topics": [], "decisions": [], "tasks": [], '
+        '"open_questions": ["Кто утвердит бюджет.", "кто утвердит бюджет"], '
+        '"risks": [], "disagreements": [], '
+        '"next_steps": ["Согласовать с финансами.", "Согласовать с финансами"], "unverified_items": []}'
+    )
+    provider = ScriptedProvider(merge_response=merge_response)
+    from protocol.service import ProtocolService
+    monkeypatch.setattr(service_mod, "create_provider", lambda **k: provider)
+    svc = ProtocolService(config=env["config"], store=env["store"], gpu_lock=asyncio.Lock(), unload_asr=lambda: None)
+
+    async def run():
+        result = await svc.create_protocol(transcript_path=transcript, job_id="job-1", username="alice")
+        return await _wait_terminal(env["store"], result.protocol_job_id)
+
+    job = asyncio.run(run())
+    assert job["status"] == "completed"
+    res = env["store"].get_result(job["id"])
+    assert len(res["document_json"]["open_questions"]) == 1
+    assert len(res["document_json"]["next_steps"]) == 1

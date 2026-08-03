@@ -4,28 +4,47 @@
   "source_filename": "team-sync-2026-07-31.mp3",
   "duration_seconds": 1830.0,
   "participants": [
-    "Спикер 1",
-    "Спикер 2",
+    "Иван",
+    "Мария",
     "Спикер 3"
   ],
   "summary": "Команда обсудила статус миграции на PostgreSQL, риски релиза и распределила задачи на следующую неделю.",
   "topics": [
-    "Статус миграции на PostgreSQL",
-    "Риски предстоящего релиза",
-    "Планирование спринта"
+    {
+      "title": "Статус миграции на PostgreSQL",
+      "summary": "Обсудили прогресс миграции и договорились завершить её до конца квартала."
+    },
+    {
+      "title": "Риски предстоящего релиза",
+      "summary": "Обозначили риск нехватки времени на регрессионное тестирование."
+    },
+    {
+      "title": "Планирование спринта",
+      "summary": ""
+    }
   ],
   "decisions": [
     {
       "text": "Перейти на PostgreSQL до конца квартала",
       "speaker": "Иван",
       "timestamp": "00:05:12",
-      "confidence": 0.9
+      "confidence": 0.9,
+      "anchor": "timestamp-312-1",
+      "verified": true,
+      "verification_reason": "",
+      "timestamp_start": "00:05:12",
+      "timestamp_end": "00:05:12"
     },
     {
       "text": "Отложить релиз мобильного клиента на неделю",
       "speaker": "Мария",
-      "timestamp": "00:18:40",
-      "confidence": 0.85
+      "timestamp": "00:18:40 - 00:19:10",
+      "confidence": 0.85,
+      "anchor": "timestamp-1120-1",
+      "verified": true,
+      "verification_reason": "",
+      "timestamp_start": "00:18:40",
+      "timestamp_end": "00:19:10"
     }
   ],
   "tasks": [
@@ -35,7 +54,12 @@
       "deadline": "не указан",
       "speaker": "Иван",
       "timestamp": "00:06:00",
-      "confidence": 0.7
+      "confidence": 0.7,
+      "anchor": "timestamp-360-1",
+      "verified": null,
+      "verification_reason": "",
+      "timestamp_start": "00:06:00",
+      "timestamp_end": "00:06:00"
     },
     {
       "task": "Прогнать нагрузочное тестирование",
@@ -43,7 +67,12 @@
       "deadline": "пятница",
       "speaker": "Мария",
       "timestamp": "00:20:10",
-      "confidence": 0.6
+      "confidence": 0.6,
+      "anchor": "timestamp-1210-1",
+      "verified": false,
+      "verification_reason": "Срок «пятница» не подтверждён явно в этом фрагменте расшифровки",
+      "timestamp_start": "00:20:10",
+      "timestamp_end": "00:20:10"
     }
   ],
   "owners": [
@@ -58,33 +87,70 @@
   "risks": [
     "Возможна нехватка времени на регрессионное тестирование"
   ],
-  "disagreements": [
-    "Мария и Пётр разошлись во мнениях о сроках миграции"
-  ],
+  "disagreements": [],
   "next_steps": [
-    "Согласовать финальную дату релиза на следующей встрече"
+    "Согласовать финальный план миграции с DBA-командой"
   ],
   "unverified_items": [
-    "Ответственный за нагрузочное тестирование не указан"
+    "Срок «пятница» для нагрузочного тестирования не подтверждён явно в расшифровке",
+    "Ответственный за коммуникацию с клиентами не указан"
   ],
   "timestamp_refs": [
     {
-      "label": "обсуждение миграции",
+      "label": "Перейти на PostgreSQL до конца квартала",
       "timestamp": "00:05:12",
       "speaker": "Иван",
-      "chunk_index": 0
+      "chunk_index": 0,
+      "anchor": "timestamp-312-1",
+      "source_text": "Значит, договорились — переходим на PostgreSQL до конца квартала.",
+      "element_type": "decision"
     },
     {
-      "label": "обсуждение релиза",
+      "label": "Отложить релиз мобильного клиента на неделю",
       "timestamp": "00:18:40",
       "speaker": "Мария",
-      "chunk_index": 1
+      "chunk_index": 1,
+      "anchor": "timestamp-1120-1",
+      "source_text": "Предлагаю отложить релиз мобильного клиента на неделю.",
+      "element_type": "decision"
+    },
+    {
+      "label": "Подготовить план миграции БД",
+      "timestamp": "00:06:00",
+      "speaker": "Иван",
+      "chunk_index": 0,
+      "anchor": "timestamp-360-1",
+      "source_text": "Я подготовлю план миграции к следующему созвону.",
+      "element_type": "task"
+    },
+    {
+      "label": "Прогнать нагрузочное тестирование",
+      "timestamp": "00:20:10",
+      "speaker": "Мария",
+      "chunk_index": 1,
+      "anchor": "timestamp-1210-1",
+      "source_text": "Постараюсь прогнать нагрузочные тесты в пятницу.",
+      "element_type": "task"
     }
   ],
   "model_id": "qwen3-8b",
   "prompt_versions": {
     "chunk_analysis": 1,
     "topic_split": 1,
-    "merge": 1
-  }
+    "merge": 1,
+    "fact_check": 1,
+    "html_template": 1
+  },
+  "engine": "llama_cpp",
+  "model_path": "/opt/gigascribe/models/protocol/qwen3-8b/qwen3-8b-q4_k_m.gguf",
+  "context_length": 32768,
+  "temperature": 0.2,
+  "max_output_tokens": 12288,
+  "chunking_settings": {
+    "chunk_minutes": 12,
+    "chunk_overlap_seconds": 30,
+    "topic_split_enabled": true
+  },
+  "app_commit": "a8a2daf",
+  "generated_at": 1785500000.0
 }

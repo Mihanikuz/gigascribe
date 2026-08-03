@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol>
+  <metadata>
+    <title>Синхрон команды разработки — 31.07.2026</title>
+    <sourceFile>team-sync-2026-07-31.mp3</sourceFile>
+    <processedAt>2026-07-31 15:00</processedAt>
+    <durationSeconds>1830.0</durationSeconds>
+    <model>qwen3-8b</model>
+  </metadata>
+  <participants>
+    <participant>Иван</participant>
+    <participant>Мария</participant>
+    <participant>Спикер 3</participant>
+  </participants>
+  <summary>Команда обсудила статус миграции на PostgreSQL, риски релиза и распределила задачи на следующую неделю.</summary>
+  <topics>
+    <topic>
+      <title>Статус миграции на PostgreSQL</title>
+      <summary>Обсудили прогресс миграции и договорились завершить её до конца квартала.</summary>
+    </topic>
+    <topic>
+      <title>Риски предстоящего релиза</title>
+      <summary>Обозначили риск нехватки времени на регрессионное тестирование.</summary>
+    </topic>
+    <topic>
+      <title>Планирование спринта</title>
+      <summary />
+    </topic>
+  </topics>
+  <decisions>
+    <decision>
+      <text>Перейти на PostgreSQL до конца квартала</text>
+      <speaker>Иван</speaker>
+      <timestampStart>00:05:12</timestampStart>
+      <timestampEnd>00:05:12</timestampEnd>
+      <confidence>0.90</confidence>
+      <verified>true</verified>
+      <verificationReason />
+    </decision>
+    <decision>
+      <text>Отложить релиз мобильного клиента на неделю</text>
+      <speaker>Мария</speaker>
+      <timestampStart>00:18:40</timestampStart>
+      <timestampEnd>00:19:10</timestampEnd>
+      <confidence>0.85</confidence>
+      <verified>true</verified>
+      <verificationReason />
+    </decision>
+  </decisions>
+  <tasks>
+    <task>
+      <text>Подготовить план миграции БД</text>
+      <owner>Иван</owner>
+      <deadline>не указан</deadline>
+      <speaker>Иван</speaker>
+      <timestampStart>00:06:00</timestampStart>
+      <timestampEnd>00:06:00</timestampEnd>
+      <confidence>0.70</confidence>
+      <verified />
+      <verificationReason />
+    </task>
+    <task>
+      <text>Прогнать нагрузочное тестирование</text>
+      <owner>не указан</owner>
+      <deadline>пятница</deadline>
+      <speaker>Мария</speaker>
+      <timestampStart>00:20:10</timestampStart>
+      <timestampEnd>00:20:10</timestampEnd>
+      <confidence>0.60</confidence>
+      <verified>false</verified>
+      <verificationReason>Срок «пятница» не подтверждён явно в этом фрагменте расшифровки</verificationReason>
+    </task>
+  </tasks>
+  <openQuestions>
+    <item>Кто отвечает за коммуникацию с клиентами о переносе релиза?</item>
+  </openQuestions>
+  <risks>
+    <item>Возможна нехватка времени на регрессионное тестирование</item>
+  </risks>
+  <disagreements />
+  <nextSteps>
+    <item>Согласовать финальный план миграции с DBA-командой</item>
+  </nextSteps>
+  <unverifiedItems>
+    <item>Срок «пятница» для нагрузочного тестирования не подтверждён явно в расшифровке</item>
+    <item>Ответственный за коммуникацию с клиентами не указан</item>
+  </unverifiedItems>
+</protocol>

@@ -9,6 +9,7 @@ validation rules.
 from __future__ import annotations
 
 import dataclasses
+import re
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
@@ -51,12 +52,61 @@ class ProtocolValidationError(ValueError):
     """Raised when an LLM response fails schema validation."""
 
 
-def _as_str_list(value: Any) -> list[str]:
+# The model is not always consistent about which field name it uses for a
+# bare piece of text inside a list item (a risk might come back as
+# {"risk": "..."} or {"text": "..."} depending on the call). Tried in this
+# order; a dict with none of these recognizable keys is dropped rather than
+# stringified, since str(dict) would leak Python repr syntax like
+# "{'text': '...'}" straight into the protocol.
+_TEXT_FIELD_CANDIDATES = ("text", "question", "risk", "fact", "topic", "summary", "task", "content", "value", "description")
+
+
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in _TEXT_FIELD_CANDIDATES:
+            v = value.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    return ""
+
+
+def as_str_list(value: Any) -> list[str]:
     if value is None:
         return []
     if not isinstance(value, list):
         raise ProtocolValidationError("expected a list of strings")
-    return [str(v) for v in value]
+    return [t for t in (normalize_text(v) for v in value) if t]
+
+
+def _dedup_key(text: str) -> str:
+    """Normalize for duplicate comparison (item 9): collapse whitespace,
+    lowercase, drop a trailing period, fold ё/е -- never mutates the actual
+    displayed text, only the comparison key."""
+    t = re.sub(r"\s+", " ", text.strip().lower())
+    t = t.rstrip(".")
+    t = t.replace("ё", "е")  # ё -> е
+    return t
+
+
+def dedup_preserve_order(items: tuple[str, ...]) -> tuple[str, ...]:
+    """Drop duplicates (by normalized text) while keeping first-seen order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        key = _dedup_key(item)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        out.append(item)
+    return tuple(out)
 
 
 @dataclass(frozen=True)
@@ -68,6 +118,12 @@ class DecisionItem:
     anchor: Optional[str] = None
     verified: Optional[bool] = None
     verification_reason: str = ""
+    # Item 7: the timecode a decision cites may be a single point or a
+    # range ("15:12 - 16:00"); these hold the parsed/normalized bounds
+    # (empty if `timestamp` couldn't be parsed at all) so JSON/HTML/XML
+    # all show the same start/end rather than each re-parsing `timestamp`.
+    timestamp_start: str = ""
+    timestamp_end: str = ""
 
     @classmethod
     def from_json(cls, raw: dict[str, Any]) -> "DecisionItem":
@@ -92,6 +148,8 @@ class TaskItem:
     anchor: Optional[str] = None
     verified: Optional[bool] = None
     verification_reason: str = ""
+    timestamp_start: str = ""
+    timestamp_end: str = ""
 
     @classmethod
     def from_json(cls, raw: dict[str, Any]) -> "TaskItem":
@@ -105,6 +163,52 @@ class TaskItem:
             timestamp=str(raw.get("timestamp") or NOT_SPECIFIED),
             confidence=_clamp_confidence(raw.get("confidence")),
         )
+
+
+def dedup_items_preserve_order(items: tuple, key_fn) -> tuple:
+    """Same as dedup_preserve_order but for DecisionItem/TaskItem-style
+    objects, keyed by whatever text field the caller points at."""
+    seen: set[str] = set()
+    out: list = []
+    for item in items:
+        key = _dedup_key(key_fn(item))
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        out.append(item)
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class Topic:
+    """Item 6: a topic is a title plus an optional short description, never
+    a raw nested JSON blob dumped as text."""
+    title: str
+    summary: str = ""
+
+    @classmethod
+    def from_json(cls, raw: Any) -> Optional["Topic"]:
+        if isinstance(raw, str):
+            title = raw.strip()
+            return cls(title=title) if title else None
+        if isinstance(raw, dict):
+            title = ""
+            for key in ("title", "topic", "text", "name"):
+                v = raw.get(key)
+                if isinstance(v, str) and v.strip():
+                    title = v.strip()
+                    break
+            if not title:
+                return None
+            summary = ""
+            for key in ("summary", "description"):
+                v = raw.get(key)
+                if isinstance(v, str) and v.strip():
+                    summary = v.strip()
+                    break
+            return cls(title=title, summary=summary)
+        return None
 
 
 @dataclass(frozen=True)
@@ -168,12 +272,12 @@ class ChunkAnalysis:
             chunk_index=chunk_index,
             topic=str(raw.get("topic") or ""),
             summary=str(raw.get("summary") or ""),
-            facts=tuple(_as_str_list(raw.get("facts"))),
+            facts=tuple(as_str_list(raw.get("facts"))),
             decisions=tuple(DecisionItem.from_json(d) for d in (raw.get("decisions") or [])),
             tasks=tuple(TaskItem.from_json(t) for t in (raw.get("tasks") or [])),
-            open_questions=tuple(_as_str_list(raw.get("open_questions"))),
-            risks=tuple(_as_str_list(raw.get("risks"))),
-            disagreements=tuple(_as_str_list(raw.get("disagreements"))),
+            open_questions=tuple(as_str_list(raw.get("open_questions"))),
+            risks=tuple(as_str_list(raw.get("risks"))),
+            disagreements=tuple(as_str_list(raw.get("disagreements"))),
             terms=terms,
         )
 
@@ -199,7 +303,7 @@ class ProtocolDocument:
     duration_seconds: float
     participants: tuple[str, ...]
     summary: str
-    topics: tuple[str, ...]
+    topics: tuple[Topic, ...]
     decisions: tuple[DecisionItem, ...]
     tasks: tuple[TaskItem, ...]
     owners: tuple[str, ...]
@@ -334,6 +438,15 @@ def validate_settings_snapshot(s: SettingsSnapshot) -> None:
         errors.append("context_length must be a positive integer")
     if not (isinstance(s.max_output_tokens, int) and s.max_output_tokens > 0):
         errors.append("max_output_tokens must be a positive integer")
+    elif isinstance(s.context_length, int) and s.context_length > 0:
+        # item 4: context_length must leave real room for input beyond the
+        # reserved output budget, not just be numerically larger than it.
+        min_input_reserve = 512
+        if s.context_length - s.max_output_tokens < min_input_reserve:
+            errors.append(
+                f"context_length ({s.context_length}) leaves too little room for input given "
+                f"max_output_tokens ({s.max_output_tokens}); need at least {min_input_reserve} tokens free"
+            )
     if s.default_glossary_scope not in GLOSSARY_SCOPES:
         errors.append(f"default_glossary_scope must be one of {GLOSSARY_SCOPES}")
     if s.engine not in ENGINES:

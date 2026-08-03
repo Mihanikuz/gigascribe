@@ -39,7 +39,8 @@ COPY requirements-protocol.txt ./
 RUN --mount=type=cache,id=gigascribe-pip-cache,target=/root/.cache/pip,sharing=locked \
     if [ "$INSTALL_PROTOCOL" = "1" ]; then \
         CMAKE_ARGS="-DGGML_CUDA=on" FORCE_CMAKE=1 python -m pip install --timeout 600 --retries 20 \
-            -r requirements-protocol.txt ; \
+            -r requirements-protocol.txt \
+        && python -c "import llama_cpp; print('llama-cpp-python', llama_cpp.__version__)" ; \
     else \
         echo "INSTALL_PROTOCOL=0: skipping protocol module dependencies" ; \
     fi

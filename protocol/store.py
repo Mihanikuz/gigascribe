@@ -65,10 +65,14 @@ class ProtocolStore:
               json_path TEXT,
               html_path TEXT,
               log_path TEXT,
-              settings_snapshot TEXT NOT NULL DEFAULT '{{}}'
+              settings_snapshot TEXT NOT NULL DEFAULT '{{}}',
+              xml_path TEXT
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS protocol_jobs_job_id ON protocol_jobs(job_id)")
             self._rebuild_protocol_jobs_if_stale(db, status_check)
+            existing_job_cols = {r[1] for r in db.execute("PRAGMA table_info(protocol_jobs)")}
+            if "xml_path" not in existing_job_cols:
+                db.execute("ALTER TABLE protocol_jobs ADD COLUMN xml_path TEXT")
             db.execute("""CREATE TABLE IF NOT EXISTS protocol_models (
               id TEXT PRIMARY KEY,
               label TEXT NOT NULL,
@@ -169,7 +173,25 @@ class ProtocolStore:
               confidence REAL NOT NULL DEFAULT 0,
               created_at REAL NOT NULL
             )""")
+            self._migrate_qwen3_8b_max_output_tokens(db)
             db.commit()
+
+    def _migrate_qwen3_8b_max_output_tokens(self, db: sqlite3.Connection) -> None:
+        """Item 4: qwen3-8b's default max_output_tokens moved 2048 -> 12288.
+        A one-time, flagged bump for rows already seeded at the old default
+        -- an admin who deliberately customized it (to anything other than
+        the exact old default) keeps their own value; this never
+        overwrites a real customization, and never re-runs."""
+        flag = "migrated_qwen3_8b_max_output_tokens_v1"
+        already = db.execute("SELECT 1 FROM protocol_settings WHERE key=?", (flag,)).fetchone()
+        if already:
+            return
+        row = db.execute("SELECT max_output_tokens FROM protocol_models WHERE id='qwen3-8b'").fetchone()
+        if row is not None and row[0] == 2048:
+            db.execute("UPDATE protocol_models SET max_output_tokens=12288, updated_at=? WHERE id='qwen3-8b'",
+                       (time.time(),))
+        db.execute("INSERT INTO protocol_settings (key, value) VALUES (?,?) "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (flag, "1"))
 
     def _rebuild_protocol_jobs_if_stale(self, db: sqlite3.Connection, status_check: str) -> None:
         """SQLite can't ALTER a CHECK constraint or add a NOT NULL column
@@ -208,7 +230,8 @@ class ProtocolStore:
               json_path TEXT,
               html_path TEXT,
               log_path TEXT,
-              settings_snapshot TEXT NOT NULL DEFAULT '{{}}'
+              settings_snapshot TEXT NOT NULL DEFAULT '{{}}',
+              xml_path TEXT
             )""")
             old_cols = [r[1] for r in db.execute("PRAGMA table_info(protocol_jobs_old)")]
             new_cols = [r[1] for r in db.execute("PRAGMA table_info(protocol_jobs)")]
@@ -283,7 +306,7 @@ class ProtocolStore:
         allowed = {
             "status", "progress", "message", "model_id", "chunk_total", "chunk_current",
             "error", "started_at", "finished_at", "attempts", "cancel_requested",
-            "json_path", "html_path", "log_path",
+            "json_path", "html_path", "log_path", "xml_path",
         }
         unknown = set(changes) - allowed
         if unknown:

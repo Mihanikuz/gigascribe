@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import re
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Callable, Optional
 
 from ..schemas import ProtocolValidationError
 
@@ -70,12 +70,20 @@ class LLMProvider(ABC):
         """Release all GPU/CPU memory held by this provider. Idempotent."""
 
     async def generate_json(self, prompt: str, *, temperature: float, max_tokens: int,
-                             max_retries: int = 2, system_prompt: str | None = None) -> dict[str, Any]:
+                             max_retries: int = 2, system_prompt: str | None = None,
+                             on_raw_response: Optional[Callable[[str], None]] = None) -> dict[str, Any]:
+        """`on_raw_response`, if given, is called with the full raw text of
+        every attempt (item 13) -- callers only pass it when explicit debug
+        logging is turned on (GIGASCRIBE_PROTOCOL_DEBUG_RAW_RESPONSE=1),
+        since a meeting's raw model output can contain confidential content
+        and must never land in protocol.log by default."""
         last_error: Exception | None = None
         attempt_prompt = prompt
         for attempt in range(max_retries + 1):
             raw = await self.generate(attempt_prompt, temperature=temperature, max_tokens=max_tokens,
                                        system_prompt=system_prompt)
+            if on_raw_response is not None:
+                on_raw_response(raw)
             try:
                 return extract_json(raw)
             except ProtocolValidationError as exc:

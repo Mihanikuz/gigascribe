@@ -13,7 +13,7 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest fastapi uvicorn python-multipart passlib[bcrypt] itsdangerous requests gradio==5.38.2
+          python -m pip install pytest fastapi uvicorn python-multipart passlib[bcrypt] itsdangerous requests gradio==5.38.2 xmlschema
       - name: Install FFmpeg
         run: |
           sudo apt-get update
@@ -34,6 +34,17 @@ jobs:
         # satisfy. These steps already override --entrypoint, so they never
         # exercised GPU behavior anyway -- just imports and permissions.
         run: docker run --rm --entrypoint python gigascribe:gpu-local -c "import gradio, requests, torch, torchaudio; import app; import server"
+      - name: Confirm default image excludes llama-cpp-python (item 23)
+        # This build used INSTALL_PROTOCOL=0 (the default) -- llama_cpp must
+        # not be importable, proving the protocol module's heavy optional
+        # dependency never lands in the image unless explicitly requested.
+        # A real INSTALL_PROTOCOL=1 CUDA build isn't run here: it needs an
+        # actual CUDA build toolchain this hosted runner doesn't have.
+        run: |
+          if docker run --rm --entrypoint python gigascribe:gpu-local -c "import llama_cpp" 2>/dev/null; then
+            echo "llama_cpp must NOT be importable in the default (INSTALL_PROTOCOL=0) image" >&2
+            exit 1
+          fi
       - name: Volume permission smoke
         run: |
           mkdir -p data models
