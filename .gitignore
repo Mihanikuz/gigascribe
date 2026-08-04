@@ -5,3 +5,8 @@ models/
 *.log
 __pycache__/
 .pytest_cache/
+# Optional local/vendored GigaAM source for restricted-network builds
+# (see README "Restricted networks"); keep the placeholder so the
+# Dockerfile's COPY always has a directory to copy.
+vendor/gigaam/*
+!vendor/gigaam/.gitkeep

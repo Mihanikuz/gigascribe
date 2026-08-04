@@ -55,11 +55,12 @@ class JobStore:
               original_path TEXT, wav_path TEXT, m4a_path TEXT, flac_path TEXT,
               timeout_seconds INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
               cancel_requested INTEGER NOT NULL DEFAULT 0, correlation_id TEXT,
-              requested_models TEXT, requested_device TEXT)""")
+              requested_models TEXT, requested_device TEXT,
+              auto_protocol INTEGER NOT NULL DEFAULT 0)""")
             existing = {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
             # Migration from the first persistent-queue release, plus the
-            # M4A/FLAC download columns added later.
-            for col, typ in (("correlation_id", "TEXT"), ("requested_models", "TEXT"), ("requested_device", "TEXT"), ("m4a_path", "TEXT"), ("flac_path", "TEXT")):
+            # M4A/FLAC download columns and auto_protocol added later.
+            for col, typ in (("correlation_id", "TEXT"), ("requested_models", "TEXT"), ("requested_device", "TEXT"), ("m4a_path", "TEXT"), ("flac_path", "TEXT"), ("auto_protocol", "INTEGER NOT NULL DEFAULT 0")):
                 if col not in existing: db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
             db.execute("""CREATE TABLE IF NOT EXISTS job_attempts (
               id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL REFERENCES jobs(id),
@@ -70,6 +71,13 @@ class JobStore:
                 if col not in existing_attempts: db.execute(f"ALTER TABLE job_attempts ADD COLUMN {col} {typ}")
             db.execute("CREATE INDEX IF NOT EXISTS jobs_user_created ON jobs(username, created_at DESC)")
             db.execute("CREATE INDEX IF NOT EXISTS jobs_claim ON jobs(status, created_at)")
+            # Machine/token auth for the external v1 API (see server.py's
+            # current_user_via_token). `id` is a random public identifier
+            # used to look the row up in O(1); the actual bearer secret is
+            # never stored, only its bcrypt hash.
+            db.execute("""CREATE TABLE IF NOT EXISTS api_tokens (
+              id TEXT PRIMARY KEY, secret_hash TEXT NOT NULL, label TEXT,
+              username TEXT NOT NULL, created_at REAL NOT NULL, revoked_at REAL)""")
             db.execute("UPDATE schema_version SET version=3")
 
     def _tx(self):
@@ -86,7 +94,7 @@ class JobStore:
 
     def create(self, **j: Any) -> dict[str, Any]:
         snapshot = j.get("settings_snapshot") or {}
-        values = {"id": j["id"], "username": j["username"], "filename": j["filename"], "status": j.get("status") or "queued", "progress": j.get("progress", 0), "message": j.get("message"), "created_at": j.get("created_at") or time.time(), "settings_snapshot": json.dumps(snapshot), "original_path": j.get("original_path"), "log_path": j.get("log_path"), "timeout_seconds": j.get("timeout_seconds"), "correlation_id": j.get("correlation_id", j["id"]), "requested_models": json.dumps(j.get("requested_models") or {k: snapshot.get(k) for k in ("asr_model", "diarization_model")}), "requested_device": j.get("requested_device", snapshot.get("device"))}
+        values = {"id": j["id"], "username": j["username"], "filename": j["filename"], "status": j.get("status") or "queued", "progress": j.get("progress", 0), "message": j.get("message"), "created_at": j.get("created_at") or time.time(), "settings_snapshot": json.dumps(snapshot), "original_path": j.get("original_path"), "log_path": j.get("log_path"), "timeout_seconds": j.get("timeout_seconds"), "correlation_id": j.get("correlation_id", j["id"]), "requested_models": json.dumps(j.get("requested_models") or {k: snapshot.get(k) for k in ("asr_model", "diarization_model")}), "requested_device": j.get("requested_device", snapshot.get("device")), "auto_protocol": 1 if j.get("auto_protocol") else 0}
         cols = list(values); db = self._connect()
         try: db.execute(f"INSERT INTO jobs ({','.join(cols)}) VALUES ({','.join('?' for _ in cols)})", [values[c] for c in cols])
         finally: db.close()
@@ -172,6 +180,36 @@ class JobStore:
             )
             return [self._row(r) for r in rows]
 
+    def create_api_token(self, *, token_id: str, secret_hash: str, label: str, username: str) -> dict[str, Any]:
+        db = self._connect()
+        try:
+            db.execute(
+                "INSERT INTO api_tokens (id, secret_hash, label, username, created_at) VALUES (?,?,?,?,?)",
+                (token_id, secret_hash, label, username, time.time()),
+            )
+        finally:
+            db.close()
+        return self.get_api_token(token_id)
+
+    def get_api_token(self, token_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM api_tokens WHERE id=?", (token_id,)).fetchone()
+            return dict(row) if row else None
+
+    def list_api_tokens(self) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            return [dict(r) for r in db.execute("SELECT * FROM api_tokens ORDER BY created_at DESC")]
+
+    def revoke_api_token(self, token_id: str) -> bool:
+        db = self._connect()
+        try:
+            changed = db.execute(
+                "UPDATE api_tokens SET revoked_at=? WHERE id=? AND revoked_at IS NULL", (time.time(), token_id)
+            ).rowcount
+        finally:
+            db.close()
+        return bool(changed)
+
     @staticmethod
     def _row(row):
         if not row: return None
@@ -179,4 +217,5 @@ class JobStore:
         for k in JSON_COLUMNS:
             d[k] = json.loads(d[k]) if d.get(k) else {}
         d["cancel_requested"] = bool(d["cancel_requested"])
+        d["auto_protocol"] = bool(d["auto_protocol"])
         return d

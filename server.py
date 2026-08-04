@@ -256,6 +256,37 @@ def require_admin(username: str = Depends(current_user)) -> str:
     return username
 
 
+API_TOKEN_PREFIX = "gsp"
+
+
+def _generate_api_token() -> tuple[str, str, str]:
+    """Returns (full_token, token_id, secret_hash). full_token is shown to
+    the admin exactly once at creation and never stored -- only its bcrypt
+    hash is kept, so a leaked database dump cannot be used to authenticate."""
+    token_id = secrets.token_hex(8)
+    secret = secrets.token_urlsafe(32)
+    return f"{API_TOKEN_PREFIX}_{token_id}_{secret}", token_id, pwd_context.hash(secret)
+
+
+def current_user_via_token(request: Request) -> str:
+    """Authenticates /api/v1/* machine clients via `Authorization: Bearer
+    <token>` against the api_tokens table. Deliberately independent from the
+    cookie-session `current_user` above: token holders only ever reach the
+    v1 routes below, never the admin/settings routes that use current_user
+    or require_admin."""
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    parts = auth[7:].strip().split("_", 2)
+    if len(parts) != 3 or parts[0] != API_TOKEN_PREFIX:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    _, token_id, secret = parts
+    row = job_store.get_api_token(token_id)
+    if not row or row["revoked_at"] is not None or not pwd_context.verify(secret, row["secret_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid or revoked token")
+    return row["username"]
+
+
 def validate_upload_name(filename: str) -> str:
     safe = safe_name(filename or "audio")
     if Path(safe).suffix.lower() not in giga_app.SUPPORTED_FORMATS:
@@ -336,8 +367,11 @@ def logout(request: Request):
     return RedirectResponse("/login", status_code=303)
 
 
-@app.post("/api/jobs")
-async def create_job(file: UploadFile = File(...), username: str = Depends(current_user)):
+async def _create_transcription_job(username: str, file: UploadFile, *, auto_protocol: bool) -> str:
+    """Shared by the browser upload form (/api/jobs) and the token-authenticated
+    /api/v1/meeting-protocol route. Deliberately accepts no settings of any
+    kind -- the job always runs with whatever model/engine/prompt config is
+    currently active in the admin panel, never something the caller chose."""
     filename = validate_upload_name(file.filename or "audio")
     job_id = uuid.uuid4().hex
     user_dir = safe_user_id(username)
@@ -362,8 +396,14 @@ async def create_job(file: UploadFile = File(...), username: str = Depends(curre
             original_path.unlink()
         raise
     from model_store import load_settings
-    job_store.create(id=job_id, username=username, filename=original_path.name, original_path=str(original_path), log_path=str(user_result_dir / "job.log"), settings_snapshot=load_settings(MODELS_DIR), message="В очереди", timeout_seconds=int(os.getenv("GIGASCRIBE_JOB_TIMEOUT_SECONDS", "0")) or None)
+    job_store.create(id=job_id, username=username, filename=original_path.name, original_path=str(original_path), log_path=str(user_result_dir / "job.log"), settings_snapshot=load_settings(MODELS_DIR), message="В очереди", timeout_seconds=int(os.getenv("GIGASCRIBE_JOB_TIMEOUT_SECONDS", "0")) or None, auto_protocol=auto_protocol)
     schedule_job(job_id)
+    return job_id
+
+
+@app.post("/api/jobs")
+async def create_job(file: UploadFile = File(...), auto_protocol: str = Form("0"), username: str = Depends(current_user)):
+    job_id = await _create_transcription_job(username, file, auto_protocol=auto_protocol in ("1", "true", "on"))
     return {"job_id": job_id}
 
 
@@ -412,6 +452,16 @@ async def run_job(job_id: str) -> None:
         stem = Path(job['filename']).stem
         wav=result_dir/"normalized.wav"; m4a=result_dir/f"{stem}.m4a"; flac=result_dir/f"{stem}.flac"
         job_store.update(job_id,status="completed",finished_at=time.time(),progress=1,message="Готово",transcript_path=str(transcript),wav_path=str(wav) if wav.exists() else None,m4a_path=str(m4a) if m4a.exists() else None,flac_path=str(flac) if flac.exists() else None,actual_device=str(processor.device),actual_models={"asr_model":snapshot.get("asr_model"),"diarization_model":snapshot.get("diarization_model")})
+        if job.get("auto_protocol") and PROTOCOL_ENABLED and PROTOCOL_SERVICE is not None:
+            # Best-effort: a protocol failure here must never affect the
+            # transcription job just marked completed above (same principle
+            # the manual "Создать протокол" button already follows).
+            try:
+                from protocol.schemas import ProtocolOptions
+                await PROTOCOL_SERVICE.create_protocol(transcript_path=transcript, job_id=job_id,
+                                                        username=job["username"], options=ProtocolOptions())
+            except Exception:
+                logger.exception("auto_protocol failed to start job_id=%s", job_id)
     except asyncio.TimeoutError:
         job_store.update(job_id,status="failed",finished_at=time.time(),error="Job timed out",message="Превышено время выполнения")
     except Exception as exc:
@@ -648,6 +698,37 @@ def download_protocol_xml(job_id: str, username: str = Depends(current_user)):
     return FileResponse(resolved, filename=resolved.name, media_type="application/xml")
 
 
+# --- External v1 API: token-authenticated, for machine integrations (e.g. a
+# Telegram bot or "Пачка" bridge) built separately from this app. Reuses the
+# same auto_protocol mechanism as the upload-form checkbox. Deliberately
+# takes no configuration of any kind -- model/engine/prompts/glossary stay
+# admin-panel-only, so a leaked or misused token can never change settings,
+# only submit audio and read back its own jobs' status/results.
+@app.post("/api/v1/meeting-protocol")
+async def api_v1_create_meeting_protocol(file: UploadFile = File(...), username: str = Depends(current_user_via_token)):
+    _require_protocol_enabled()
+    job_id = await _create_transcription_job(username, file, auto_protocol=True)
+    return {"job_id": job_id}
+
+
+@app.get("/api/v1/meeting-protocol/{job_id}")
+async def api_v1_meeting_protocol_status(job_id: str, username: str = Depends(current_user_via_token)):
+    _require_protocol_enabled()
+    job = job_store.get(job_id)
+    # A token only ever sees jobs created under the username it acts as --
+    # never another token's or a browser user's jobs.
+    if not job or job["username"] != username:
+        raise HTTPException(404)
+    result: dict[str, Any] = {"job_id": job_id, "status": job["status"], "message": job["message"], "error": job["error"], "protocol": _protocol_summary(job)}
+    completed = _latest_completed_protocol(job_id)
+    if completed and completed.get("json_path"):
+        try:
+            result["protocol_data"] = json.loads(_resolved_protocol_path(completed["json_path"]).read_text(encoding="utf-8"))
+        except HTTPException:
+            pass
+    return result
+
+
 @app.post("/api/jobs/{job_id}/glossary-suggestion")
 def create_glossary_suggestion(job_id: str, payload: dict[str, Any], username: str = Depends(current_user)):
     """Item 10: a user (owner or admin, matching every other job-control
@@ -723,6 +804,38 @@ def disable_local_user(target: str, admin: str = Depends(require_admin)):
 @app.post("/admin/users/{target}/enable")
 def enable_local_user(target: str, admin: str = Depends(require_admin)):
     _set_user_disabled(target, False)
+    return {"ok": True}
+
+
+# API tokens for the external /api/v1/* integration surface (e.g. a Telegram
+# bot or "Пачка" bridge). Deliberately admin-only to create/revoke -- no
+# self-service endpoint exists, otherwise any authenticated user could mint
+# machine credentials for another username ("иначе получится дыра в правах").
+@app.get("/admin/api-tokens")
+def list_api_tokens(admin: str = Depends(require_admin)):
+    return {"tokens": [
+        {"id": t["id"], "label": t["label"], "username": t["username"], "created_at": t["created_at"], "revoked_at": t["revoked_at"]}
+        for t in job_store.list_api_tokens()
+    ]}
+
+
+@app.post("/admin/api-tokens")
+def create_api_token(admin: str = Depends(require_admin), label: str = Form(...), username: str = Form(...)):
+    if not label or len(label) > 128:
+        raise HTTPException(400, detail="Invalid label")
+    if username not in _load_users():
+        raise HTTPException(400, detail="Unknown username")
+    full_token, token_id, secret_hash = _generate_api_token()
+    job_store.create_api_token(token_id=token_id, secret_hash=secret_hash, label=label, username=username)
+    # Returned once here only -- it cannot be recovered later, only revoked
+    # and re-issued.
+    return {"token": full_token, "id": token_id}
+
+
+@app.post("/admin/api-tokens/{token_id}/revoke")
+def revoke_api_token(token_id: str, admin: str = Depends(require_admin)):
+    if not job_store.revoke_api_token(token_id):
+        raise HTTPException(404, detail="Unknown or already revoked token")
     return {"ok": True}
 
 
@@ -1160,6 +1273,7 @@ INDEX_HTML = ("<!doctype html><meta charset='utf-8'><title>GigaScribe</title><st
   <form id='up'>
     <input type='file' name='file' id='file-input' required>
     <button type='submit' id='up-btn'>🚀 Запустить</button>
+    <label class='muted' id='auto-protocol-row' style='display:none'><input type='checkbox' id='auto-protocol-checkbox'> Сразу создать протокол после завершения</label>
   </form>
   <div id='upload-progress-wrap' class='upload-progress'>
     <progress id='upload-progress' value='0' max='100'></progress>
@@ -1189,6 +1303,7 @@ async function loadWhoAmI(){
 async function loadProtocolStatus(){
   let r=await fetch('/api/protocol/status'); if(!r.ok) return;
   PROTOCOL_STATUS=await r.json();
+  document.getElementById('auto-protocol-row').style.display=(PROTOCOL_STATUS.enabled && PROTOCOL_STATUS.has_installed_model)?'':'none';
 }
 
 async function loadModelsInfo(){
@@ -1279,6 +1394,7 @@ document.getElementById('up').onsubmit=function(e){
   let fileInput=document.getElementById('file-input');
   if(!fileInput.files.length) return;
   let fd=new FormData(); fd.append('file', fileInput.files[0]);
+  fd.append('auto_protocol', document.getElementById('auto-protocol-checkbox').checked ? '1' : '0');
   let wrap=document.getElementById('upload-progress-wrap');
   let bar=document.getElementById('upload-progress');
   let text=document.getElementById('upload-progress-text');
@@ -1668,6 +1784,19 @@ ADMIN_HTML = ("<!doctype html><meta charset='utf-8'><title>GigaScribe — адм
 </section>
 
 <section class='card'>
+  <h2>API-токены</h2>
+  <p class='muted'>Для внешних интеграций (Telegram-бот, «Пачка» и т.п.), эндпоинты <code>/api/v1/meeting-protocol</code>. Токен не позволяет менять настройки — только загружать аудио и читать статус/результат своих заданий.</p>
+  <table><thead><tr><th>Метка</th><th>Действует как</th><th>Создан</th><th>Статус</th><th></th></tr></thead><tbody id='tokens-body'></tbody></table>
+  <h3>Выдать токен</h3>
+  <form id='new-token-form'>
+    <label>Метка<input name='label' required placeholder='например, Telegram-бот'></label>
+    <label>Действует как пользователь<input name='username' required placeholder='admin'></label>
+    <button type='submit'>Создать</button>
+  </form>
+  <p id='token-message' class='muted'></p>
+</section>
+
+<section class='card'>
   <h2>Модели</h2>
   <table><thead><tr><th>Модель</th><th>Тип</th><th>Статус</th><th>Активна</th><th>Размер</th><th></th></tr></thead><tbody id='models-body'></tbody></table>
   <p id='model-message' class='muted'></p>
@@ -1702,6 +1831,38 @@ document.getElementById('new-user-form').onsubmit=async function(e){
   let r=await fetch('/admin/users', {method:'POST', body:new FormData(e.target)});
   if(r.ok){ msg.textContent='Пользователь создан'; e.target.reset(); loadUsers(); }
   else { let d=await r.json().catch(()=>({})); msg.textContent='Ошибка: '+(d.detail||r.status); }
+};
+
+function fmtDate(ts){return ts?new Date(ts*1000).toLocaleString():'—'}
+
+async function loadTokens(){
+  let body=document.getElementById('tokens-body');
+  let r=await fetch('/admin/api-tokens');
+  if(!r.ok){ body.innerHTML="<tr><td colspan='5'>Ошибка загрузки списка токенов</td></tr>"; return; }
+  let data=await r.json();
+  body.innerHTML=data.tokens.map(t=>`<tr>
+    <td>${escapeHtml(t.label||'')}</td>
+    <td>${escapeHtml(t.username)}</td>
+    <td>${fmtDate(t.created_at)}</td>
+    <td>${t.revoked_at?"<span class='badge cancelled'>отозван</span>":"<span class='badge completed'>активен</span>"}</td>
+    <td>${t.revoked_at?'':`<button data-token="${escapeAttr(t.id)}" class='revoke-token'>Отозвать</button>`}</td>
+  </tr>`).join('') || "<tr><td colspan='5'>Токенов пока нет</td></tr>";
+  body.querySelectorAll('.revoke-token').forEach(btn=>btn.onclick=()=>revokeToken(btn.dataset.token));
+}
+
+async function revokeToken(tokenId){
+  if(!confirm('Отозвать этот токен? Действие необратимо.')) return;
+  await fetch(`/admin/api-tokens/${encodeURIComponent(tokenId)}/revoke`, {method:'POST'});
+  loadTokens();
+}
+
+document.getElementById('new-token-form').onsubmit=async function(e){
+  e.preventDefault();
+  let msg=document.getElementById('token-message');
+  let r=await fetch('/admin/api-tokens', {method:'POST', body:new FormData(e.target)});
+  let d=await r.json().catch(()=>({}));
+  if(r.ok){ msg.textContent='Токен создан, скопируйте его сейчас — повторно он не показывается: '+d.token; e.target.reset(); loadTokens(); }
+  else { msg.textContent='Ошибка: '+(d.detail||r.status); }
 };
 
 async function loadModels(){
@@ -1751,5 +1912,6 @@ async function deleteModel(id){
 }
 
 loadUsers();
+loadTokens();
 loadModels();
 """ + PROTOCOL_ADMIN_SCRIPT + "</script>")

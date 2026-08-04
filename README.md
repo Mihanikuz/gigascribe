@@ -27,8 +27,8 @@ models/
 
 ## Installation
 
-Install in this order — models are downloaded and verified *before* the application is built and
-started, never after:
+A plain, proxy-independent checklist — proxies are only relevant on restricted networks and are a
+separate, optional note further down ([Restricted networks](#restricted-networks-proxy--no-github-access)), not a step everyone needs:
 
 1. Copy the example environment file and edit it:
    ```bash
@@ -36,24 +36,70 @@ started, never after:
    ```
    At minimum set real values for `GIGASCRIBE_SECRET_KEY` and `GIGASCRIBE_ADMIN_PASSWORD` — the server refuses to start with the placeholder values shipped in `.env.example` (or with `admin`). Set `HF_TOKEN` if you need diarization.
 
-   If the build machine can only reach GitHub through a proxy, `export http_proxy=... https_proxy=...` (and `no_proxy` if needed) in the shell before the next step — Docker forwards those automatically as build args, which both `apt-get` and the `pip install git+https://...` step (for the ASR backend) respect. Don't edit the Dockerfile for this.
-
-2. Download and verify every model the application needs (GigaAM, and pyannote unless you skip it) — this step needs real internet access, so it explicitly overrides the offline mode the served application always runs with:
+2. Download and verify every model the application needs — GigaAM, pyannote (unless skipped), and,
+   if you're using the [protocol module](#protocol-module-ai-meeting-minutes), its LLM — *before*
+   building or starting anything:
    ```bash
    ./scripts/download-models.sh
    ```
-   This builds the base image (needed to run GigaAM/pyannote's own loaders for verification) and then downloads into `./models`. It's safe to re-run — nothing already downloaded and verified is re-fetched. Set `GIGASCRIBE_SKIP_PYANNOTE=1` first if you don't have an `HF_TOKEN` and want to skip diarization. To also fetch the protocol module's `qwen3-8b` model in this same step, set `GIGASCRIBE_PROTOCOL_MODEL_REPO_ID`/`GIGASCRIBE_PROTOCOL_MODEL_FILENAME` first (see [Supported models](#supported-models) below for why those aren't filled in for you); otherwise install it separately later. At any time, re-check what's installed without downloading anything: `docker compose run --rm gigascribe-gpu python scripts/download_models.py --check`.
+   This builds the base image (needed to run GigaAM/pyannote's own loaders for verification) and then
+   downloads into `./models`. It's safe to re-run — nothing already downloaded and verified is
+   re-fetched. Set `GIGASCRIBE_SKIP_PYANNOTE=1` first if you don't have an `HF_TOKEN` and want to skip
+   diarization. To also fetch the protocol module's `qwen3-8b` model in this same step, set
+   `GIGASCRIBE_PROTOCOL_MODEL_REPO_ID`/`GIGASCRIBE_PROTOCOL_MODEL_FILENAME` first (see
+   [Supported models](#supported-models) for why those aren't filled in for you); otherwise install it
+   separately later. At any time, re-check what's installed without downloading anything:
+   `docker compose run --rm gigascribe-gpu python scripts/download_models.py --check`.
 
-3. Build (fast — the previous step already built and cached this) and start:
+3. If you plan to use the protocol module with the Ollama engine instead of llama.cpp, install and
+   start Ollama on the host (or wherever `GIGASCRIBE_OLLAMA_URL` points) now — see
+   [Prompts and glossary](#prompts-and-glossary) / [Supported models](#supported-models) for engine
+   selection. Nothing else in this checklist depends on it.
+
+4. Build and start:
    ```bash
-   docker compose build
+   docker compose build   # fast: step 2 already built and cached the base image
    docker compose up -d
    curl -f http://127.0.0.1:8000/health/ready
    ```
 
-4. Open `http://<host>:8000`, log in as `admin` with the password from step 1, and create accounts for other users at `/admin`.
+5. Open `http://<host>:8000`, log in as `admin` with the password from step 1, and create accounts for other users at `/admin`.
 
 CPU, CTC models, pyannote 3.1, compatibility profiles, and compose override profiles have been removed.
+
+## Restricted networks (proxy / no GitHub access)
+
+Two independent problems can show up on a network where GitHub (or Hugging Face, or Ollama's
+registry) isn't directly reachable — handle whichever actually applies to you:
+
+**A proxy is required.** `compose.yaml`'s `build.args` already forwards `http_proxy`/`https_proxy`/
+`no_proxy` from your shell into the build automatically — just `export` them before `docker compose
+build`; you don't need `--build-arg` or to edit anything. Two things commonly still trip people up
+even with that in place:
+- **The proxy address itself.** If your proxy runs on the Docker host at `127.0.0.1:<port>`, that
+  address is *not* reachable from inside the build container — `127.0.0.1` there means the container
+  itself, not the host. Use the Docker bridge gateway address instead (typically `172.17.0.1`; confirm
+  with `docker network inspect bridge | grep Gateway`), e.g. `export
+  http_proxy=http://172.17.0.1:<port>`. Building with `--network=host` is the other common workaround.
+- **`no_proxy` scope.** Without it, every build request goes through the proxy, not just the ones
+  that need to — set something like `export
+  no_proxy=pypi.org,files.pythonhosted.org,download.pytorch.org,huggingface.co,deb.debian.org` (add
+  your proxy's own host if it resolves via a name) alongside `http_proxy`/`https_proxy`, before both
+  `docker compose build` and `./scripts/download-models.sh`.
+
+**GitHub isn't reachable at all, even via proxy.** `requirements-gigaam.txt` normally installs GigaAM
+straight from its GitHub source. To avoid that entirely: clone or extract a copy of
+[`salute-developers/GigaAM`](https://github.com/salute-developers/GigaAM) into `vendor/gigaam/`
+before running `docker compose build` (that directory is gitignored on purpose — it's a local-only
+build input, not something this repo ships). The Dockerfile detects a non-empty `vendor/gigaam/` (a
+`setup.py` or `pyproject.toml` present) and installs from it instead of reaching GitHub; with nothing
+there, it falls back to the pinned git commit exactly as before.
+
+**Ollama's registry (`registry.ollama.ai`) is unreachable.** Same class of problem as GitHub above,
+for a different host, if you've chosen Ollama as the protocol module's engine — it needs outbound
+access to pull a model tag (`ollama pull ...`) unless you provide one already present on disk. Route
+that pull through the same proxy setup described above, or transfer/import the model to the Ollama
+host by another means; this is unrelated to whether GigaScribe's own Docker build can reach GitHub.
 
 ## Data storage
 
@@ -161,6 +207,30 @@ Repeat with `--model-id qwen3-14b`, `--model-id gemma3-12b-it`, or
 network, and only for the duration of the download — normal operation stays fully offline, same as
 the main app.
 
+#### GPU offload status and the CPU-wheel fallback
+
+`INSTALL_PROTOCOL=1` builds `llama-cpp-python` with CUDA GPU offload (`GGML_CUDA=on`) via a
+dedicated multi-stage build step (`protocol-builder-1` in the `Dockerfile`) that temporarily installs
+the CUDA devel toolchain (`nvcc`) from NVIDIA's official Debian apt repository, compiles the wheel,
+and discards the toolchain — the final image only keeps the compiled wheel and the CUDA runtime `.so`
+files it needs. **This has not been verified against real hardware in the environment this was
+written in** (no GPU or Docker daemon available there); if it doesn't work for your driver/CUDA
+combination, or you'd rather not wait for a CUDA compile at all, the officially-supported fallback is
+a plain CPU-built wheel:
+
+```bash
+docker compose -f compose.yaml -f compose.protocol.yaml build \
+  --build-arg INSTALL_PROTOCOL=1 \
+  --build-arg PROTOCOL_CMAKE_ARGS=
+```
+
+(An empty `PROTOCOL_CMAKE_ARGS` skips the `-DGGML_CUDA=on` flag inside `protocol-builder-1`, so it
+falls through to a plain `pip wheel` there — still no CUDA toolchain needed on the build host, but the
+resulting wheel runs LLM inference on CPU. Expect roughly 15-20 minutes for a single protocol job
+on a 14B model instead of seconds on GPU — usable for evaluating the module, not for routine
+production load.) Please report back whether the GPU path builds and actually offloads to GPU on your
+hardware so this note can be updated with a confirmed status.
+
 After installing, an admin picks the active model, edits its launch parameters (temperature, max
 tokens, context, launch args) and its **engine** — Протоколирование → Модели → "Настройка движка
 модели" lets an admin choose `llama_cpp` (GGUF, local file, GPU-layer count) or `ollama` (model
@@ -242,11 +312,51 @@ result, or the final protocol.
 7. On server restart, any protocol job caught mid-run is marked `failed` with a clear "restored
    after restart" message rather than silently resumed, so it can never leave the GPU lock held.
 
+### Automatic protocol creation
+
+Instead of clicking "Создать протокол" after a transcription finishes, tick "Сразу создать
+протокол после завершения" next to the upload button (shown whenever the module is enabled and at
+least one model is installed) — the protocol job starts the instant the transcription completes,
+with no second manual step. It reuses exactly the same `create_protocol()` call the button makes,
+with the same error isolation: if it fails (no model installed, transcript missing, etc.) it's
+logged and the transcription job is unaffected either way. The flag is stored per-job
+(`jobs.auto_protocol`, set once at upload time, read-only afterwards) and is entirely independent
+of the module being enabled at all — if `GIGASCRIBE_PROTOCOL_ENABLED=0`, the checkbox is hidden and
+the flag is simply never acted on.
+
+### External API for integrations (`/api/v1/meeting-protocol`)
+
+For machine clients built separately (a Telegram bot, "Пачка" bridge, etc.) that need to submit
+audio and poll for a protocol without a browser session:
+
+- `POST /api/v1/meeting-protocol` — multipart file upload, `Authorization: Bearer <token>` header.
+  Returns `{"job_id": ...}` immediately; the job always runs with `auto_protocol` on, using the
+  admin panel's currently active model/engine/prompts/glossary.
+- `GET /api/v1/meeting-protocol/{job_id}` — status and, once ready, the protocol result
+  (`protocol_data`, the same document as `protocol.json`). Only returns jobs created by that same
+  token; any other job (including another token's) 404s, never 403 — this mirrors the
+  ownership-check semantics used elsewhere in the app.
+
+**These two routes accept no configuration of any kind** — there is no field for model, engine,
+prompt, or glossary. That's deliberate: the external API can submit audio and read results, and
+nothing else. All configuration stays admin-panel-only.
+
+Tokens are bearer strings (`gsp_<id>_<secret>`, shown once at creation and never recoverable — only
+the bcrypt hash of the secret half is stored) that authenticate as a specific local username, via a
+dependency (`current_user_via_token`) kept fully separate from the cookie-session auth the rest of
+the app uses. **Token issuance and revocation are admin-only**, in the admin panel's "API-токены"
+section (label + the username the token acts as) — there is deliberately no self-service endpoint,
+since letting any authenticated user mint a token for another username would be a privilege hole.
+
+The polling route (`GET .../{job_id}`) has no rate limiting yet — `requirements-base.txt` doesn't
+currently pull in a rate-limiting library. Fine for a single internal bridge; worth adding
+(e.g. `slowapi`) before exposing this to many external callers.
+
 ### Where things are stored
 
 ```text
 data/
-  jobs.sqlite3          # existing DB; protocol/* and glossary_* tables added via ALTER/CREATE, no data loss
+  jobs.sqlite3          # existing DB; protocol/*, glossary_*, and api_tokens tables added via ALTER/CREATE, no data loss
   protocols/<job_id>/
     protocol.json        # structured result (source of truth)
     protocol.html         # rendered page served at /api/jobs/{id}/protocol
@@ -272,13 +382,16 @@ docker compose -f compose.yaml -f compose.protocol.yaml build
 docker compose -f compose.yaml -f compose.protocol.yaml up -d
 ```
 
-`compose.protocol.yaml` only adds `--build-arg INSTALL_PROTOCOL=1` (which triggers
-`CMAKE_ARGS="-DGGML_CUDA=on" pip install -r requirements-protocol.txt` inside the Dockerfile, so
-`llama-cpp-python` is built with CUDA GPU offload for CUDA 12.8-capable cards such as the RTX 5060
-Ti) and `GIGASCRIBE_PROTOCOL_ENABLED=1`. No proxy settings are added by either file. As with the
-base image, building `llama-cpp-python` from source needs a CUDA-capable toolchain available at
-build time; if your build host doesn't have one, install `requirements-protocol.txt` from a
-prebuilt wheel instead of relying on this Dockerfile step.
+`compose.protocol.yaml` only adds `--build-arg INSTALL_PROTOCOL=1` and `GIGASCRIBE_PROTOCOL_ENABLED=1`.
+That build arg selects a dedicated `protocol-builder-1` stage in the `Dockerfile` that compiles
+`llama-cpp-python` with CUDA GPU offload (`GGML_CUDA=on`) for CUDA 12.8-capable cards such as the RTX
+5060 Ti, temporarily installing just the CUDA devel toolchain (`nvcc`) it needs to do that and
+discarding it afterwards — this needs no CUDA toolchain on the build host itself, only outbound
+access to NVIDIA's apt repository during the build. No proxy settings are added by either compose
+file (`compose.yaml`'s `build.args` already forwards your shell's own `http_proxy`/`https_proxy`/
+`no_proxy` if you have them set — see [Restricted networks](#restricted-networks-proxy--no-github-access)).
+See [GPU offload status and the CPU-wheel fallback](#gpu-offload-status-and-the-cpu-wheel-fallback)
+for this build step's verification status and the CPU-only fallback if it doesn't work for you.
 
 ### Running the tests
 
