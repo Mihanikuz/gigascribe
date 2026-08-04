@@ -22,6 +22,15 @@ services:
         HOST_UID: ${HOST_UID:-1000}
         HOST_GID: ${HOST_GID:-1000}
         TORCH_REQUIREMENTS: requirements-cu128.txt
+        # No proxy is configured here -- these three only forward whatever
+        # http_proxy/https_proxy/no_proxy you already have set in your own
+        # shell (empty/unset by default, so this is a no-op for everyone
+        # who doesn't need a proxy). See README "Restricted networks" for
+        # why `docker compose build` alone does NOT pick these up from the
+        # shell without this passthrough.
+        http_proxy: ${http_proxy:-}
+        https_proxy: ${https_proxy:-}
+        no_proxy: ${no_proxy:-}
     ports: ["8000:8000"]
     environment: *environment
     volumes:
