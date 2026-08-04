@@ -1,13 +1,13 @@
 # GigaScribe
 
-GigaScribe now supports one production configuration only:
+GigaScribe теперь поддерживает только одну продакшн-конфигурацию:
 
-- ASR: `gigaam-v3-e2e-rnnt` (`v3_e2e_rnnt` checkpoint and tokenizer)
-- Diarization: disabled or local `pyannote-community-1`
-- Device: NVIDIA CUDA only
-- Runtime: offline (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`)
+- ASR: `gigaam-v3-e2e-rnnt` (чекпоинт и токенизатор `v3_e2e_rnnt`)
+- Диаризация: отключена или локальная `pyannote-community-1`
+- Устройство: только NVIDIA CUDA
+- Режим работы: офлайн (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`)
 
-## Model layout
+## Раскладка моделей
 
 ```text
 models/
@@ -18,205 +18,218 @@ models/
   pyannote/community-1/.pyannote-ready.json
 ```
 
-## Prerequisites
+## Требования
 
-- Docker Engine with the Compose plugin (`docker compose`, not the old `docker-compose`).
-- An NVIDIA GPU with the driver and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) installed on the host, so `--gpus all` works.
-- Outbound internet access for the one-time model download step below (the served application itself is fully offline afterwards).
-- A Hugging Face access token with access granted to [`pyannote/speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1), only if you want speaker diarization (it is a gated model). Not needed if you plan to run with diarization disabled.
+- Docker Engine с плагином Compose (`docker compose`, а не старый `docker-compose`).
+- NVIDIA GPU с установленным драйвером и [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) на хосте, чтобы работал `--gpus all`.
+- Исходящий доступ в интернет для одноразового шага загрузки моделей (см. ниже) — сам развёрнутый сервис после этого работает полностью офлайн.
+- Токен доступа Hugging Face с доступом к [`pyannote/speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1) — только если нужна диаризация спикеров (это закрытая/gated-модель). Не требуется, если планируете работать с отключённой диаризацией.
 
-## Installation
+## Установка
 
-A plain, proxy-independent checklist — proxies are only relevant on restricted networks and are a
-separate, optional note further down ([Restricted networks](#restricted-networks-proxy--no-github-access)), not a step everyone needs:
+Простой чек-лист, не зависящий от прокси — прокси актуален только в ограниченных сетях и вынесен
+отдельной опциональной заметкой ниже ([Ограниченные сети](#restricted-networks)), а не является шагом,
+нужным всем:
 
-1. Copy the example environment file and edit it:
+1. Скопируйте файл окружения-примера и отредактируйте его:
    ```bash
    cp .env.example .env
    ```
-   At minimum set real values for `GIGASCRIBE_SECRET_KEY` and `GIGASCRIBE_ADMIN_PASSWORD` — the server refuses to start with the placeholder values shipped in `.env.example` (or with `admin`). Set `HF_TOKEN` if you need diarization.
+   Как минимум задайте реальные значения `GIGASCRIBE_SECRET_KEY` и `GIGASCRIBE_ADMIN_PASSWORD` — сервер
+   откажется стартовать с плейсхолдерами из `.env.example` (или со значением `admin`). Укажите
+   `HF_TOKEN`, если нужна диаризация.
 
-2. Download and verify every model the application needs — GigaAM, pyannote (unless skipped), and,
-   if you're using the [protocol module](#protocol-module-ai-meeting-minutes), its LLM — *before*
-   building or starting anything:
+2. Скачайте и проверьте все модели, нужные приложению — GigaAM, pyannote (если не пропускаете) и,
+   если используете [модуль протоколирования](#protocol-module), его LLM — *до* сборки и запуска
+   чего-либо:
    ```bash
    ./scripts/download-models.sh
    ```
-   This builds the base image (needed to run GigaAM/pyannote's own loaders for verification) and then
-   downloads into `./models`. It's safe to re-run — nothing already downloaded and verified is
-   re-fetched. Set `GIGASCRIBE_SKIP_PYANNOTE=1` first if you don't have an `HF_TOKEN` and want to skip
-   diarization. To also fetch the protocol module's `qwen3-8b` model in this same step, set
-   `GIGASCRIBE_PROTOCOL_MODEL_REPO_ID`/`GIGASCRIBE_PROTOCOL_MODEL_FILENAME` first (see
-   [Supported models](#supported-models) for why those aren't filled in for you); otherwise install it
-   separately later. At any time, re-check what's installed without downloading anything:
-   `docker compose run --rm gigascribe-gpu python scripts/download_models.py --check`.
+   Этот шаг соберёт базовый образ (нужен для запуска загрузчиков GigaAM/pyannote в целях проверки), а
+   затем скачает файлы в `./models`. Скрипт безопасно перезапускать — уже скачанное и проверенное
+   повторно не загружается. Установите `GIGASCRIBE_SKIP_PYANNOTE=1` заранее, если нет `HF_TOKEN` и вы
+   хотите пропустить диаризацию. Чтобы на этом же шаге скачать модель `qwen3-8b` для модуля
+   протоколирования, заранее задайте `GIGASCRIBE_PROTOCOL_MODEL_REPO_ID`/
+   `GIGASCRIBE_PROTOCOL_MODEL_FILENAME` (см. [Поддерживаемые модели](#supported-models) — почему они
+   не заполнены заранее), иначе установите модель отдельно позже. В любой момент можно проверить, что
+   уже установлено, без загрузки: `docker compose run --rm gigascribe-gpu python
+   scripts/download_models.py --check`.
 
-3. If you plan to use the protocol module with the Ollama engine instead of llama.cpp, install and
-   start Ollama on the host (or wherever `GIGASCRIBE_OLLAMA_URL` points) now — see
-   [Prompts and glossary](#prompts-and-glossary) / [Supported models](#supported-models) for engine
-   selection. Nothing else in this checklist depends on it.
+3. Если планируете использовать модуль протоколирования с движком Ollama вместо llama.cpp, установите
+   и запустите Ollama на хосте (или там, куда указывает `GIGASCRIBE_OLLAMA_URL`) уже сейчас — см.
+   [Промпты и глоссарий](#prompts-and-glossary) / [Поддерживаемые модели](#supported-models) про выбор
+   движка. Больше ничего в этом чек-листе от этого не зависит.
 
-4. Build and start:
+4. Соберите и запустите:
    ```bash
-   docker compose build   # fast: step 2 already built and cached the base image
+   docker compose build   # быстро: шаг 2 уже собрал и закэшировал базовый образ
    docker compose up -d
    curl -f http://127.0.0.1:8000/health/ready
    ```
 
-5. Open `http://<host>:8000`, log in as `admin` with the password from step 1, and create accounts for other users at `/admin`.
+5. Откройте `http://<host>:8000`, войдите как `admin` с паролем из шага 1 и создайте учётные записи
+   для остальных пользователей в `/admin`.
 
-CPU, CTC models, pyannote 3.1, compatibility profiles, and compose override profiles have been removed.
+CPU, CTC-модели, pyannote 3.1, профили совместимости и профили-переопределения compose удалены.
 
-## Restricted networks (proxy / no GitHub access)
+<a id="restricted-networks"></a>
+## Ограниченные сети (прокси / нет доступа к GitHub)
 
-Two independent problems can show up on a network where GitHub (or Hugging Face, or Ollama's
-registry) isn't directly reachable — handle whichever actually applies to you:
+В сети, где GitHub (или Hugging Face, или реестр Ollama) недоступны напрямую, могут встретиться две
+независимые проблемы — решайте ту, что реально применима к вам:
 
-**A proxy is required.** `compose.yaml`'s `build.args` already forwards `http_proxy`/`https_proxy`/
-`no_proxy` from your shell into the build automatically — just `export` them before `docker compose
-build`; you don't need `--build-arg` or to edit anything. Two things commonly still trip people up
-even with that in place:
-- **The proxy address itself.** If your proxy runs on the Docker host at `127.0.0.1:<port>`, that
-  address is *not* reachable from inside the build container — `127.0.0.1` there means the container
-  itself, not the host. Use the Docker bridge gateway address instead (typically `172.17.0.1`; confirm
-  with `docker network inspect bridge | grep Gateway`), e.g. `export
-  http_proxy=http://172.17.0.1:<port>`. Building with `--network=host` is the other common workaround.
-- **`no_proxy` scope.** Without it, every build request goes through the proxy, not just the ones
-  that need to — set something like `export
-  no_proxy=pypi.org,files.pythonhosted.org,download.pytorch.org,huggingface.co,deb.debian.org` (add
-  your proxy's own host if it resolves via a name) alongside `http_proxy`/`https_proxy`, before both
-  `docker compose build` and `./scripts/download-models.sh`.
+**Нужен прокси.** `build.args` в `compose.yaml` уже автоматически прокидывает `http_proxy`/
+`https_proxy`/`no_proxy` из вашей оболочки в сборку — просто сделайте `export` этих переменных перед
+`docker compose build`; `--build-arg` или правка файлов не нужны. Две вещи здесь обычно всё равно
+сбивают с толку:
+- **Сам адрес прокси.** Если прокси работает на Docker-хосте по адресу `127.0.0.1:<port>`, этот адрес
+  *недоступен* изнутри сборочного контейнера — там `127.0.0.1` означает сам контейнер, а не хост.
+  Используйте вместо этого адрес шлюза Docker-моста (обычно `172.17.0.1`; уточните командой `docker
+  network inspect bridge | grep Gateway`), например `export http_proxy=http://172.17.0.1:<port>`.
+  Другой распространённый обходной путь — сборка с `--network=host`.
+- **Область действия `no_proxy`.** Без неё через прокси пойдут вообще все запросы сборки, а не только
+  нужные — задайте что-то вроде `export
+  no_proxy=pypi.org,files.pythonhosted.org,download.pytorch.org,huggingface.co,deb.debian.org`
+  (добавьте туда и хост самого прокси, если он резолвится по имени) вместе с `http_proxy`/
+  `https_proxy`, перед `docker compose build` и перед `./scripts/download-models.sh`.
 
-**GitHub isn't reachable at all, even via proxy.** `requirements-gigaam.txt` normally installs GigaAM
-straight from its GitHub source. To avoid that entirely: clone or extract a copy of
-[`salute-developers/GigaAM`](https://github.com/salute-developers/GigaAM) into `vendor/gigaam/`
-before running `docker compose build` (that directory is gitignored on purpose — it's a local-only
-build input, not something this repo ships). The Dockerfile detects a non-empty `vendor/gigaam/` (a
-`setup.py` or `pyproject.toml` present) and installs from it instead of reaching GitHub; with nothing
-there, it falls back to the pinned git commit exactly as before.
+**GitHub недоступен вообще, даже через прокси.** `requirements-gigaam.txt` обычно устанавливает GigaAM
+напрямую из его исходников на GitHub. Чтобы полностью этого избежать: склонируйте или распакуйте копию
+[`salute-developers/GigaAM`](https://github.com/salute-developers/GigaAM) в `vendor/gigaam/` перед
+запуском `docker compose build` (эта директория намеренно в `.gitignore` — это чисто локальный вход для
+сборки, а не то, что поставляется вместе с репозиторием). Dockerfile определяет непустой `vendor/gigaam/`
+(наличие `setup.py` или `pyproject.toml`) и устанавливает пакет из него вместо обращения к GitHub; если
+там ничего нет — используется откат к зафиксированному git-коммиту, как и раньше.
 
-**Ollama's registry (`registry.ollama.ai`) is unreachable.** Same class of problem as GitHub above,
-for a different host, if you've chosen Ollama as the protocol module's engine — it needs outbound
-access to pull a model tag (`ollama pull ...`) unless you provide one already present on disk. Route
-that pull through the same proxy setup described above, or transfer/import the model to the Ollama
-host by another means; this is unrelated to whether GigaScribe's own Docker build can reach GitHub.
+**Реестр Ollama (`registry.ollama.ai`) недоступен.** Проблема того же класса, что и с GitHub выше, но
+для другого хоста — актуально, если в качестве движка модуля протоколирования выбран Ollama: ему нужен
+исходящий доступ, чтобы скачать тег модели (`ollama pull ...`), если только вы не предоставили модель,
+уже лежащую на диске. Пропустите эту загрузку через тот же прокси, что описан выше, либо перенесите/
+импортируйте модель на хост Ollama другим способом; это никак не связано с тем, может ли собственная
+Docker-сборка GigaScribe достучаться до GitHub.
 
-## Data storage
+## Хранение данных
 
-Every writable/user-created file lives outside the image, in the two directories `compose.yaml`
-bind-mounts from the host: `./data` (→ `GIGASCRIBE_DATA_DIR`, uploaded originals, transcripts,
-M4A/FLAC exports, generated protocols, `jobs.sqlite3`, logs) and `./models` (→
-`GIGASCRIBE_MODELS_DIR`, GigaAM/pyannote/protocol model weights). Rebuilding, updating, or removing
-the container never touches either directory — only `docker compose down -v` (which this project's
-compose files don't define named volumes for, so `-v` has nothing to remove here) or manually
-deleting the host paths would. To point either at a dedicated external location instead of a
-relative `./data`/`./models` next to the repo (e.g. `/opt/gigascribe-data`), set
-`GIGASCRIBE_DATA_DIR=/opt/gigascribe-data/app-data` and `GIGASCRIBE_MODELS_DIR=/opt/gigascribe-data/models`
-in `.env` and update the two bind-mount paths on the left of the `:` in `compose.yaml`'s `volumes:`
-to match; the container-side paths (right of the `:`) don't need to change.
+Все записываемые/создаваемые пользователем файлы живут вне образа, в двух директориях, которые
+`compose.yaml` монтирует с хоста: `./data` (→ `GIGASCRIBE_DATA_DIR`, загруженные оригиналы,
+транскрипты, экспорты M4A/FLAC, сгенерированные протоколы, `jobs.sqlite3`, логи) и `./models` (→
+`GIGASCRIBE_MODELS_DIR`, веса моделей GigaAM/pyannote/протокола). Пересборка, обновление или удаление
+контейнера никогда не затрагивает ни одну из этих директорий — тронуть их может только `docker compose
+down -v` (хотя compose-файлы этого проекта не объявляют именованных томов, так что `-v` здесь удалять
+нечего) либо ручное удаление путей на хосте. Чтобы указать вместо относительных `./data`/`./models`
+рядом с репозиторием отдельное внешнее расположение (например, `/opt/gigascribe-data`), задайте в
+`.env` `GIGASCRIBE_DATA_DIR=/opt/gigascribe-data/app-data` и
+`GIGASCRIBE_MODELS_DIR=/opt/gigascribe-data/models`, и поменяйте соответствующим образом два пути слева
+от `:` в `volumes:` файла `compose.yaml`; пути внутри контейнера (справа от `:`) менять не нужно.
 
-## Users and administration
+## Пользователи и администрирование
 
-- Log in as `admin` and open `/admin` to create or disable local accounts and manage installed models.
-- The transcription history is shared: every logged-in user sees every job. Only the job's owner or an administrator can cancel or retry it.
+- Войдите как `admin` и откройте `/admin`, чтобы создавать или отключать локальные учётные записи и
+  управлять установленными моделями.
+- История транскрипций общая: каждый вошедший пользователь видит все задания. Отменить или повторить
+  задание может только его владелец или администратор.
 
-## Protocol module (AI meeting minutes)
+<a id="protocol-module"></a>
+## Модуль протоколирования (протокол встреч на базе ИИ)
 
-`protocol/` is a self-contained add-on that turns a finished transcript into a structured meeting
-protocol (summary, decisions, tasks, open questions, risks) using a local LLM. It is fully
-isolated from transcription, diarization, the job queue, and authorization:
+`protocol/` — самодостаточное дополнение, превращающее готовый транскрипт в структурированный протокол
+встречи (сводка, решения, задачи, открытые вопросы, риски) с помощью локальной LLM. Модуль полностью
+изолирован от транскрипции, диаризации, очереди заданий и авторизации:
 
-- **Own package.** `protocol/` never imports `app.py`, `asr_backend.py`, `diarization_backend.py`,
-  or `model_manager.py`. `server.py` is the only integration point, and it talks to the module
-  only through `ProtocolService` (`protocol/service.py`) and plain callables/locks it passes in
-  (`MODEL_MANAGER.unload_all`, the shared GPU `asyncio.Lock`).
-- **Own dependencies.** Heavy LLM dependencies (`llama-cpp-python`) live in
-  `requirements-protocol.txt`, not `requirements.txt`/`requirements-base.txt`. The main image does
-  not need them.
-- **Own storage.** The module adds its own SQLite tables (`protocol_jobs`, `protocol_models`,
-  `protocol_prompts`, `protocol_results`, `glossary_*`, `protocol_settings`) to the existing
-  `jobs.sqlite3`, linked to `jobs` only via a `job_id` foreign key. Nothing in the existing `jobs`
-  table schema changes.
-- **Own GPU discipline.** Transcription and protocol generation never run on the GPU at the same
-  time: protocol generation waits for the same GPU lock transcription jobs use, unloads GigaAM and
-  pyannote (`MODEL_MANAGER.unload_all()`), runs `gc.collect()` + `torch.cuda.empty_cache()`, then
-  loads the LLM. The LLM is always unloaded and VRAM freed afterwards, on both success and failure.
-  ASR/diarization models simply reload on the next transcription job, as they already do today.
+- **Собственный пакет.** `protocol/` никогда не импортирует `app.py`, `asr_backend.py`,
+  `diarization_backend.py` или `model_manager.py`. `server.py` — единственная точка интеграции, и
+  общается с модулем только через `ProtocolService` (`protocol/service.py`) и передаваемые в него
+  простые вызываемые объекты/блокировки (`MODEL_MANAGER.unload_all`, общий GPU `asyncio.Lock`).
+- **Собственные зависимости.** Тяжёлые зависимости LLM (`llama-cpp-python`) лежат в
+  `requirements-protocol.txt`, а не в `requirements.txt`/`requirements-base.txt`. Основному образу они
+  не нужны.
+- **Собственное хранилище.** Модуль добавляет собственные таблицы SQLite (`protocol_jobs`,
+  `protocol_models`, `protocol_prompts`, `protocol_results`, `glossary_*`, `protocol_settings`) в
+  существующий `jobs.sqlite3`, связанные с `jobs` только через внешний ключ `job_id`. Схема
+  существующей таблицы `jobs` при этом не меняется.
+- **Собственная дисциплина работы с GPU.** Транскрипция и генерация протокола никогда не выполняются
+  на GPU одновременно: генерация протокола ждёт ту же GPU-блокировку, что используют задания
+  транскрипции, выгружает GigaAM и pyannote (`MODEL_MANAGER.unload_all()`), выполняет `gc.collect()` +
+  `torch.cuda.empty_cache()`, и только затем загружает LLM. LLM всегда выгружается и VRAM
+  освобождается после этого — как при успехе, так и при ошибке. Модели ASR/диаризации просто
+  перезагружаются на следующем задании транскрипции, как и раньше.
 
-### Enabling / disabling
+### Включение/отключение
 
-The module is off by default. Set in `.env`:
+По умолчанию модуль выключен. Задайте в `.env`:
 
 ```bash
 GIGASCRIBE_PROTOCOL_ENABLED=1
 ```
 
-and restart the container. When unset or `0`:
-- the `protocol` package is **never imported** (verified by
+и перезапустите контейнер. Когда переменная не задана или равна `0`:
+- пакет `protocol` **никогда не импортируется** (проверяется тестом
   `tests/test_protocol_server_integration.py::test_protocol_package_never_imported_when_disabled`),
-- no protocol SQLite tables/migrations run, no LLM is ever loaded,
-- the "Создать протокол" button and the admin "Протоколирование" section are hidden,
-- `/health/ready` and the rest of the app are completely unaffected.
+- ни одна SQLite-таблица/миграция модуля не выполняется, LLM никогда не загружается,
+- кнопка «Создать протокол» и раздел администрирования «Протоколирование» скрыты,
+- `/health/ready` и остальное приложение работают совершенно без изменений.
 
-If the `protocol/` package fails to import (missing dependency, corrupted files) or is deleted
-entirely while `GIGASCRIBE_PROTOCOL_ENABLED=1`, `server.py` catches the failure at startup, logs it,
-and falls back to running with the module disabled — GigaScribe still starts and transcription
-still works.
+Если пакет `protocol/` не удаётся импортировать (отсутствует зависимость, повреждены файлы) или он
+целиком удалён при `GIGASCRIBE_PROTOCOL_ENABLED=1`, `server.py` перехватывает ошибку при старте,
+логирует её и откатывается к работе с отключённым модулем — GigaScribe всё равно запускается, а
+транскрипция продолжает работать.
 
-### Removing the module entirely
+### Полное удаление модуля
 
-1. Delete the `protocol/` directory and `requirements-protocol.txt`.
-2. Remove `GIGASCRIBE_PROTOCOL_ENABLED` (and any other `GIGASCRIBE_PROTOCOL_*`) from `.env`.
-3. Nothing else needs to change — `server.py` only touches the module behind the
-   `GIGASCRIBE_PROTOCOL_ENABLED` gate, and the extra SQLite tables are simply left unused (drop
-   them manually with `sqlite3` if you want them gone too; this is optional, they are inert).
+1. Удалите директорию `protocol/` и файл `requirements-protocol.txt`.
+2. Уберите `GIGASCRIBE_PROTOCOL_ENABLED` (и любые другие `GIGASCRIBE_PROTOCOL_*`) из `.env`.
+3. Больше ничего менять не нужно — `server.py` обращается к модулю только за флагом
+   `GIGASCRIBE_PROTOCOL_ENABLED`, а дополнительные таблицы SQLite просто останутся неиспользуемыми
+   (при желании можно вручную удалить их через `sqlite3`; это опционально, сами по себе они безвредны).
 
-### Supported models
+<a id="supported-models"></a>
+### Поддерживаемые модели
 
-Four local GGUF chat models, run via [llama.cpp](https://github.com/ggml-org/llama.cpp)
-(`llama-cpp-python`) by default, with an optional [Ollama](https://ollama.com/) engine
-(`GIGASCRIBE_OLLAMA_URL`, default `http://127.0.0.1:11434`) selectable per-deployment in
-Протоколирование → Настройки:
+Четыре локальные GGUF чат-модели, по умолчанию запускаемые через
+[llama.cpp](https://github.com/ggml-org/llama.cpp) (`llama-cpp-python`), с опциональным движком
+[Ollama](https://ollama.com/) (`GIGASCRIBE_OLLAMA_URL`, по умолчанию `http://127.0.0.1:11434`),
+выбираемым для каждого развёртывания в Протоколирование → Настройки:
 
-| Model | Quantization | Context | Approx. VRAM (Q4_K_M) |
+| Модель | Квантование | Контекст | Прибл. VRAM (Q4_K_M) |
 |---|---|---|---|
-| Qwen3-14B | Q4_K_M | 32768 | ~10-12 GB |
-| Qwen3-8B | Q4_K_M | 32768 | ~6-7 GB |
-| Gemma 3 12B IT | Q4_K_M | 8192 | ~8-9 GB |
-| Ministral 3 8B Instruct | Q4_K_M | 32768 | ~6-7 GB |
+| Qwen3-14B | Q4_K_M | 32768 | ~10-12 ГБ |
+| Qwen3-8B | Q4_K_M | 32768 | ~6-7 ГБ |
+| Gemma 3 12B IT | Q4_K_M | 8192 | ~8-9 ГБ |
+| Ministral 3 8B Instruct | Q4_K_M | 32768 | ~6-7 ГБ |
 
-VRAM figures are rough Q4_K_M ballpark estimates for planning purposes only — check the actual
-GGUF file size for the build you download. GigaAM + pyannote are fully unloaded before the LLM
-loads, so the LLM does not need to share VRAM with them.
+Значения VRAM — грубые ориентировочные оценки для Q4_K_M, только для планирования — проверяйте
+реальный размер GGUF-файла для конкретной скачиваемой сборки. GigaAM и pyannote полностью выгружаются
+перед загрузкой LLM, так что LLM не нужно делить VRAM с ними.
 
-Model weights are **not** bundled or auto-downloaded. `repo_id`/`filename` are intentionally left
-blank in `protocol/models.py`, because the current GGUF quantization filenames on Hugging Face
-change over time and shipping a guessed URL would be worse than requiring an explicit one. Install
-a model with:
+Веса моделей **не** поставляются вместе с проектом и не скачиваются автоматически. `repo_id`/
+`filename` намеренно оставлены пустыми в `protocol/models.py`, потому что актуальные имена файлов
+GGUF-квантований на Hugging Face со временем меняются, и зашитый угаданный URL был бы хуже, чем явное
+требование указать его. Установка модели:
 
 ```bash
 docker compose run --rm gigascribe-gpu python scripts/download_protocol_model.py \
   --model-id qwen3-8b \
-  --repo-id <hugging-face-repo-id-you-verified> \
-  --filename <gguf-filename-you-verified>
+  --repo-id <проверенный-вами-repo-id-на-hugging-face> \
+  --filename <проверенное-вами-имя-gguf-файла>
 ```
 
-Repeat with `--model-id qwen3-14b`, `--model-id gemma3-12b-it`, or
-`--model-id ministral3-8b-instruct` for the other models. `--list` shows current install status;
-`--force` re-downloads. This script is the only place in the protocol module that ever reaches the
-network, and only for the duration of the download — normal operation stays fully offline, same as
-the main app.
+Повторите с `--model-id qwen3-14b`, `--model-id gemma3-12b-it` или
+`--model-id ministral3-8b-instruct` для остальных моделей. `--list` показывает текущий статус
+установки; `--force` — принудительно перекачивает заново. Этот скрипт — единственное место в модуле
+протоколирования, которое вообще обращается к сети, и только на время загрузки — в обычной работе всё
+остаётся полностью офлайн, как и в основном приложении.
 
-#### GPU offload status and the CPU-wheel fallback
+<a id="gpu-offload-status"></a>
+#### Статус GPU-оффлоада и CPU-фолбэк
 
-`INSTALL_PROTOCOL=1` builds `llama-cpp-python` with CUDA GPU offload (`GGML_CUDA=on`) via a
-dedicated multi-stage build step (`protocol-builder-1` in the `Dockerfile`) that temporarily installs
-the CUDA devel toolchain (`nvcc`) from NVIDIA's official Debian apt repository, compiles the wheel,
-and discards the toolchain — the final image only keeps the compiled wheel and the CUDA runtime `.so`
-files it needs. **This has not been verified against real hardware in the environment this was
-written in** (no GPU or Docker daemon available there); if it doesn't work for your driver/CUDA
-combination, or you'd rather not wait for a CUDA compile at all, the officially-supported fallback is
-a plain CPU-built wheel:
+`INSTALL_PROTOCOL=1` собирает `llama-cpp-python` с GPU-оффлоадом через CUDA (`GGML_CUDA=on`) на
+отдельном multi-stage шаге сборки (`protocol-builder-1` в `Dockerfile`), который временно
+устанавливает набор инструментов CUDA devel (`nvcc`) из официального Debian apt-репозитория NVIDIA,
+компилирует wheel-пакет и затем отбрасывает этот тулчейн — в финальном образе остаётся только
+скомпилированный wheel и нужные ему `.so`-файлы CUDA-рантайма. **Это не было проверено на реальном
+железе в среде, где писался этот код** (там не было ни GPU, ни Docker-демона); если сборка не
+заработает под вашу комбинацию драйвера/CUDA, либо вы вообще не хотите ждать компиляцию под CUDA,
+официально поддерживаемый запасной вариант — обычный CPU-сборённый wheel:
 
 ```bash
 docker compose -f compose.yaml -f compose.protocol.yaml build \
@@ -224,182 +237,196 @@ docker compose -f compose.yaml -f compose.protocol.yaml build \
   --build-arg PROTOCOL_CMAKE_ARGS=
 ```
 
-(An empty `PROTOCOL_CMAKE_ARGS` skips the `-DGGML_CUDA=on` flag inside `protocol-builder-1`, so it
-falls through to a plain `pip wheel` there — still no CUDA toolchain needed on the build host, but the
-resulting wheel runs LLM inference on CPU. Expect roughly 15-20 minutes for a single protocol job
-on a 14B model instead of seconds on GPU — usable for evaluating the module, not for routine
-production load.) Please report back whether the GPU path builds and actually offloads to GPU on your
-hardware so this note can be updated with a confirmed status.
+(Пустой `PROTOCOL_CMAKE_ARGS` пропускает флаг `-DGGML_CUDA=on` внутри `protocol-builder-1`, так что
+там выполняется обычный `pip wheel` — CUDA-тулчейн на сборочном хосте по-прежнему не нужен, но
+получившийся wheel выполняет инференс LLM на CPU. Ожидайте порядка 15-20 минут на одно задание
+протокола для 14B-модели вместо секунд на GPU — годится для оценки модуля, но не для регулярной
+продакшн-нагрузки.) Пожалуйста, сообщите, собирается ли GPU-путь и реально ли выполняется оффлоад на
+GPU на вашем железе, чтобы обновить этот статус на подтверждённый.
 
-After installing, an admin picks the active model, edits its launch parameters (temperature, max
-tokens, context, launch args) and its **engine** — Протоколирование → Модели → "Настройка движка
-модели" lets an admin choose `llama_cpp` (GGUF, local file, GPU-layer count) or `ollama` (model
-tag + local Ollama daemon URL + `keep_alive`) per model, and runs a load test from that same tab.
-Setting changes only apply to protocol jobs created afterwards — every job freezes a full
-**settings snapshot** (model, engine, context/temperature/token limits, chunking settings, glossary
-settings, and the exact prompt versions used) at creation time in `protocol_jobs.settings_snapshot`,
-so jobs already queued or in progress are never affected by a later admin change, and a retry of a
-failed job replays that same frozen snapshot rather than picking up new settings.
+После установки администратор выбирает активную модель, редактирует её параметры запуска
+(температура, лимит токенов, контекст, аргументы запуска) и её **движок** — Протоколирование → Модели
+→ «Настройка движка модели» позволяет администратору выбрать `llama_cpp` (GGUF, локальный файл, число
+слоёв на GPU) или `ollama` (тег модели + URL локального демона Ollama + `keep_alive`) для каждой
+модели, и запустить тестовую загрузку прямо из этой вкладки. Изменения настроек применяются только к
+заданиям протокола, созданным после этого — каждое задание фиксирует полный **снимок настроек**
+(модель, движок, контекст/температура/лимиты токенов, настройки разбиения на блоки, настройки
+глоссария и точные версии использованных промптов) в момент создания, в
+`protocol_jobs.settings_snapshot`, так что уже поставленные в очередь или выполняющиеся задания никогда
+не затрагиваются последующим изменением администратора, а повтор неудавшегося задания воспроизводит тот
+же зафиксированный снимок, а не подхватывает новые настройки.
 
-Only an administrator can set an Ollama URL (`/api/protocol/models/{id}/params` requires
-`require_admin`); there is no way for a regular user to point the module at an arbitrary URL.
+Задать URL Ollama может только администратор (`/api/protocol/models/{id}/params` требует
+`require_admin`); у обычного пользователя нет способа направить модуль на произвольный URL.
 
-`llama.cpp` models are always called through `create_chat_completion()` with the model's own chat
-template (read from the GGUF's `tokenizer.chat_template` metadata) — never a hardcoded raw-completion
-format. A GGUF that has no embedded chat template fails to load with a clear error instead of
-silently running in an incorrect mode. Qwen3 builds are additionally told not to emit `<think>`
-reasoning, and any `<think>...</think>` block is stripped centrally before JSON parsing regardless
-of provider, so no internal reasoning can ever leak into a chunk analysis, the merge, the fact-check
-result, or the final protocol.
+Модели `llama.cpp` всегда вызываются через `create_chat_completion()` с собственным чат-шаблоном модели
+(читается из метаданных GGUF `tokenizer.chat_template`) — никогда через захардкоженный формат
+raw-completion. GGUF без встроенного чат-шаблона не загружается и выдаёт понятную ошибку вместо
+молчаливой работы в неверном режиме. Сборкам Qwen3 дополнительно указывается не выводить рассуждения
+`<think>`, а любой блок `<think>...</think>` централизованно вырезается перед разбором JSON независимо
+от провайдера, так что внутренние рассуждения модели никогда не попадут ни в анализ блока, ни в
+слияние, ни в результат факт-чека, ни в итоговый протокол.
 
-### Prompts and glossary
+<a id="prompts-and-glossary"></a>
+### Промпты и глоссарий
 
-- Протоколирование → Промпты lets an admin pick "Общий промпт" or one of the four models, then edit
-  the chunk-analysis, topic-split, final-merge, fact-check, or HTML-template prompt for that scope,
-  preview it, and restore the built-in default. Resolution order when a job runs: the selected
-  model's own active prompt → the common active prompt → the built-in default. Prompts are versioned
-  (`protocol_prompts` table keeps every saved version with author/timestamp) and never hardcoded in
-  `server.py` — defaults live in `protocol/prompts.py`. The exact version of every prompt kind used
-  is pinned into the job's settings snapshot at creation and never changes mid-job.
-- Протоколирование → Словарь/Предложения manage the term glossary (canonical term + aliases +
-  scope: job/project/department/global). Terms only get applied automatically once an admin marks
-  them `confirmed`. Suggestions can come from three sources, none ever applied automatically:
-  admin-added terms are `confirmed` immediately; everything else is `proposed` until an admin
-  confirms it — the chunk-analysis LLM call's own `terms` field (detected/suggested/context/
-  confidence, deduplicated and self-replacement-filtered), a document diff, or a user/owner
-  submitting `POST /api/jobs/{job_id}/glossary-suggestion` (a small form on the job card does this).
-  Import/export supports JSON and CSV.
+- Протоколирование → Промпты позволяет администратору выбрать «Общий промпт» или одну из четырёх
+  моделей, затем отредактировать промпт анализа блока, разбиения на темы, финального слияния,
+  факт-чека или HTML-шаблона для этой области, посмотреть предпросмотр и восстановить встроенное
+  значение по умолчанию. Порядок разрешения при выполнении задания: собственный активный промпт
+  выбранной модели → общий активный промпт → встроенное значение по умолчанию. Промпты версионируются
+  (таблица `protocol_prompts` хранит каждую сохранённую версию с автором и временем) и никогда не
+  захардкожены в `server.py` — значения по умолчанию лежат в `protocol/prompts.py`. Точная версия
+  каждого типа промпта, использованная в задании, фиксируется в снимке настроек при создании и не
+  меняется в процессе выполнения.
+- Протоколирование → Словарь/Предложения управляют глоссарием терминов (канонический термин + алиасы +
+  область действия: задание/проект/отдел/глобально). Термины применяются автоматически только после
+  того, как администратор пометит их как `confirmed`. Предложения могут приходить из трёх источников,
+  ни один из них никогда не применяется автоматически: термины, добавленные администратором,
+  получают статус `confirmed` сразу; всё остальное остаётся `proposed`, пока администратор его не
+  подтвердит — это собственное поле `terms` вызова LLM для анализа блока (обнаружено/предложено/
+  контекст/уверенность, с дедупликацией и фильтрацией самозамен), diff документа, либо
+  пользователь/владелец, отправляющий `POST /api/jobs/{job_id}/glossary-suggestion` (это делает
+  небольшая форма на карточке задания). Импорт/экспорт поддерживает JSON и CSV.
 
-### How it works
+### Как это работает
 
-1. User clicks "Создать протокол" on a completed job (button only appears once transcription is
-   done, the module is enabled, and at least one model is installed). This creates a
-   `protocol_jobs` row with a frozen settings snapshot; repeat clicks reuse the existing active job
-   instead of creating a duplicate.
-2. The pipeline (`protocol/service.py`) prepares the transcript and splits it into chunks. Topic
-   splitting is two-stage so a long meeting is never sent to the model in one piece: rough
-   10-15-minute pre-blocks each get a one-line topic hint, then a single call over those hints (not
-   the raw transcript) proposes boundaries for the whole meeting; boundaries outside the
-   transcript's own range are dropped and near-duplicates are merged. If that's unreliable, or
-   disabled, it falls back to fixed time windows with a configurable overlap — a chunk never splits
-   a reply mid-way. Each chunk is analyzed into strict JSON (using "не указан" for anything not
-   stated in the transcript — the prompts explicitly forbid inventing decisions, deadlines, owners,
-   or numbers), then a separate merge call combines all chunks into one document.
-3. A **fact-check** stage follows the merge: every decision and task from the merged document is
-   sent back to the model alongside the transcript, and the model confirms or flags each one by
-   index (never rewriting the item's text). An item that can't be confirmed is marked unverified —
-   never removed. If the fact-check call itself fails technically (invalid JSON after every retry),
-   the whole protocol job fails rather than publishing an unverified protocol as "ready".
-4. Each decision/task's timestamp — a single point or a range like `15:12 - 16:00` — is matched to
-   a *genuine* transcript segment (one whose own span actually overlaps the cited time, not merely
-   whichever segment happens to start closest) within a tolerance; a match gets a unique, stable
-   HTML anchor (e.g. `timestamp-312-1`, never the raw timecode text itself) and an appendix row
-   (timecode, speaker, source reply, block number, item type). A timestamp that can't be matched is
-   shown as plain text, never as a broken link, and the item is noted in `unverified_items`.
-5. The result is rendered from that one validated document into `protocol.json` (source of truth
-   — includes the model/engine, prompt versions, chunking settings, and app git commit for
-   reproducibility), `protocol.html` (`protocol/renderer.py`, escapes everything, table of
-   contents, hides empty sections, print/download buttons for all three formats), and
-   `protocol.xml` (same data, validates against `protocol/protocol.xsd`) under
-   `data/protocols/<job_id>/`, alongside `protocol.log` (full internal detail/tracebacks — never
-   shown to the user, who only sees a short status message including a `fact_checking` stage). Set
-   `GIGASCRIBE_PROTOCOL_DEBUG_RAW_RESPONSE=1` to also log every raw LLM response to `protocol.log`
-   for debugging — off by default, since a meeting's raw model output can be confidential.
-6. On any failure, the protocol job is marked `failed` with a short message, the LLM is unloaded,
-   and the underlying transcription job is completely untouched — it is not marked failed and its
-   results are not deleted. The user can retry from the same button (replaying the original settings
-   snapshot, not any settings changed since).
-7. On server restart, any protocol job caught mid-run is marked `failed` with a clear "restored
-   after restart" message rather than silently resumed, so it can never leave the GPU lock held.
+1. Пользователь нажимает «Создать протокол» на завершённом задании (кнопка появляется только когда
+   транскрипция готова, модуль включён и установлена хотя бы одна модель). Это создаёт строку в
+   `protocol_jobs` с зафиксированным снимком настроек; повторные нажатия переиспользуют существующее
+   активное задание вместо создания дубликата.
+2. Конвейер (`protocol/service.py`) готовит транскрипт и делит его на блоки. Разбиение на темы —
+   двухэтапное, чтобы длинная встреча никогда не отправлялась модели целиком: грубые
+   10-15-минутные преблоки сначала получают однострочную подсказку темы, затем один вызов над этими
+   подсказками (а не над сырым транскриптом) предлагает границы для всей встречи; границы за пределами
+   диапазона самого транскрипта отбрасываются, а близкие дубликаты объединяются. Если это ненадёжно
+   или отключено, используется откат к фиксированным временным окнам с настраиваемым перекрытием — блок
+   никогда не разрывает реплику посередине. Каждый блок анализируется в строгий JSON (с «не указан» для
+   всего, что не упомянуто в транскрипте — промпты явно запрещают выдумывать решения, сроки,
+   ответственных или цифры), затем отдельный вызов слияния объединяет все блоки в один документ.
+3. После слияния идёт этап **факт-чека**: каждое решение и задача из объединённого документа
+   отправляются обратно модели вместе с транскриптом, и модель подтверждает или помечает каждый пункт
+   по индексу (никогда не переписывая сам текст пункта). Пункт, который не удалось подтвердить,
+   помечается как неподтверждённый — но никогда не удаляется. Если сам вызов факт-чека технически не
+   удаётся (невалидный JSON после всех попыток), всё задание протокола завершается ошибкой, а не
+   публикует неподтверждённый протокол как «готовый».
+4. Временная метка каждого решения/задачи — одна точка или диапазон вида `15:12 - 16:00` —
+   сопоставляется с *подлинным* сегментом транскрипта (тем, чей собственный диапазон реально
+   пересекается с указанным временем, а не просто ближайшим по началу) в пределах допуска; совпадению
+   присваивается уникальный устойчивый HTML-якорь (например, `timestamp-312-1`, никогда сам сырой
+   текст таймкода) и строка в приложении (таймкод, спикер, исходная реплика, номер блока, тип пункта).
+   Временная метка, которую не удалось сопоставить, показывается как обычный текст, никогда как
+   битая ссылка, а пункт отмечается в `unverified_items`.
+5. Результат рендерится из этого единственного проверенного документа в `protocol.json` (источник
+   истины — включает модель/движок, версии промптов, настройки разбиения на блоки и git-коммит
+   приложения для воспроизводимости), `protocol.html` (`protocol/renderer.py`, экранирует всё,
+   оглавление, скрывает пустые разделы, кнопки печати/скачивания всех трёх форматов) и `protocol.xml`
+   (те же данные, валидируется по `protocol/protocol.xsd`) в `data/protocols/<job_id>/`, а также
+   `protocol.log` (полная внутренняя детализация/трассировки — никогда не показывается пользователю,
+   который видит только короткое сообщение о статусе, включая этап `fact_checking`). Установите
+   `GIGASCRIBE_PROTOCOL_DEBUG_RAW_RESPONSE=1`, чтобы дополнительно логировать в `protocol.log` каждый
+   сырой ответ LLM для отладки — по умолчанию выключено, поскольку сырой вывод модели по встрече может
+   быть конфиденциальным.
+6. При любой ошибке задание протокола помечается как `failed` с коротким сообщением, LLM выгружается,
+   а исходное задание транскрипции остаётся полностью нетронутым — оно не помечается как неудавшееся, и
+   его результаты не удаляются. Пользователь может повторить попытку той же кнопкой (воспроизводится
+   исходный снимок настроек, а не какие-либо настройки, изменённые с тех пор).
+7. При перезапуске сервера любое задание протокола, застигнутое в процессе выполнения, помечается как
+   `failed` с понятным сообщением «восстановлено после перезапуска», а не молчаливо возобновляется —
+   так GPU-блокировка никогда не остаётся удержанной навсегда.
 
-### Automatic protocol creation
+### Автоматическое создание протокола
 
-Instead of clicking "Создать протокол" after a transcription finishes, tick "Сразу создать
-протокол после завершения" next to the upload button (shown whenever the module is enabled and at
-least one model is installed) — the protocol job starts the instant the transcription completes,
-with no second manual step. It reuses exactly the same `create_protocol()` call the button makes,
-with the same error isolation: if it fails (no model installed, transcript missing, etc.) it's
-logged and the transcription job is unaffected either way. The flag is stored per-job
-(`jobs.auto_protocol`, set once at upload time, read-only afterwards) and is entirely independent
-of the module being enabled at all — if `GIGASCRIBE_PROTOCOL_ENABLED=0`, the checkbox is hidden and
-the flag is simply never acted on.
+Вместо того чтобы нажимать «Создать протокол» после завершения транскрипции, можно отметить галочку
+«Сразу создать протокол после завершения» рядом с кнопкой загрузки (показывается, когда модуль включён
+и установлена хотя бы одна модель) — задание протокола запустится сразу же по завершении транскрипции,
+без второго ручного шага. Используется точно тот же вызов `create_protocol()`, что и кнопка, с той же
+изоляцией ошибок: если он не удаётся (модель не установлена, транскрипт отсутствует и т. п.), это
+логируется, а задание транскрипции в любом случае не затрагивается. Флаг хранится для каждого задания
+(`jobs.auto_protocol`, задаётся один раз при загрузке, дальше доступен только на чтение) и полностью не
+зависит от того, включён ли модуль вообще — если `GIGASCRIBE_PROTOCOL_ENABLED=0`, чекбокс скрыт, а флаг
+просто никогда не используется.
 
-### External API for integrations (`/api/v1/meeting-protocol`)
+### Внешний API для интеграций (`/api/v1/meeting-protocol`)
 
-For machine clients built separately (a Telegram bot, "Пачка" bridge, etc.) that need to submit
-audio and poll for a protocol without a browser session:
+Для отдельно разрабатываемых машинных клиентов (Telegram-бот, мост в «Пачку» и т. п.), которым нужно
+отправлять аудио и опрашивать статус протокола без браузерной сессии:
 
-- `POST /api/v1/meeting-protocol` — multipart file upload, `Authorization: Bearer <token>` header.
-  Returns `{"job_id": ...}` immediately; the job always runs with `auto_protocol` on, using the
-  admin panel's currently active model/engine/prompts/glossary.
-- `GET /api/v1/meeting-protocol/{job_id}` — status and, once ready, the protocol result
-  (`protocol_data`, the same document as `protocol.json`). Only returns jobs created by that same
-  token; any other job (including another token's) 404s, never 403 — this mirrors the
-  ownership-check semantics used elsewhere in the app.
+- `POST /api/v1/meeting-protocol` — загрузка файла multipart, заголовок `Authorization: Bearer
+  <token>`. Сразу возвращает `{"job_id": ...}`; задание всегда выполняется с включённым
+  `auto_protocol`, используя текущую активную модель/движок/промпты/глоссарий из панели
+  администрирования.
+- `GET /api/v1/meeting-protocol/{job_id}` — статус, а когда готово — результат протокола
+  (`protocol_data`, тот же документ, что и `protocol.json`). Возвращает только задания, созданные тем
+  же токеном; любое чужое задание (включая задания другого токена) даёт 404, никогда 403 — это
+  повторяет семантику проверки владения, используемую в остальном приложении.
 
-**These two routes accept no configuration of any kind** — there is no field for model, engine,
-prompt, or glossary. That's deliberate: the external API can submit audio and read results, and
-nothing else. All configuration stays admin-panel-only.
+**Эти два маршрута не принимают никаких настроек** — там нет полей для модели, движка, промпта или
+глоссария. Это сделано намеренно: внешний API может только отправлять аудио и читать результаты, и
+ничего больше. Вся конфигурация остаётся только в панели администрирования.
 
-Tokens are bearer strings (`gsp_<id>_<secret>`, shown once at creation and never recoverable — only
-the bcrypt hash of the secret half is stored) that authenticate as a specific local username, via a
-dependency (`current_user_via_token`) kept fully separate from the cookie-session auth the rest of
-the app uses. **Token issuance and revocation are admin-only**, in the admin panel's "API-токены"
-section (label + the username the token acts as) — there is deliberately no self-service endpoint,
-since letting any authenticated user mint a token for another username would be a privilege hole.
+Токены — это bearer-строки (`gsp_<id>_<secret>`, показываются один раз при создании и не подлежат
+восстановлению — хранится только bcrypt-хэш секретной половины), которые аутентифицируют как
+конкретного локального пользователя через зависимость (`current_user_via_token`), полностью отдельную
+от cookie-сессионной аутентификации, используемой остальным приложением. **Выпуск и отзыв токенов
+доступны только администратору**, в разделе «API-токены» панели администрирования (метка + имя
+пользователя, от имени которого действует токен) — самостоятельной выдачи намеренно нет, поскольку
+возможность для любого авторизованного пользователя выпустить токен от имени другого пользователя была
+бы дырой в правах.
 
-The polling route (`GET .../{job_id}`) has no rate limiting yet — `requirements-base.txt` doesn't
-currently pull in a rate-limiting library. Fine for a single internal bridge; worth adding
-(e.g. `slowapi`) before exposing this to many external callers.
+У маршрута опроса (`GET .../{job_id}`) пока нет ограничения частоты запросов —
+`requirements-base.txt` сейчас не подключает библиотеку для rate limiting. Для одного внутреннего
+моста это нормально; стоит добавить (например, `slowapi`) перед тем как открывать этот эндпоинт многим
+внешним вызывающим сторонам.
 
-### Where things are stored
+### Где что хранится
 
 ```text
 data/
-  jobs.sqlite3          # existing DB; protocol/*, glossary_*, and api_tokens tables added via ALTER/CREATE, no data loss
+  jobs.sqlite3          # существующая БД; таблицы protocol/*, glossary_* и api_tokens добавлены через ALTER/CREATE, без потери данных
   protocols/<job_id>/
-    protocol.json        # structured result (source of truth)
-    protocol.html         # rendered page served at /api/jobs/{id}/protocol
-    protocol.xml            # same document, validates against protocol/protocol.xsd
-    protocol.log           # full internal log, incl. tracebacks on failure
+    protocol.json        # структурированный результат (источник истины)
+    protocol.html         # отрендеренная страница, отдаётся по /api/jobs/{id}/protocol
+    protocol.xml            # тот же документ, валидируется по protocol/protocol.xsd
+    protocol.log           # полный внутренний лог, вкл. трассировки при ошибке
 models/
-  protocol/<model_id>/...  # installed GGUF weights
+  protocol/<model_id>/...  # установленные веса GGUF
 ```
 
-### Docker build with (or without) the protocol module
+### Сборка Docker с модулем протоколирования (и без него)
 
-The main Dockerfile stays exactly as before by default: `INSTALL_PROTOCOL` defaults to `0`, so
-`requirements-protocol.txt` and `llama-cpp-python` are never installed and the image's size/dependency
-set are unaffected.
+Основной Dockerfile по умолчанию остаётся ровно таким же, как раньше: `INSTALL_PROTOCOL` по умолчанию
+равен `0`, так что `requirements-protocol.txt` и `llama-cpp-python` никогда не устанавливаются, а
+размер образа и набор зависимостей не меняются.
 
 ```bash
-# Without the protocol module (default, unchanged) --
+# Без модуля протоколирования (по умолчанию, без изменений) --
 docker compose -f compose.yaml build
 docker compose -f compose.yaml up -d
 
-# With it -- compose.protocol.yaml is an override, not a replacement --
+# С модулем -- compose.protocol.yaml это переопределение, а не замена --
 docker compose -f compose.yaml -f compose.protocol.yaml build
 docker compose -f compose.yaml -f compose.protocol.yaml up -d
 ```
 
-`compose.protocol.yaml` only adds `--build-arg INSTALL_PROTOCOL=1` and `GIGASCRIBE_PROTOCOL_ENABLED=1`.
-That build arg selects a dedicated `protocol-builder-1` stage in the `Dockerfile` that compiles
-`llama-cpp-python` with CUDA GPU offload (`GGML_CUDA=on`) for CUDA 12.8-capable cards such as the RTX
-5060 Ti, temporarily installing just the CUDA devel toolchain (`nvcc`) it needs to do that and
-discarding it afterwards — this needs no CUDA toolchain on the build host itself, only outbound
-access to NVIDIA's apt repository during the build. No proxy settings are added by either compose
-file (`compose.yaml`'s `build.args` already forwards your shell's own `http_proxy`/`https_proxy`/
-`no_proxy` if you have them set — see [Restricted networks](#restricted-networks-proxy--no-github-access)).
-See [GPU offload status and the CPU-wheel fallback](#gpu-offload-status-and-the-cpu-wheel-fallback)
-for this build step's verification status and the CPU-only fallback if it doesn't work for you.
+`compose.protocol.yaml` только добавляет `--build-arg INSTALL_PROTOCOL=1` и
+`GIGASCRIBE_PROTOCOL_ENABLED=1`. Этот build-arg выбирает отдельный этап `protocol-builder-1` в
+`Dockerfile`, который собирает `llama-cpp-python` с GPU-оффлоадом через CUDA (`GGML_CUDA=on`) для
+карт с поддержкой CUDA 12.8, таких как RTX 5060 Ti, временно устанавливая только нужный для этого набор
+инструментов CUDA devel (`nvcc`) и затем отбрасывая его — это не требует CUDA-тулчейна на самом
+сборочном хосте, только исходящий доступ к apt-репозиторию NVIDIA во время сборки. Ни один из
+compose-файлов не добавляет настроек прокси (`build.args` в `compose.yaml` уже прокидывает ваши
+собственные `http_proxy`/`https_proxy`/`no_proxy`, если они заданы в оболочке — см. [Ограниченные
+сети](#restricted-networks)). Статус проверки этого шага сборки и CPU-фолбэк, если он не заработает у
+вас, см. в разделе [Статус GPU-оффлоада и CPU-фолбэк](#gpu-offload-status).
 
-### Running the tests
+### Запуск тестов
 
 ```bash
 python -m pytest tests/ -q
 ```
 
-Protocol-specific tests are the `tests/test_protocol_*.py` files (chunking, providers/JSON
-retry-on-invalid-JSON, glossary, SQLite migration, HTML rendering/escaping, the full pipeline
-against a fake LLM provider, and `server.py` isolation/access-control checks run in subprocesses).
-They require no GPU and no real model weights.
+Тесты, специфичные для модуля протоколирования — это файлы `tests/test_protocol_*.py` (разбиение на
+блоки, повтор при невалидном JSON у провайдеров, глоссарий, миграция SQLite, рендеринг/экранирование
+HTML, полный конвейер против фейкового провайдера LLM, а также проверки изоляции/контроля доступа
+`server.py`, выполняемые в отдельных подпроцессах). Для них не нужны ни GPU, ни реальные веса моделей.
