@@ -1008,6 +1008,20 @@ async def api_protocol_test_model(model_id: str, admin: str = Depends(require_ad
     try:
         async with gpu_worker:
             MODEL_MANAGER.unload_all()
+            # unload_all() only drops Python references -- torch's CUDA
+            # caching allocator keeps the freed blocks reserved for itself
+            # unless explicitly told to release them, which would otherwise
+            # starve a large model's raw CUDA allocations here (this mirrors
+            # protocol/service.py's _unload_asr(), which does the same after
+            # every real protocol job's ASR/diarization unload).
+            import gc
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
             await provider.load()
             text = await provider.generate("Ответь одним словом: тест.", temperature=0.1, max_tokens=16)
         ok = bool(text and text.strip())
