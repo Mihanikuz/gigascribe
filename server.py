@@ -319,13 +319,29 @@ def _model_checks(load: bool = False) -> dict[str, Any]:
     return MODEL_MANAGER.health_status(deep=load)
 
 @app.get("/health/ready")
-def health_ready():
+async def health_ready():
     # Deep: actually load ASR/diarization once (cheap on later polls, since
     # ModelManager reuses already-loaded models) rather than only checking
     # that files exist. A broken import (e.g. torchcodec) or GPU placement
     # failure should make the container not-ready, not surface as the first
     # user's job failing at 1%.
-    status = MODEL_MANAGER.health_status(deep=True)
+    #
+    # Only do the deep (GPU-touching) check when gpu_worker is free. This
+    # endpoint is polled continuously by the browser and Docker's own
+    # HEALTHCHECK -- unconditionally awaiting gpu_worker here would either
+    # race an in-progress transcription/protocol-test for VRAM (confirmed
+    # cause of intermittent "Failed to create llama_context" failures on a
+    # 16GB card) or, if properly serialized, block for the full duration of
+    # a long transcription job and trip Docker's 5s healthcheck timeout.
+    # Falling back to the cheap file-existence check while busy is the
+    # correct tradeoff: readiness was already deep-verified moments before
+    # whatever is currently holding the lock started.
+    if gpu_worker.locked():
+        status = MODEL_MANAGER.health_status(deep=False)
+    else:
+        async with gpu_worker:
+            loop = asyncio.get_running_loop()
+            status = await loop.run_in_executor(None, lambda: MODEL_MANAGER.health_status(deep=True))
     checks = {"data_writable": _writable_dir(BASE_DIR), "models_writable": _writable_dir(MODELS_DIR), "secret_key_configured": SECRET_KEY_CONFIGURED, "ffmpeg": shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None}
     ready = status["status"] == "ready" and all(checks.values())
     status["checks"] = checks
@@ -333,7 +349,13 @@ def health_ready():
     return JSONResponse(status, status_code=200 if ready else 503)
 
 @app.get("/health/models")
-def health_models(): return _model_checks(load=True)
+async def health_models():
+    # Same GPU-lock-awareness as /health/ready, see its comment.
+    if gpu_worker.locked():
+        return _model_checks(load=False)
+    async with gpu_worker:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: _model_checks(load=True))
 
 @app.get("/health/gpu")
 def health_gpu():
@@ -883,9 +905,10 @@ def api_models_delete(model_id: str, username: str = Depends(require_admin)):
     raise HTTPException(400, detail="Unsupported model")
 
 @app.post("/api/models/{model_id}/test")
-def api_models_test(model_id: str, username: str = Depends(require_admin)):
+async def api_models_test(model_id: str, username: str = Depends(require_admin)):
     from model_store import SUPPORTED_GIGAAM_MODELS, SUPPORTED_DIARIZATION_MODELS, is_gigaam_ready, is_pyannote_ready, gigaam_checkpoint_path, pyannote_target_for
-    try:
+
+    def _run_test():
         if model_id in SUPPORTED_GIGAAM_MODELS:
             meta=SUPPORTED_GIGAAM_MODELS[model_id]
             if not is_gigaam_ready(MODELS_DIR, meta["model_name"]): raise RuntimeError("Model is not installed or integrity verification failed")
@@ -914,6 +937,19 @@ def api_models_test(model_id: str, username: str = Depends(require_admin)):
         elif model_id == "none": return {"ok": True, "model_id": model_id, "load_test": "not_applicable"}
         else: raise HTTPException(404, detail="Unknown model")
         return {"ok": True, "model_id": model_id, "load_test": "ok", "inference_test": "ok"}
+
+    try:
+        # Serialized on the same gpu_worker lock as transcription jobs and
+        # protocol model tests -- this endpoint used to run outside that
+        # lock entirely, so an ASR/diarization test could load onto the GPU
+        # concurrently with a protocol model test (or a real transcription
+        # job), starving whichever one needed more VRAM. Confirmed as the
+        # cause of spurious "Failed to create llama_context" test failures
+        # on a 16GB card when a large protocol model (Qwen3-14B) happened to
+        # run at the same time as an ASR/diarization test.
+        async with gpu_worker:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _run_test)
     except HTTPException: raise
     except Exception as exc:
         logger.exception("model test failed model_id=%s", model_id)
@@ -1008,6 +1044,20 @@ async def api_protocol_test_model(model_id: str, admin: str = Depends(require_ad
     try:
         async with gpu_worker:
             MODEL_MANAGER.unload_all()
+            # unload_all() only drops Python references -- torch's CUDA
+            # caching allocator keeps the freed blocks reserved for itself
+            # unless explicitly told to release them, which would otherwise
+            # starve a large model's raw CUDA allocations here (this mirrors
+            # protocol/service.py's _unload_asr(), which does the same after
+            # every real protocol job's ASR/diarization unload).
+            import gc
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
             await provider.load()
             text = await provider.generate("Ответь одним словом: тест.", temperature=0.1, max_tokens=16)
         ok = bool(text and text.strip())
