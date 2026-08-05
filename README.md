@@ -213,10 +213,24 @@ the main app.
 dedicated multi-stage build step (`protocol-builder-1` in the `Dockerfile`) that temporarily installs
 the CUDA devel toolchain (`nvcc`) from NVIDIA's official Debian apt repository, compiles the wheel,
 and discards the toolchain — the final image only keeps the compiled wheel and the CUDA runtime `.so`
-files it needs. **This has not been verified against real hardware in the environment this was
-written in** (no GPU or Docker daemon available there); if it doesn't work for your driver/CUDA
-combination, or you'd rather not wait for a CUDA compile at all, the officially-supported fallback is
-a plain CPU-built wheel:
+files it needs. **Confirmed working on real hardware** (RTX 5060 Ti, driver 595.84, CUDA 12.8,
+Docker 29.1.3/Compose 2.40.3): the build succeeds, `llama_cpp` imports at container runtime with
+`llama_supports_gpu_offload` present, and all four supported models load and pass their admin-panel
+test with measured GPU VRAM/utilization activity. Two things worth knowing from that verification:
+
+- The base images (`protocol-builder-1`/`protocol-builder-0`/final) are pinned to
+  `python:3.11-slim-bookworm` rather than the untagged `python:3.11-slim`, which silently tracks
+  whichever Debian release is currently "stable" — it had moved to trixie, whose newer glibc breaks
+  `nvcc`'s CUDA 12.8 compiler-id detection outright.
+- **A 16GB card doesn't have headroom for Qwen3-14B at its default `context_length=32768`** with full
+  GPU offload (`n_gpu_layers=-1`) — the KV cache alone at that context is several GB on top of the
+  ~8.4GB Q4_K_M weights. It fails to load with `Failed to create llama_context` (llama.cpp's generic
+  wrapper around any native context-creation failure, including CUDA OOM). Lower `context_length` to
+  8192-16384 for that model in Протоколирование → Модели → "Настройка модели" if you're on a 16GB
+  card; Qwen3-8B, Gemma 3 12B IT, and Ministral 3 8B Instruct all fit at their defaults.
+
+If GPU offload doesn't work for your driver/CUDA combination, or you'd rather not wait for a CUDA
+compile at all, the officially-supported fallback is a plain CPU-built wheel:
 
 ```bash
 docker compose -f compose.yaml -f compose.protocol.yaml build \
@@ -228,8 +242,7 @@ docker compose -f compose.yaml -f compose.protocol.yaml build \
 falls through to a plain `pip wheel` there — still no CUDA toolchain needed on the build host, but the
 resulting wheel runs LLM inference on CPU. Expect roughly 15-20 minutes for a single protocol job
 on a 14B model instead of seconds on GPU — usable for evaluating the module, not for routine
-production load.) Please report back whether the GPU path builds and actually offloads to GPU on your
-hardware so this note can be updated with a confirmed status.
+production load.)
 
 After installing, an admin picks the active model, edits its launch parameters (temperature, max
 tokens, context, launch args) and its **engine** — Протоколирование → Модели → "Настройка движка
