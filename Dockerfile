@@ -93,6 +93,7 @@ ARG TORCH_REQUIREMENTS=requirements-cu128.txt
 # size increase. Build with --build-arg INSTALL_PROTOCOL=1 (see
 # compose.protocol.yaml) to compile it in with CUDA offload support.
 ARG INSTALL_PROTOCOL=0
+ARG PROTOCOL_CMAKE_ARGS
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
     PIP_CACHE_DIR=/root/.cache/pip PIP_NO_CACHE_DIR=0 \
     PIP_DEFAULT_TIMEOUT=600 PIP_RETRIES=20 \
@@ -142,8 +143,11 @@ COPY --from=protocol-builder /usr/local/cuda/lib64 /usr/local/cuda/lib64
 RUN --mount=type=cache,id=gigascribe-pip-cache,target=/root/.cache/pip,sharing=locked \
     if [ "$INSTALL_PROTOCOL" = "1" ]; then \
         python -m pip install --timeout 600 --retries 20 \
-            --find-links /tmp/protocol-wheels -r requirements-protocol.txt \
-        && python -c "import llama_cpp; print('llama-cpp-python', llama_cpp.__version__)" ; \
+            --find-links /tmp/protocol-wheels -r requirements-protocol.txt ; \
+        case "$PROTOCOL_CMAKE_ARGS" in \
+            *GGML_CUDA*) echo "Skipping build-time 'import llama_cpp' check: a CUDA-linked build needs libcuda.so.1 from the NVIDIA driver, which is only present once the container actually starts with GPU access (docker compose up's gpus: all), never during docker build. Verified for real the first time a protocol job loads a GGUF model." ;; \
+            *) python -c "import llama_cpp; print('llama-cpp-python', llama_cpp.__version__)" ;; \
+        esac \
     else \
         echo "INSTALL_PROTOCOL=0: skipping protocol module dependencies" ; \
     fi \
