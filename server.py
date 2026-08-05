@@ -319,13 +319,29 @@ def _model_checks(load: bool = False) -> dict[str, Any]:
     return MODEL_MANAGER.health_status(deep=load)
 
 @app.get("/health/ready")
-def health_ready():
+async def health_ready():
     # Deep: actually load ASR/diarization once (cheap on later polls, since
     # ModelManager reuses already-loaded models) rather than only checking
     # that files exist. A broken import (e.g. torchcodec) or GPU placement
     # failure should make the container not-ready, not surface as the first
     # user's job failing at 1%.
-    status = MODEL_MANAGER.health_status(deep=True)
+    #
+    # Only do the deep (GPU-touching) check when gpu_worker is free. This
+    # endpoint is polled continuously by the browser and Docker's own
+    # HEALTHCHECK -- unconditionally awaiting gpu_worker here would either
+    # race an in-progress transcription/protocol-test for VRAM (confirmed
+    # cause of intermittent "Failed to create llama_context" failures on a
+    # 16GB card) or, if properly serialized, block for the full duration of
+    # a long transcription job and trip Docker's 5s healthcheck timeout.
+    # Falling back to the cheap file-existence check while busy is the
+    # correct tradeoff: readiness was already deep-verified moments before
+    # whatever is currently holding the lock started.
+    if gpu_worker.locked():
+        status = MODEL_MANAGER.health_status(deep=False)
+    else:
+        async with gpu_worker:
+            loop = asyncio.get_running_loop()
+            status = await loop.run_in_executor(None, lambda: MODEL_MANAGER.health_status(deep=True))
     checks = {"data_writable": _writable_dir(BASE_DIR), "models_writable": _writable_dir(MODELS_DIR), "secret_key_configured": SECRET_KEY_CONFIGURED, "ffmpeg": shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None}
     ready = status["status"] == "ready" and all(checks.values())
     status["checks"] = checks
@@ -333,7 +349,13 @@ def health_ready():
     return JSONResponse(status, status_code=200 if ready else 503)
 
 @app.get("/health/models")
-def health_models(): return _model_checks(load=True)
+async def health_models():
+    # Same GPU-lock-awareness as /health/ready, see its comment.
+    if gpu_worker.locked():
+        return _model_checks(load=False)
+    async with gpu_worker:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: _model_checks(load=True))
 
 @app.get("/health/gpu")
 def health_gpu():
