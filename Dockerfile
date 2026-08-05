@@ -4,7 +4,17 @@ ARG INSTALL_PROTOCOL=0
 # entirely and build a plain CPU wheel instead -- the officially-supported
 # fallback if the CUDA build below doesn't work on your driver/CUDA
 # combination (see README "GPU offload status and the CPU-wheel fallback").
-ARG PROTOCOL_CMAKE_ARGS=-DGGML_CUDA=on
+#
+# CMAKE_CUDA_ARCHITECTURES is set explicitly (not left to llama.cpp's own
+# "native" default) because "native" probes an actual GPU device at CMake
+# configure time -- which doesn't exist here: `docker compose build` runs
+# this stage with no GPU passthrough (only `docker compose up`'s `gpus: all`
+# reaches a running container), so "native" fails outright with "no GPU was
+# detected". The list below matches requirements-cu128.txt's own torch
+# build's supported architectures (confirmed via its reported arch_list),
+# so a wheel built here targets the same hardware range torch already
+# does, including sm_120 (RTX 5060 Ti / Blackwell).
+ARG PROTOCOL_CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=70;75;80;86;90;100;120"
 
 # =========================================================================
 # protocol-builder-1: compiles llama-cpp-python, with CUDA GPU offload
