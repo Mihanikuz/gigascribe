@@ -30,12 +30,21 @@ ARG PROTOCOL_CMAKE_ARGS=-DGGML_CUDA=on
 # =========================================================================
 FROM python:3.11-slim AS protocol-builder-1
 ARG PROTOCOL_CMAKE_ARGS
+# NVIDIA's cuda-keyring (as of this writing) certifies its signing key with
+# a SHA1 self-signature, which apt's sqv/sequoia backend on Debian trixie
+# rejects outright since SHA1 was declared insecure for this purpose on
+# 2026-02-01 ("Policy rejected non-revocation signature ... SHA1 is not
+# considered secure"). This is an upstream NVIDIA packaging issue, not
+# something fixable from this Dockerfile beyond scoping trust narrowly to
+# just this one apt source (still fetched over HTTPS from
+# developer.download.nvidia.com) rather than disabling verification globally.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake git ca-certificates gnupg wget \
     && if [ -n "$PROTOCOL_CMAKE_ARGS" ]; then \
         wget -qO /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb \
         && dpkg -i /tmp/cuda-keyring.deb && rm -f /tmp/cuda-keyring.deb \
-        && apt-get update && apt-get install -y --no-install-recommends \
+        && apt-get -o Acquire::AllowInsecureRepositories=true update \
+        && apt-get install -y --no-install-recommends --allow-unauthenticated \
             cuda-nvcc-12-8 cuda-cudart-dev-12-8 libcublas-dev-12-8 ; \
     fi \
     && mkdir -p /usr/local/cuda/lib64 \
