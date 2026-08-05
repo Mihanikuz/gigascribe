@@ -883,9 +883,10 @@ def api_models_delete(model_id: str, username: str = Depends(require_admin)):
     raise HTTPException(400, detail="Unsupported model")
 
 @app.post("/api/models/{model_id}/test")
-def api_models_test(model_id: str, username: str = Depends(require_admin)):
+async def api_models_test(model_id: str, username: str = Depends(require_admin)):
     from model_store import SUPPORTED_GIGAAM_MODELS, SUPPORTED_DIARIZATION_MODELS, is_gigaam_ready, is_pyannote_ready, gigaam_checkpoint_path, pyannote_target_for
-    try:
+
+    def _run_test():
         if model_id in SUPPORTED_GIGAAM_MODELS:
             meta=SUPPORTED_GIGAAM_MODELS[model_id]
             if not is_gigaam_ready(MODELS_DIR, meta["model_name"]): raise RuntimeError("Model is not installed or integrity verification failed")
@@ -914,6 +915,19 @@ def api_models_test(model_id: str, username: str = Depends(require_admin)):
         elif model_id == "none": return {"ok": True, "model_id": model_id, "load_test": "not_applicable"}
         else: raise HTTPException(404, detail="Unknown model")
         return {"ok": True, "model_id": model_id, "load_test": "ok", "inference_test": "ok"}
+
+    try:
+        # Serialized on the same gpu_worker lock as transcription jobs and
+        # protocol model tests -- this endpoint used to run outside that
+        # lock entirely, so an ASR/diarization test could load onto the GPU
+        # concurrently with a protocol model test (or a real transcription
+        # job), starving whichever one needed more VRAM. Confirmed as the
+        # cause of spurious "Failed to create llama_context" test failures
+        # on a 16GB card when a large protocol model (Qwen3-14B) happened to
+        # run at the same time as an ASR/diarization test.
+        async with gpu_worker:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _run_test)
     except HTTPException: raise
     except Exception as exc:
         logger.exception("model test failed model_id=%s", model_id)
