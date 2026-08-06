@@ -1322,8 +1322,8 @@ INDEX_HTML = ("<!doctype html><meta charset='utf-8'><title>GigaScribe</title><st
   <h2>Новая транскрипция</h2>
   <form id='up'>
     <input type='file' name='file' id='file-input' required>
-    <button type='submit' id='up-btn'>🚀 Запустить</button>
-    <label class='muted' id='auto-protocol-row' style='display:none'><input type='checkbox' id='auto-protocol-checkbox'> Сразу создать протокол после завершения</label>
+    <button type='button' id='up-btn' onclick='submitJob(false)'>🚀 Транскрибация</button>
+    <button type='button' id='up-protocol-btn' style='display:none' onclick='submitJob(true)'>📄 Транскрибация + протокол</button>
   </form>
   <div id='upload-progress-wrap' class='upload-progress'>
     <progress id='upload-progress' value='0' max='100'></progress>
@@ -1353,7 +1353,7 @@ async function loadWhoAmI(){
 async function loadProtocolStatus(){
   let r=await fetch('/api/protocol/status'); if(!r.ok) return;
   PROTOCOL_STATUS=await r.json();
-  document.getElementById('auto-protocol-row').style.display=(PROTOCOL_STATUS.enabled && PROTOCOL_STATUS.has_installed_model)?'':'none';
+  document.getElementById('up-protocol-btn').style.display=(PROTOCOL_STATUS.enabled && PROTOCOL_STATUS.has_installed_model)?'':'none';
 }
 
 async function loadModelsInfo(){
@@ -1439,17 +1439,17 @@ async function retryProtocol(id){await fetch(`/api/jobs/${id}/protocol/retry`,{m
 let poll=3000;
 async function tick(){await refresh();setTimeout(tick,document.hidden?10000:poll)}
 
-document.getElementById('up').onsubmit=function(e){
-  e.preventDefault();
+function submitJob(autoProtocol){
   let fileInput=document.getElementById('file-input');
   if(!fileInput.files.length) return;
   let fd=new FormData(); fd.append('file', fileInput.files[0]);
-  fd.append('auto_protocol', document.getElementById('auto-protocol-checkbox').checked ? '1' : '0');
+  fd.append('auto_protocol', autoProtocol ? '1' : '0');
   let wrap=document.getElementById('upload-progress-wrap');
   let bar=document.getElementById('upload-progress');
   let text=document.getElementById('upload-progress-text');
   let btn=document.getElementById('up-btn');
-  wrap.style.display='block'; btn.disabled=true; bar.value=0; text.textContent='Загрузка файла: 0%';
+  let protocolBtn=document.getElementById('up-protocol-btn');
+  wrap.style.display='block'; btn.disabled=true; protocolBtn.disabled=true; bar.value=0; text.textContent='Загрузка файла: 0%';
   let xhr=new XMLHttpRequest();
   xhr.upload.onprogress=function(ev){
     if(ev.lengthComputable){
@@ -1458,7 +1458,7 @@ document.getElementById('up').onsubmit=function(e){
     }
   };
   xhr.onload=function(){
-    btn.disabled=false;
+    btn.disabled=false; protocolBtn.disabled=false;
     if(xhr.status>=200&&xhr.status<300){
       text.textContent='Загрузка завершена, обработка начата';
       document.getElementById('up').reset();
@@ -1470,10 +1470,10 @@ document.getElementById('up').onsubmit=function(e){
     }
     setTimeout(()=>{wrap.style.display='none'},4000);
   };
-  xhr.onerror=function(){btn.disabled=false;text.textContent='Ошибка сети при загрузке'};
+  xhr.onerror=function(){btn.disabled=false; protocolBtn.disabled=false; text.textContent='Ошибка сети при загрузке'};
   xhr.open('POST','/api/jobs');
   xhr.send(fd);
-};
+}
 
 (async()=>{ await loadWhoAmI(); await loadModelsInfo(); await loadProtocolStatus(); tick(); })();
 </script>""")
